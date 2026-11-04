@@ -1,0 +1,8 @@
+calltable
+Copyright 2026 The calltable Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+calltable was extracted from an internal verification queue ("testbench")
+used by its authors; the extracted code is distributed under the same
+open-source terms. No third-party source code is bundled in this repository.

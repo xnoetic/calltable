@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# ct — calltable CLI thin wrapper; follows symlinks back to the checkout root.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [ -h "$SELF" ]; do
+  DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  LINK="$(readlink "$SELF")"
+  case "$LINK" in
+    /*) SELF="$LINK" ;;
+    *)  SELF="$DIR/$LINK" ;;
+  esac
+done
+CALLTABLE_ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
+export PYTHONPATH="$CALLTABLE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+exec "${PYTHON:-python3}" -m calltable cli "$@"

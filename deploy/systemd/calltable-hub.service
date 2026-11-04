@@ -1,0 +1,22 @@
+[Unit]
+Description=calltable hub (job queue, locks, logs, dashboard)
+Documentation=https://github.com/eanzhao-os/calltable
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to your checkout path (the installer uses %h/.calltable/src).
+WorkingDirectory=%h/.calltable/src
+ExecStart=/usr/bin/python3 -m calltable hub --config %h/.config/calltable/config.json
+Environment=PYTHONUNBUFFERED=1
+MemoryLow=256M
+MemoryMin=128M
+Restart=on-failure
+RestartSec=3
+# The hub only writes its own data directory.
+NoNewPrivileges=yes
+PrivateTmp=no
+
+[Install]
+WantedBy=default.target

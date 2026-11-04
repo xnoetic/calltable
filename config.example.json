@@ -1,0 +1,70 @@
+{
+  "token": "CHANGE-ME",
+  "data_dir": "./data",
+  "profiles_dir": "./profiles",
+  "hub_url": "http://hub.example.internal:8091",
+  "hub_bind": "127.0.0.1",
+  "hub_port": 8091,
+  "beszel_url": "",
+  "default_slot": "light",
+  "hosts": {
+    "runner-a": {
+      "slots": {
+        "heavy": 2,
+        "light": 1
+      },
+      "labels": [
+        "linux"
+      ],
+      "note": "Linux build runner"
+    },
+    "runner-b": {
+      "slots": {
+        "heavy": 1,
+        "light": 2
+      },
+      "labels": [
+        "windows"
+      ],
+      "note": "Windows runner (interactive desktop session for UI tests)"
+    }
+  },
+  "exec_host": "runner-a",
+  "runs_root": "./data/runs",
+  "mirror_root": "./data/mirrors",
+  "max_jobs": 2,
+  "poll_interval": 3,
+  "sample_interval": 10,
+  "retention_success_seconds": 86400,
+  "retention_failure_seconds": 259200,
+  "log_cap_bytes": 268435456,
+  "keep_ref_days": 14,
+  "use_systemd": true,
+  "shell": "/bin/bash",
+  "owner_tailnet": "",
+  "groups": {
+    "linux": [
+      "runner-a"
+    ],
+    "windows": [
+      "runner-b"
+    ]
+  },
+  "resource_defaults": {
+    "heavy": {
+      "memory_max": "12G",
+      "cpu_weight": "400",
+      "slice": "calltable-heavy.slice"
+    },
+    "light": {
+      "memory_max": "4G",
+      "cpu_weight": "200",
+      "slice": "calltable-light.slice"
+    }
+  },
+  "cpu_rate_percent": 70,
+  "upstreams": {},
+  "upstream_interval": 300,
+  "min_free_gb": 20,
+  "runs_max_gb": 100
+}

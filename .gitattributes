@@ -1,0 +1,12 @@
+* text=auto
+# Scripts that Linux executes directly must stay LF (otherwise shebangs and
+# interpreters see a trailing \r).
+*.sh      text eol=lf
+bin/ct    text eol=lf
+*.service text eol=lf
+*.slice   text eol=lf
+*.json    text eol=lf
+*.py      text eol=lf
+# Windows scripts stay CRLF.
+*.ps1     text eol=crlf
+*.cmd     text eol=crlf

@@ -1,0 +1,955 @@
+"""执行器：常驻主机，按 host 名向 hub 领取任务并在本机跑完。
+
+流程
+----
+启动 → 生成 worker 实例 id → 重放上次没送达的 finish → 循环（心跳 + claim）。
+每个任务：下载 bundle（如有）→ fetch 进本机裸镜像 → ``git worktree add`` 到
+``runs_root/<job_id>/work`` → 写 launcher（source profile 的 env 文件）→ 启动
+（Linux 走 systemd scope，Windows 走 Job Object）→ 实时上传日志分块 → 每 10 秒
+上传资源采样 → 收集产物（glob + sha256）→ 上报终态。
+
+准备阶段（下载/fetch/worktree）也受同一个超时截止时间约束，并在每步前后检查
+取消标记（I8）。取消时先礼貌终止再强杀整棵进程树。
+
+终态上报失败会指数退避重试（最长 10 分钟），仍然失败就写进
+``<data_dir>/pending/<job_id>.json``，下次启动时重放（B1）。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+from pathlib import Path
+
+from . import __version__, disk, gitops, proc
+from .client import HubClient, HubError
+from .config import Config
+from .util import now, parse_size, valid_project_name
+
+LOG_CHUNK = 32 * 1024
+LOG_FLUSH_SECONDS = 0.8
+MAX_ARTIFACTS = 200
+MAX_ARTIFACT_BYTES = 512 * 1024 * 1024
+ARTIFACT_SCAN_SECONDS = 60.0
+# 产物收集不能把整个 node_modules 走一遍：在 Windows 上实测 >10 分钟，
+# 主进程早就退出了，job 却一直挂着。命中这些目录名直接剪枝。
+ARTIFACT_SKIP_DIRS = {
+    ".git", "node_modules", ".pnpm", ".cache", ".turbo-build", ".build-cache",
+    ".turbo", ".next", ".venv", "venv", "target", "dist", "coverage",
+}
+FINISH_BUDGET = 600.0
+FINISH_MAX_DELAY = 30.0
+#: 磁盘/runs 大小的全量扫描至少隔这么久（walk 巨型 node_modules 很贵）。
+DISK_SCAN_INTERVAL = 60.0
+
+
+def _artifact_regex(pattern: str) -> re.Pattern[str]:
+    """把产物 glob 转成正则（``**`` 跨目录，``**/`` 可匹配零层）。"""
+    out = ["^"]
+    i = 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+            continue
+        ch = pattern[i]
+        if ch == "*":
+            if pattern.startswith("**", i):
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+        elif ch == "?":
+            out.append("[^/]")
+        else:
+            out.append(re.escape(ch))
+        i += 1
+    out.append("$")
+    return re.compile("".join(out))
+
+class Aborted(Exception):
+    """准备阶段被取消或超时。"""
+
+    def __init__(self, status: str):
+        super().__init__(status)
+        self.status = status
+
+
+class Executor:
+    def __init__(self, config: Config, *, once: bool = False,
+                 client: HubClient | None = None):
+        self.config = config
+        self.once = once
+        self.host = config.exec_host
+        self.worker_id = f"{self.host}-{uuid.uuid4().hex[:10]}"
+        self.client = client or HubClient(config.hub_url, config.token_value)
+        self.runs_root = config.runs_root
+        self.mirror_root = config.mirror_root
+        self.pending_dir = config.data_dir / "pending"
+        if os.name != "nt":
+            # 执行器创建的所有目录/文件（含 git clone 的检出）都必须是
+            # owner-only；LocalStorage 拒绝组可写的目录链。进程级 umask 比
+            # 事后递归 chmod 便宜得多。
+            os.umask(0o077)
+        self.runs_root.mkdir(parents=True, exist_ok=True)
+        self.mirror_root.mkdir(parents=True, exist_ok=True)
+        self.pending_dir.mkdir(parents=True, exist_ok=True)
+        # 任务临时目录会被 LocalStorage 的 owner-only 检查拒绝，如果祖先目录
+        # 组可写（某些发行版默认 umask 0002）。启动时把 runs 目录链收紧。
+        self._tighten_private_dirs()
+
+    @staticmethod
+    def _tighten_private_dirs_for(path: Path) -> None:
+        if os.name == "nt":
+            return
+        for target, mode in ((path, 0o700), (path.parent, 0o755)):
+            try:
+                if target.exists():
+                    current = target.stat().st_mode & 0o777
+                    if current & 0o022:
+                        os.chmod(target, mode)
+            except OSError:
+                pass
+
+    def _tighten_private_dirs(self) -> None:
+        self._tighten_private_dirs_for(self.runs_root)
+        self._stop = threading.Event()
+        self._lock = threading.RLock()
+        self._active: dict[str, threading.Thread] = {}
+        self._active_jobs: set[str] = set()
+        #: 已经跑完但终态还没送达 hub 的任务：仍要在心跳里报告，否则 hub 会把它
+        #: 当成「丢失」回收，把成功改成 error（hub 重启窗口里真实发生过）。
+        self._unreported: set[str] = set()
+        self._cancel_flags: dict[str, bool] = {}
+        self._watcher: threading.Thread | None = None
+        self._disk_status: disk.DiskStatus = disk.DiskStatus()
+        self._disk_checked_at = 0.0
+        #: 已完成 run 目录的大小缓存：避免每分钟重新 walk node_modules。
+        self._run_size_cache: dict[str, tuple[float, int]] = {}
+        self._disk_warned_at = 0.0
+        self._disk_cleanup_lock = threading.Lock()
+        self._disk_cleanup_thread: threading.Thread | None = None
+
+        self.use_systemd, self.systemd_reason = self._decide_systemd()
+
+    # ------------------------------------------------------------ 启动
+    def _decide_systemd(self) -> tuple[bool, str]:
+        want = self.config.raw.get("use_systemd", None)
+        if want is False:
+            return False, "disabled by config"
+        available, reason = proc.probe_systemd()
+        if available:
+            return True, "probe ok"
+        if reason == "windows":
+            return False, "windows"
+        return False, f"probe failed: {reason}; falling back to direct mode"
+
+    def run(self) -> None:
+        self._reclaim_orphans()
+        print(f"calltable exec host={self.host} worker={self.worker_id} "
+              f"hub={self.config.hub_url} runs={self.runs_root} "
+              f"systemd={self.use_systemd} ({self.systemd_reason})", flush=True)
+        if not self.use_systemd and self.systemd_reason.startswith("probe failed"):
+            print(f"[exec] WARNING: {self.systemd_reason}", file=sys.stderr,
+                  flush=True)
+        self.replay_pending()
+        self._start_watcher()
+        self._start_housekeeping()
+        if self.once:
+            self._run_once()
+            return
+        while not self._stop.is_set():
+            try:
+                if not self.heartbeat():
+                    self._stop.wait(self.config.poll_interval)
+                    continue
+                self._claim_loop()
+            except HubError as exc:
+                print(f"[hub] {exc}", file=sys.stderr, flush=True)
+            except Exception as exc:  # pragma: no cover - 常驻兜底
+                print(f"[exec] {type(exc).__name__}: {exc}", file=sys.stderr,
+                      flush=True)
+            self._stop.wait(self.config.poll_interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            procs = list(self._running_procs.values())
+        for tree in procs:
+            tree.terminate(3)
+
+    _running_procs: dict[str, proc.TreeProcess] = {}
+
+    def _start_watcher(self) -> None:
+        self._watcher = threading.Thread(target=self._watch_loop, daemon=True,
+                                         name="exec-watcher")
+        self._watcher.start()
+
+    def _watch_loop(self) -> None:
+        """每 3 秒查一次在跑任务是否被取消（准备阶段也用它）。"""
+        while not self._stop.wait(3):
+            with self._lock:
+                jobs = list(self._active_jobs)
+            for job_id in jobs:
+                try:
+                    state = self.client.get_json(f"/api/jobs/{job_id}")
+                except HubError:
+                    continue
+                if state and state.get("cancel_requested"):
+                    self._cancel_flags[job_id] = True
+
+    def _start_housekeeping(self) -> None:
+        thread = threading.Thread(target=self._janitor_loop, daemon=True,
+                                  name="exec-janitor")
+        thread.start()
+
+    def _janitor_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.cleanup_disk()
+                self.janitor()
+                # 上次没送达的终态：定期重试，别等下一次重启。
+                if any(self.pending_dir.glob("*.json")):
+                    self.replay_pending()
+            except Exception as exc:  # pragma: no cover
+                print(f"[exec] janitor: {type(exc).__name__}: {exc}",
+                      file=sys.stderr, flush=True)
+            self._stop.wait(600)
+
+    # ------------------------------------------------------------ 心跳/领取
+    def heartbeat(self) -> bool:
+        with self._lock:
+            running = sorted(self._active_jobs | self._unreported)
+        system = self._host_system()
+        try:
+            self.client.post_json("/api/hosts/heartbeat", {
+                "host": self.host,
+                "worker": self.worker_id,
+                "running": running,
+                "os": f"{sys.platform}-{os.name}",
+                "version": __version__,
+                "system": system,
+            })
+            return True
+        except HubError as exc:
+            print(f"[hub] heartbeat failed: {exc}", file=sys.stderr, flush=True)
+            return False
+
+    # ------------------------------------------------------------ 磁盘水位
+    def disk_status(self, *, force: bool = False) -> disk.DiskStatus:
+        """测量 runs_root 空闲与 runs 大小（只读，不删目录）。
+
+        删除几十 GB 的 run 目录可能要好几分钟，绝不能放在心跳路径上，
+        否则主机在 hub 眼里会失联。清理见 :meth:`cleanup_disk`。
+        """
+        now_ts = time.time()
+        interval = 15.0 if force else DISK_SCAN_INTERVAL
+        if (not self._disk_checked_at
+                or now_ts - self._disk_checked_at >= interval):
+            self._disk_status = disk.measure(
+                self.runs_root,
+                min_free_gb=self.config.min_free_gb,
+                runs_max_gb=self.config.runs_max_gb,
+                cache=self._run_size_cache,
+                scan_budget=self.config.disk_scan_budget)
+            self._disk_checked_at = now_ts
+        return self._disk_status
+
+    def cleanup_disk(self) -> disk.DiskStatus:
+        """把 runs 清理到水位以下（慢操作；放在后台线程或 janitor 里跑）。"""
+        with self._lock:
+            protected = set(self._active_jobs)
+        status = disk.enforce(
+            self.runs_root,
+            min_free_gb=self.config.min_free_gb,
+            runs_max_gb=self.config.runs_max_gb,
+            protected=protected,
+            cache=self._run_size_cache,
+            scan_budget=self.config.disk_scan_budget)
+        self._disk_status = status
+        self._disk_checked_at = time.time()
+        if status.reclaimed:
+            print(f"[exec] disk watermark: removed "
+                  f"{status.reclaimed} finished run dir(s), "
+                  f"freed {status.reclaimed_bytes / disk.GB:.1f}G", flush=True)
+        return status
+
+    def request_disk_cleanup(self) -> bool:
+        """单飞地启动一次后台清理；已在跑就返回 False。"""
+        with self._disk_cleanup_lock:
+            if self._disk_cleanup_thread and self._disk_cleanup_thread.is_alive():
+                return False
+            thread = threading.Thread(target=self._disk_cleanup_worker,
+                                      daemon=True, name="exec-disk-cleanup")
+            self._disk_cleanup_thread = thread
+            thread.start()
+            return True
+
+    def _disk_cleanup_worker(self) -> None:
+        try:
+            self.cleanup_disk()
+        except Exception as exc:  # pragma: no cover - 后台兜底
+            print(f"[exec] disk cleanup: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+
+    def _host_system(self) -> dict:
+        status = self.disk_status()
+        payload = status.to_dict()
+        total, available = disk.memory_bytes()
+        payload.update({
+            "mem_total_gb": round(total / disk.GB, 1),
+            "mem_free_gb": round(available / disk.GB, 1),
+            "load1": disk.load_average(),
+        })
+        return payload
+
+    def _claim_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._lock:
+                live = {k: t for k, t in self._active.items() if t.is_alive()}
+                self._active = live
+                self._active_jobs = {k for k in self._active_jobs if k in live}
+                if len(live) >= self.config.max_jobs:
+                    return
+            status = self.disk_status(force=bool(self._disk_status.low))
+            if status.low:
+                # 清理放到后台线程，心跳/对账不能被 rmtree 拖住。
+                self.request_disk_cleanup()
+                now_ts = time.time()
+                if now_ts - self._disk_warned_at > 300:
+                    self._disk_warned_at = now_ts
+                    print(f"[exec] disk_low: {status.reason}; not claiming "
+                          "new jobs", file=sys.stderr, flush=True)
+                return
+            job = self.client.post_json("/api/exec/claim", {
+                "host": self.host, "worker": self.worker_id})
+            if not job:
+                return
+            thread = threading.Thread(target=self._run_job, args=(job,),
+                                      name=f"job-{job['id']}", daemon=True)
+            with self._lock:
+                self._active[job["id"]] = thread
+                self._active_jobs.add(job["id"])
+            thread.start()
+            if self.once:
+                thread.join()
+                return
+
+    def _reclaim_orphans(self) -> None:
+        """执行器重启后，杀掉上一次进程留下的任务进程并结算。
+
+        Python 进程被杀时，子进程（bash/dotnet）可能继续跑；hub 会把这些
+        任务标成 needs_reconcile，但如果不主动清理，它们会一直占着槽位且
+        永远不会触发超时。"""
+        try:
+            entries = list(self.runs_root.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            marker = entry / ".running"
+            if not marker.exists():
+                continue
+            try:
+                owner = marker.read_text(encoding="utf-8").strip()
+            except OSError:
+                owner = ""
+            if owner == self.worker_id:
+                continue
+            job_id = entry.name
+            pid_text = ""
+            try:
+                pid_text = (entry / ".pid").read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+            if pid_text.isdigit() and self._pid_matches(int(pid_text), job_id):
+                self._kill_tree(int(pid_text), job_id)
+            try:
+                self.client.post_json(
+                    f"/api/exec/jobs/{job_id}/finish",
+                    {"status": "error", "exit_code": None,
+                     "error": "executor restarted; orphan job terminated"})
+            except HubError:
+                pass
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            self._schedule_cleanup(entry, "error")
+
+    def _pid_matches(self, pid: int, job_id: str) -> bool:
+        """PID 可能被系统复用；只杀命令行里确实属于该任务的进程。"""
+        try:
+            if os.name == "nt":
+                out = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     f"(Get-CimInstance Win32_Process -Filter \"ProcessId={pid}\")"
+                     ".CommandLine"],
+                    capture_output=True, text=True, timeout=20)
+                return job_id in (out.stdout or "")
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return job_id in raw.replace(b"\0", b" ").decode("utf-8", "replace")
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _kill_tree(self, pid: int, job_id: str) -> None:
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)],
+                               capture_output=True, timeout=30)
+            else:
+                from .proc_linux import unit_name
+                subprocess.run(["systemctl", "--user", "stop",
+                                unit_name(job_id) + ".scope"],
+                               capture_output=True, timeout=30)
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (OSError, ProcessLookupError):
+                    pass
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _run_once(self) -> None:
+        self.heartbeat()
+        self._claim_loop()
+
+    # ------------------------------------------------------------ 单个任务
+    def _run_job(self, job: dict) -> None:
+        job_id = job["id"]
+        run_dir = self.runs_root / job_id
+        work = run_dir / "work"
+        tmp = run_dir / "tmp"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            try:
+                os.chmod(run_dir, 0o700)
+            except OSError:
+                pass
+        (run_dir / ".running").write_text(self.worker_id, encoding="utf-8")
+        work.mkdir(parents=True, exist_ok=True)
+        tmp.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            for private in (work, tmp):
+                try:
+                    os.chmod(private, 0o700)
+                except OSError:
+                    pass
+        profile = job.get("profile_data") or {}
+        timeout = int(job["timeout"]) if job.get("timeout") is not None else 3600
+        deadline = time.time() + timeout
+        outcome = {"status": "error", "exit_code": None, "error": ""}
+        tree = None
+        try:
+            mirror = self._mirror_for(job["project"])
+            sha = job.get("sha") or ""
+            if not sha:
+                raise RuntimeError("job has no commit sha")
+
+            self._checkpoint(job_id, deadline)
+            if job.get("bundle_url"):
+                bundle = run_dir / "upload.bundle"
+                self.client.download(job["bundle_url"], bundle)
+                self._checkpoint(job_id, deadline, "bundle download")
+                try:
+                    gitops.ingest_bundle(mirror, bundle)
+                except gitops.GitError:
+                    self.client.download(job["bundle_url"] + "?full=1", bundle)
+                    gitops.ingest_bundle(mirror, bundle)
+                bundle.unlink(missing_ok=True)
+            if not gitops.has_commit(mirror, sha):
+                bundle = run_dir / "full.bundle"
+                self.client.download(f"/api/jobs/{job_id}/bundle?full=1", bundle)
+                gitops.ingest_bundle(mirror, bundle)
+                bundle.unlink(missing_ok=True)
+            self._checkpoint(job_id, deadline, "bundle fetch")
+            if not gitops.has_commit(mirror, sha):
+                raise RuntimeError(f"commit {sha} is not available in the executor mirror")
+
+            # 每个任务独立 clone --shared：不用 worktree，避免并发任务共享镜像
+            # refs 时互相覆盖 refs/remotes/origin/main。
+            base_ref_sha = job.get("base_ref_sha") or ""
+            if base_ref_sha and not gitops.has_commit(mirror, base_ref_sha):
+                bundle = run_dir / "base.bundle"
+                self.client.download(
+                    f"/api/jobs/{job_id}/bundle?full=1&sha={base_ref_sha}", bundle)
+                gitops.ingest_bundle(mirror, bundle)
+                bundle.unlink(missing_ok=True)
+            gitops.clone_shared(mirror, work, sha)
+            if os.name != "nt":
+                # clone_shared 会重建 work，权限需要在 clone 之后再收紧一次。
+                try:
+                    os.chmod(work, 0o700)
+                except OSError:
+                    pass
+            self._checkpoint(job_id, deadline, "checkout")
+            if base_ref_sha and job.get("base_ref"):
+                gitops.set_base_ref(work, job["base_ref"], base_ref_sha)
+
+            script = self._write_launcher(run_dir, job, profile, work)
+            env = self._build_env(job, profile, tmp, work)
+            argv = self._argv(script)
+            self._checkpoint(job_id, deadline, "before launch")
+
+            tier = job.get("systemd") or {}
+            tree = proc.spawn(
+                argv=argv, cwd=work, env=env, job_id=job_id,
+                use_systemd=self.use_systemd,
+                memory_max=tier.get("memory_max"),
+                cpu_weight=tier.get("cpu_weight"),
+                slice=tier.get("slice"),
+                cpu_rate_percent=(job.get("cpu_rate_percent")
+                                  or self.config.cpu_rate_percent),
+                soft_memory_bytes=parse_size(tier.get("memory_max")),
+            )
+            try:
+                (run_dir / ".pid").write_text(str(tree.popen.pid), encoding="utf-8")
+            except OSError:
+                pass
+            with self._lock:
+                self._running_procs[job_id] = tree
+
+            pump = LogPump(self.client, job_id, tree.popen.stdout)
+            pump.start()
+            sampler = threading.Thread(target=self._sample_loop,
+                                       args=(job_id, tree), daemon=True)
+            sampler.start()
+
+            status, limit_error = self._supervise(job, tree, job_id)
+            try:
+                code = tree.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                # 主进程已退出但孙进程还继承着管道：给日志 10 秒收尾，
+                # 然后结束整个进程组/Job，绝不能让它把任务拖住。
+                tree.terminate(3)
+                code = tree.wait(timeout=10)
+            # 主进程已退出时，孙进程可能还活着并占着 stdout。无条件收掉
+            # 整个进程组/Job，管道才会 EOF；不能让后台进程拖住收尾。
+            tree.terminate(2)
+            pump.finish()
+            sampler.join(timeout=5)
+            outcome = {"status": status, "exit_code": code, "error": limit_error}
+
+            notes = self._collect_artifacts(job_id, work, profile.get("artifacts") or [])
+            if notes:
+                extra = "; ".join(notes)
+                outcome["error"] = (f"{outcome['error']}; {extra}"
+                                   if outcome["error"] else extra)
+        except Aborted as exc:
+            outcome = {"status": exc.status, "exit_code": None,
+                       "error": "aborted during preparation"}
+            if tree is not None:
+                tree.terminate(3)
+        except Exception as exc:
+            outcome = {"status": "error", "exit_code": None,
+                       "error": f"{type(exc).__name__}: {exc}"}
+            if tree is not None:
+                tree.terminate(3)
+        finally:
+            if tree is not None:
+                tree.close()
+                with self._lock:
+                    self._running_procs.pop(job_id, None)
+            with self._lock:
+                self._active_jobs.discard(job_id)
+                self._cancel_flags.pop(job_id, None)
+            try:
+                (run_dir / ".running").unlink()
+            except OSError:
+                pass
+            self._finish(job_id, outcome)
+            self._schedule_cleanup(run_dir, outcome["status"])
+
+    # ------------------------------------------------------------ 准备阶段
+    def _mirror_for(self, project: str) -> Path:
+        """镜像路径必须在 mirror_root 之内（I4）。"""
+        if not valid_project_name(project):
+            raise RuntimeError(f"invalid project name: {project!r}")
+        root = self.mirror_root.resolve()
+        path = (root / f"{project}.git").resolve()
+        if not path.is_relative_to(root):
+            raise RuntimeError(f"mirror path escapes mirror_root: {path}")
+        return path
+
+    def _checkpoint(self, job_id: str, deadline: float, stage: str = "") -> None:
+        if self._cancel_flags.get(job_id):
+            raise Aborted("cancelled")
+        if time.time() > deadline:
+            raise Aborted("timeout")
+
+    def _supervise(self, job: dict, tree, job_id: str) -> tuple[str, str]:
+        timeout = int(job["timeout"]) if job.get("timeout") is not None else 3600
+        started = job.get("started")
+        if isinstance(started, (int, float)) and started > 0:
+            # hub 记录的接收时间是预算起点；检出/安装已经花掉的时间要扣掉。
+            timeout = max(0, timeout - max(0, time.time() - float(started)))
+        deadline = time.time() + timeout
+        status = "succeeded"
+        error = ""
+        while True:
+            code = tree.poll()
+            if code is not None:
+                break
+            if getattr(tree, "soft_limit_exceeded", False):
+                # direct 模式没有 cgroup：采样连续两次超限后执行器自己动手。
+                status = "error"
+                error = "memory limit exceeded (soft, direct mode)"
+                tree.terminate(5)
+                break
+            if time.time() >= deadline or self._cancel_flags.get(job_id):
+                status = "cancelled" if self._cancel_flags.get(job_id) else "timeout"
+                tree.terminate(5)
+                break
+            time.sleep(0.4)
+        if tree.poll() is None:
+            tree.terminate(5)
+        if status == "succeeded" and tree.poll() not in (0, None):
+            status = "failed"
+        return status, error
+
+    def _sample_loop(self, job_id: str, tree) -> None:
+        interval = self.config.sample_interval
+        while tree.poll() is None and not self._stop.is_set():
+            sample = tree.sample()
+            try:
+                self.client.post_json(f"/api/jobs/{job_id}/samples", {
+                    "samples": [{
+                        "cpu_usec": sample.cpu_usec,
+                        "mem_current": sample.mem_current,
+                        "mem_peak": sample.mem_peak,
+                    }]})
+            except HubError:
+                pass
+            time.sleep(interval)
+
+    # ------------------------------------------------------------ 终态上报
+    def _finish(self, job_id: str, outcome: dict) -> bool:
+        """指数退避重试（最长 10 分钟）；彻底失败就落 pending 文件。"""
+        delay = 1.0
+        started = time.time()
+        with self._lock:
+            self._unreported.add(job_id)
+        while True:
+            try:
+                self.client.post_json(f"/api/exec/jobs/{job_id}/finish", outcome)
+                with self._lock:
+                    self._unreported.discard(job_id)
+                return True
+            except HubError as exc:
+                elapsed = time.time() - started
+                if elapsed >= FINISH_BUDGET:
+                    self._write_pending(job_id, outcome)
+                    print(f"[exec] finish for {job_id} failed after "
+                          f"{int(elapsed)}s; queued for replay: {exc}",
+                          file=sys.stderr, flush=True)
+                    return False
+                print(f"[exec] finish for {job_id} failed ({exc}); "
+                      f"retrying in {delay:.0f}s", file=sys.stderr, flush=True)
+                time.sleep(min(delay, FINISH_MAX_DELAY))
+                delay = min(delay * 2, FINISH_MAX_DELAY)
+
+    def _write_pending(self, job_id: str, outcome: dict) -> None:
+        target = self.pending_dir / f"{job_id}.json"
+        try:
+            target.write_text(json.dumps(outcome, ensure_ascii=False),
+                              encoding="utf-8")
+        except OSError as exc:
+            print(f"[exec] cannot persist pending finish for {job_id}: {exc}",
+                  file=sys.stderr, flush=True)
+
+    def replay_pending(self) -> int:
+        replayed = 0
+        for path in sorted(self.pending_dir.glob("*.json")):
+            job_id = path.stem
+            try:
+                outcome = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            try:
+                self.client.post_json(f"/api/exec/jobs/{job_id}/finish", outcome)
+                path.unlink(missing_ok=True)
+                with self._lock:
+                    self._unreported.discard(job_id)
+                replayed += 1
+                print(f"[exec] replayed pending finish for {job_id}", flush=True)
+            except HubError as exc:
+                print(f"[exec] pending finish still failing for {job_id}: {exc}",
+                      file=sys.stderr, flush=True)
+        return replayed
+
+    # ------------------------------------------------------------ 环境与脚本
+    def _write_launcher(self, run_dir: Path, job: dict, profile: dict,
+                        work: Path) -> Path:
+        shell = self.config.shell
+        if shell.lower().endswith("cmd.exe"):
+            raise RuntimeError(
+                "cmd.exe launcher is not supported on Windows; install Git Bash "
+                "and set config.shell to bash.exe (see README)")
+        env_files = [str(x) for x in (profile.get("env_files") or [])]
+        command = shlex.join([str(x) for x in job.get("cmd") or []])
+        script = run_dir / "run.sh"
+        lines = [
+            "set -e",
+            # 任务里所有产物都必须是 owner-only：LocalStorage 会拒绝组可写的
+            # 目录链。发行版默认 umask 0002 时会放开，这里显式收紧。
+            "umask 077",
+            f'cd {shlex.quote(str(work))}',
+        ]
+        score = self.config.task_oom_score_adj
+        if score:
+            # 让 OOM killer 优先选任务而不是执行器；/proc 不存在时（Windows）
+            # 静默跳过。
+            lines.append(f"echo {int(score)} > /proc/self/oom_score_adj "
+                         "2>/dev/null || true")
+        for path in env_files:
+            quoted = shlex.quote(path)
+            lines.append(f'if [ ! -r {quoted} ]; then echo "calltable: env file '
+                         f'not readable: {path}" >&2; exit 97; fi')
+            lines.append(f'. {quoted}')
+        for setup in (profile.get("setup") or []):
+            # 用子 shell 隔离，setup 里的 cd 不能影响真正的任务命令。
+            lines.append("( %s )" % setup)
+        lines.append(command)
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return script
+
+    def _argv(self, script: Path) -> list[str]:
+        return [self.config.shell, str(script)]
+
+    def _build_env(self, job: dict, profile: dict, tmp: Path,
+                   work: Path) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update({str(k): str(v) for k, v in (profile.get("env") or {}).items()})
+        env["TMPDIR"] = str(tmp)
+        env["TMP"] = str(tmp)
+        env["TEMP"] = str(tmp)
+        env["CALLTABLE_JOB_ID"] = job["id"]
+        env["CALLTABLE_PROJECT"] = job["project"]
+        env["CALLTABLE_HOST"] = job["host"]
+        env["CALLTABLE_WORKTREE"] = str(work)
+        env["CALLTABLE_SHA"] = job.get("sha") or ""
+        env["CALLTABLE_BASE_SHA"] = (job.get("base_sha") or job.get("sha")
+                              or job.get("base_ref_sha") or "")
+        env["CALLTABLE_DIRTY"] = "1" if job.get("dirty") else "0"
+        env["CALLTABLE_BASE_REF_SHA"] = job.get("base_ref_sha") or ""
+        env["CALLTABLE_SUBMITTER"] = job.get("submitter") or ""
+        # 构建/工具链默认值：任务结束不留常驻 MSBuild / VBCSCompiler / 遥测进程。
+        env["MSBUILDDISABLENODEREUSE"] = "1"
+        env["DOTNET_CLI_USE_MSBUILD_SERVER"] = "0"
+        env["UseSharedCompilation"] = "false"
+        env["DOTNET_CLI_TELEMETRY_OPTOUT"] = "1"
+        env["DOTNET_NOLOGO"] = "1"
+        env["LC_ALL"] = env.get("LC_ALL") or "C.UTF-8"
+        env.pop("GIT_DIR", None)
+        env.pop("GIT_WORK_TREE", None)
+        env.pop("GIT_INDEX_FILE", None)
+        return env
+
+    # ------------------------------------------------------------ 产物
+    def _collect_artifacts(self, job_id: str, work: Path,
+                           patterns: list[str]) -> list[str]:
+        """收集产物；任何失败只记一条说明，绝不改 status / exit_code（B3）。
+
+        不能依赖 ``Path.glob("**/...")``：它会遍历 node_modules 等巨型目录，
+        实测在 Windows 上超过 10 分钟，导致主进程已退出而 job 仍显示 running。
+        这里用 os.walk 剪枝 + 总时限，保证任务结束不被产物收集拖住。
+        """
+        notes: list[str] = []
+        seen: set[str] = set()
+        count = 0
+        root = work.resolve()
+        regexes = []
+        for pattern in patterns:
+            if ".." in Path(pattern).parts:
+                notes.append(f"artifact pattern rejected: {pattern}")
+                continue
+            regexes.append((pattern, _artifact_regex(pattern)))
+        if not regexes:
+            return notes
+        deadline = time.monotonic() + ARTIFACT_SCAN_SECONDS
+        truncated = False
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(
+                name for name in dirnames
+                if name not in ARTIFACT_SKIP_DIRS
+                and not (Path(dirpath) / name).is_symlink())
+            for name in sorted(filenames):
+                if time.monotonic() > deadline:
+                    truncated = True
+                    break
+                path = Path(dirpath) / name
+                try:
+                    rel = path.relative_to(root).as_posix()
+                except ValueError:
+                    continue
+                matched = next(
+                    (pattern for pattern, regex in regexes if regex.fullmatch(rel)),
+                    None)
+                if matched is None or rel in seen:
+                    continue
+                seen.add(rel)
+                count += 1
+                if count > MAX_ARTIFACTS:
+                    notes.append(f"artifact limit reached ({MAX_ARTIFACTS})")
+                    return notes
+                try:
+                    resolved = path.resolve()
+                    if not resolved.is_relative_to(root):
+                        notes.append(f"artifact outside worktree skipped: {path}")
+                        continue
+                    if resolved.stat().st_size > MAX_ARTIFACT_BYTES:
+                        notes.append(f"artifact too large skipped: {rel}")
+                        continue
+                    self.client.upload_file(
+                        f"/api/jobs/{job_id}/artifacts", resolved,
+                        headers={"X-Calltable-Path": urllib.parse.quote(rel)})
+                except Exception as exc:
+                    notes.append(f"artifact upload failed: {name}: "
+                                 f"{type(exc).__name__}: {exc}")
+            if truncated:
+                break
+        if truncated:
+            notes.append(f"artifact scan truncated after "
+                         f"{ARTIFACT_SCAN_SECONDS:.0f}s")
+        return notes
+
+    # ------------------------------------------------------------ 清理
+    def _schedule_cleanup(self, run_dir: Path, status: str) -> None:
+        retention = (self.config.retention_success if status == "succeeded"
+                     else self.config.retention_failure)
+        finished = now()
+        marker = run_dir / ".retention"
+        try:
+            marker.write_text(str(finished + retention), encoding="utf-8")
+        except OSError:
+            pass
+        # 磁盘水位保护按「完成时间从旧到新」清理，需要一个明确的完成时间。
+        try:
+            (run_dir / disk.FINISHED_MARKER).write_text(str(finished),
+                                                        encoding="utf-8")
+        except OSError:
+            pass
+
+    def janitor(self) -> None:
+        """清掉过期 run 目录；正在跑的（.running）不碰，最后统一 worktree prune。"""
+        cutoff = now()
+        removed = 0
+        for entry in self.runs_root.iterdir():
+            if not entry.is_dir():
+                continue
+            marker = entry / ".running"
+            if marker.exists():
+                owner = ""
+                try:
+                    owner = marker.read_text(encoding="utf-8").strip()
+                except OSError:
+                    pass
+                # 只有「本执行器当前在跑」的任务才受保护；上次崩溃留下的
+                # .running 目录要按普通残留处理，否则永远清不掉。
+                if not owner or owner == self.worker_id:
+                    continue
+            marker = entry / ".retention"
+            try:
+                deadline = float(marker.read_text().strip())
+            except (OSError, ValueError):
+                try:
+                    age = cutoff - entry.stat().st_mtime
+                except OSError:
+                    continue
+                if age < self.config.retention_failure:
+                    continue
+                deadline = 0
+            if deadline > cutoff:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        # 旧版本用 worktree 建检出；每轮 prune 一次，清掉历史遗留登记（I5）。
+        for mirror in self.mirror_root.glob("*.git"):
+            gitops.git(["-C", str(mirror), "worktree", "prune"], check=False)
+
+
+class LogPump:
+    """把进程输出按块上传：读线程 + 定时 flush 线程。"""
+
+    def __init__(self, client: HubClient, job_id: str, stream):
+        self.client = client
+        self.job_id = job_id
+        self.stream = stream
+        self.buffer = bytearray()
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.writer = threading.Thread(target=self._write, daemon=True)
+
+    def start(self) -> None:
+        self.reader.start()
+        self.writer.start()
+
+    def _read(self) -> None:
+        try:
+            while True:
+                chunk = self.stream.read1(8192) if hasattr(self.stream, "read1") \
+                    else self.stream.read(8192)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.buffer.extend(chunk)
+        except (OSError, ValueError):
+            pass
+        finally:
+            self.stop_event.set()
+
+    def _write(self) -> None:
+        while True:
+            finished = self.stop_event.is_set()
+            with self.lock:
+                data = bytes(self.buffer[:LOG_CHUNK])
+                del self.buffer[:len(data)]
+            if data:
+                self._post(data)
+            elif finished:
+                return
+            if not data:
+                time.sleep(LOG_FLUSH_SECONDS)
+
+    def _post(self, data: bytes) -> None:
+        for attempt in range(3):
+            try:
+                self.client.request("POST", f"/api/jobs/{self.job_id}/logs",
+                                    data=data,
+                                    headers={"Content-Type": "application/octet-stream"})
+                return
+            except HubError as exc:
+                if attempt == 2:
+                    print(f"[exec] log upload for {self.job_id} failed: {exc}",
+                          file=sys.stderr, flush=True)
+                else:
+                    time.sleep(0.5 * (attempt + 1))
+
+    def finish(self) -> None:
+        self.reader.join(timeout=15)
+        self.stop_event.set()
+        self.writer.join(timeout=20)
+        with self.lock:
+            leftover = bytes(self.buffer)
+            self.buffer.clear()
+        if leftover:
+            self._post(leftover)
+
+
+def serve(config: Config, *, once: bool = False) -> None:
+    executor = Executor(config, once=once)
+    try:
+        executor.run()
+    except KeyboardInterrupt:
+        executor.stop()

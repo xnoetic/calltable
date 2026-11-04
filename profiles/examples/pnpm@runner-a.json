@@ -1,0 +1,33 @@
+{
+  "name": "pnpm@runner-a",
+  "project": "pnpm",
+  "host": "runner-a",
+  "slot": "light",
+  "locks": [],
+  "setup": [
+    "pnpm install --frozen-lockfile"
+  ],
+  "rules": [
+    {
+      "match": "pnpm (run )?(test|test:e2e|build)$",
+      "slot": "heavy",
+      "locks": [
+        "pnpm-fullgate@{host}"
+      ],
+      "timeout": "1h",
+      "memory_max": "8G"
+    }
+  ],
+  "env": {
+    "CI": "1",
+    "NODE_OPTIONS": "--max-old-space-size=4096"
+  },
+  "artifacts": [
+    "reports/**/*.xml",
+    "coverage/**/*.json"
+  ],
+  "timeout": "30m",
+  "memory_max": "4G",
+  "cpu_weight": "200",
+  "note": "Example: pnpm workspace. Full test/build runs take the heavy slot and a per-host lock."
+}

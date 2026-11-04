@@ -1,0 +1,40 @@
+{
+  "name": "dotnet@runner-a",
+  "project": "dotnet",
+  "host": "runner-a",
+  "slot": "light",
+  "locks": [],
+  "env_files": [
+    "/etc/calltable/env/dotnet.sh"
+  ],
+  "env": {
+    "DOTNET_CLI_TELEMETRY_OPTOUT": "1",
+    "DOTNET_NOLOGO": "1"
+  },
+  "rules": [
+    {
+      "match": "IntegrationTests",
+      "slot": "heavy",
+      "locks": [],
+      "timeout": "2h",
+      "memory_max": "12G"
+    },
+    {
+      "match": "build/(verify|smoke)\\.sh",
+      "slot": "heavy",
+      "locks": [
+        "dotnet-fullgate@{host}"
+      ],
+      "timeout": "2h",
+      "memory_max": "12G"
+    }
+  ],
+  "artifacts": [
+    "**/TestResults/*.trx",
+    "build/out/evidence/*.json"
+  ],
+  "timeout": "1h",
+  "memory_max": "4G",
+  "cpu_weight": "200",
+  "note": "Example: .NET repository. Integration tests and gate scripts take the heavy slot; unit tests stay on light."
+}

@@ -1,0 +1,23 @@
+[Unit]
+Description=calltable executor (runs jobs for one host)
+Documentation=https://github.com/eanzhao-os/calltable
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/.calltable/src
+ExecStart=/usr/bin/python3 -m calltable exec --config %h/.config/calltable/exec.json
+Environment=PYTHONUNBUFFERED=1
+MemoryLow=256M
+MemoryMin=128M
+Restart=on-failure
+RestartSec=5
+# Each task gets its own `systemd-run --user --scope` (cgroup limits and
+# sampling), so do not constrain the whole unit here: that would also limit the
+# hub connection and git operations.
+KillMode=process
+NoNewPrivileges=no
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,29 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime data and real configs (tokens never go into the repo)
+data/
+config.json
+config.hub.json
+config.exec.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.bundle
+uploads/
+runs/
+mirrors/
+artifacts/
+pending/
+
+# Local scratch
+.smoke/
+*.log
+.DS_Store
+Thumbs.db

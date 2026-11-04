@@ -1,0 +1,7 @@
+[Unit]
+Description=calltable light jobs (CPUWeight 200, MemoryMax 4G)
+Documentation=https://github.com/eanzhao-os/calltable
+
+[Slice]
+CPUWeight=200
+MemoryMax=4G

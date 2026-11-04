@@ -1,0 +1,30 @@
+{
+  "name": "pytest@runner-a",
+  "project": "pytest",
+  "host": "runner-a",
+  "slot": "light",
+  "locks": [],
+  "env_files": [
+    "/etc/calltable/env/python.sh"
+  ],
+  "rules": [
+    {
+      "match": "pytest( .*)?(tests/integration|-m (slow|integration))",
+      "slot": "heavy",
+      "locks": [],
+      "timeout": "45m",
+      "memory_max": "8G"
+    }
+  ],
+  "env": {
+    "PYTHONUNBUFFERED": "1"
+  },
+  "artifacts": [
+    "reports/junit*.xml",
+    "reports/coverage.xml"
+  ],
+  "timeout": "20m",
+  "memory_max": "2G",
+  "cpu_weight": "200",
+  "note": "Example: Python project. Integration/slow tests take the heavy slot; everything else stays on light."
+}
