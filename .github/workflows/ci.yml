@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # 手动重跑（分支上验证修复时用；默认只在 main / PR 上跑）
+  workflow_dispatch:
 
 permissions:
   contents: read
