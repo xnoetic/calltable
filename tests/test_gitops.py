@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import threading
@@ -15,6 +16,13 @@ from calltable import gitops
 def git(cwd, *args):
     out = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                          text=True, check=True)
+    return out.stdout.strip()
+
+
+def git_config(cwd, key, *, env=None, config_opts=None):
+    """读一个配置项（没有时返回空串）。"""
+    out = gitops.git(["config", "--get", key], cwd=cwd, env=env,
+                     config_opts=config_opts, check=False)
     return out.stdout.strip()
 
 
@@ -148,9 +156,23 @@ class GitOpsTests(unittest.TestCase):
         self.assertEqual(gitops.keep_refs(mirror), [])
 
     def test_git_runs_with_cross_platform_config(self):
-        # A6：-c core.autocrlf=false -c core.longpaths=true 必须真的生效
-        self.assertEqual(git(self.repo, "config", "--get", "core.autocrlf"), "false")
-        self.assertEqual(git(self.repo, "config", "--get", "core.longpaths"), "true")
+        """A6：-c core.autocrlf=false -c core.longpaths=true 必须真的生效。
+
+        自包含：把全局/系统配置全部关掉，值只能来自 GIT_CONFIG_OPTS。
+        CI runner 上没人替我们设 core.longpaths，所以不能读环境里的配置。
+        """
+        isolated = {"GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_SYSTEM": os.devnull}
+        for key, expected in (("core.autocrlf", "false"),
+                              ("core.longpaths", "true"),
+                              ("core.quotepath", "false")):
+            self.assertEqual(
+                git_config(self.repo, key, env=isolated), expected,
+                f"{key} must come from GIT_CONFIG_OPTS")
+        # 不带 -c 时这两项无处可读：证明上面的值确实来自 GIT_CONFIG_OPTS。
+        for key in ("core.longpaths", "core.quotepath"):
+            self.assertEqual(
+                git_config(self.repo, key, env=isolated, config_opts=[]), "")
 
     def test_bundle_multi_can_carry_a_base_tip(self):
         base = git(self.repo, "rev-parse", "HEAD")

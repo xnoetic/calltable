@@ -30,6 +30,14 @@ def _windows():
     return proc_windows
 
 
+def _direct():
+    """direct 模式的实现：有 /proc 就用它，macOS/BSD 退回 ps。"""
+    if os.path.isdir("/proc"):
+        return _linux()
+    from . import proc_posix
+    return proc_posix
+
+
 def probe_systemd() -> tuple[bool, str]:
     """真跑一次 systemd-run 探测；返回 (可用, 原因)。"""
     if os.name == "nt":
@@ -55,15 +63,15 @@ def spawn(*, argv: list[str], cwd: str | Path, env: dict[str, str],
         return _linux().spawn_systemd(
             argv=argv, cwd=cwd, env=env, job_id=job_id,
             memory_max=memory_max, cpu_weight=cpu_weight, slice=slice)
-    return _linux().spawn_direct(argv=argv, cwd=cwd, env=env, job_id=job_id,
-                                 soft_limit_bytes=soft_memory_bytes)
+    return _direct().spawn_direct(argv=argv, cwd=cwd, env=env, job_id=job_id,
+                                  soft_limit_bytes=soft_memory_bytes)
 
 
 def kill_pid_tree(pid: int) -> None:
     if os.name == "nt":
         _windows().kill_tree(pid)
     else:
-        _linux().kill_tree(pid)
+        _direct().kill_tree(pid)
 
 
 def pid_alive(pid: int) -> bool:
@@ -71,4 +79,4 @@ def pid_alive(pid: int) -> bool:
         return False
     if os.name == "nt":
         return _windows().pid_alive(pid)
-    return _linux().pid_alive(pid)
+    return _direct().pid_alive(pid)

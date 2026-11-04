@@ -11,7 +11,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-from calltable import proc, proc_linux
+from calltable import proc, proc_linux, proc_posix
 
 SCRIPT = textwrap.dedent("""
     import subprocess, sys, time
@@ -214,6 +214,68 @@ class DirectTreeTests(unittest.TestCase):
             finally:
                 tree.terminate(2)
                 tree.close()
+
+
+class PsSamplerTests(unittest.TestCase):
+    """macOS/BSD 没有 /proc：同一套树采样要能靠 `ps` 跑起来。
+
+    这台机器上只能验证解析与聚合（Linux/Windows 不跑 ps 路径），但解析错了
+    macOS 上就会变成「永远采到 0」，所以按真机的 ps 输出形状钉住。
+    """
+
+    PS_OUTPUT = "".join([
+        "  100     1   100  4096    0:00.12\n",   # 任务主进程（pgid == pid）
+        "  101   100   100  8192    0:00.34\n",   # 子进程
+        "  102   101   100 16384 1-02:03:04\n",   # 孙进程（跨天 CPU 时间）
+        "  200     1   200 32768   12:34.56\n",   # 无关进程
+        "### garbage ###\n",
+    ])
+
+    def test_parse_cpu_seconds(self):
+        self.assertAlmostEqual(proc_posix.parse_cpu_seconds("0:00.12"), 0.12)
+        self.assertAlmostEqual(proc_posix.parse_cpu_seconds("12:34.56"),
+                               12 * 60 + 34.56)
+        self.assertAlmostEqual(proc_posix.parse_cpu_seconds("2:03:04"),
+                               2 * 3600 + 3 * 60 + 4)
+        self.assertAlmostEqual(proc_posix.parse_cpu_seconds("1-02:03:04"),
+                               86400 + 2 * 3600 + 3 * 60 + 4)
+        self.assertEqual(proc_posix.parse_cpu_seconds(""), 0.0)
+        self.assertEqual(proc_posix.parse_cpu_seconds("n/a"), 0.0)
+
+    def test_parse_ps_output_fills_the_proc_table_shape(self):
+        table = proc_posix.parse_ps_output(self.PS_OUTPUT, 100)
+        self.assertEqual(sorted(table), [100, 101, 102, 200])
+        self.assertEqual(table[101]["ppid"], 100)
+        self.assertEqual(table[101]["session"], 100)
+        self.assertEqual(table[101]["rss"], 8192 * 1024)
+        self.assertEqual(table[101]["utime"], 34)  # 0.34s @ 100 tick/s
+        self.assertEqual(table[102]["utime"], 9378400)
+
+    def test_sampler_sums_the_tree_and_ignores_other_sessions(self):
+        impl = proc_posix.PsImpl(100)
+        impl._proc_table = lambda: proc_posix.parse_ps_output(self.PS_OUTPUT, 100)
+        self.assertEqual(sorted(impl._pids()), [100, 101, 102])
+        sample = impl.sample()
+        self.assertEqual(sample.mem_current, (4096 + 8192 + 16384) * 1024)
+        self.assertEqual(sample.mem_peak, sample.mem_current)
+        self.assertEqual(sample.tasks, 3)
+        self.assertEqual(sample.cpu_usec,
+                         int((12 + 34 + 9378400) * 1_000_000 / 100))
+        self.assertGreater(sample.cpu_usec, 0)
+
+    def test_soft_limit_uses_the_same_two_strike_rule(self):
+        impl = proc_posix.PsImpl(100, soft_limit_bytes=10 << 20)
+        impl._proc_table = lambda: proc_posix.parse_ps_output(self.PS_OUTPUT, 100)
+        impl.sample()
+        self.assertFalse(impl.exceeded)
+        impl.sample()
+        self.assertTrue(impl.exceeded)
+
+    def test_direct_mode_picks_the_sampler_that_fits_the_platform(self):
+        with mock.patch("calltable.proc.os.path.isdir", return_value=False):
+            self.assertIs(proc._direct(), proc_posix)
+        with mock.patch("calltable.proc.os.path.isdir", return_value=True):
+            self.assertIs(proc._direct(), proc_linux)
 
 
 class SystemdParseTests(unittest.TestCase):

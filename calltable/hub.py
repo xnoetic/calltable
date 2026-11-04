@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import socketserver
 import threading
 import time
 import urllib.parse
@@ -655,7 +656,10 @@ class Handler(BaseHTTPRequestHandler):
         art = self.hub.store.artifact(job_id, name)
         if not art:
             return self._error(404, "no such artifact")
-        path = Path(art["stored"])
+        # 两边都要 resolve()：temp/data 目录本身可能就是符号链接（macOS 的
+        # /var -> /private/var、Windows 的 8.3 短名），只 resolve 一边会让合法
+        # 路径被当成越界，返回 410。
+        path = Path(art["stored"]).resolve()
         if not path.is_relative_to(self.hub.artifact_dir.resolve()):
             return self._error(410, "artifact path rejected")
         if not path.exists():
@@ -939,12 +943,28 @@ class Handler(BaseHTTPRequestHandler):
         }
 
 
+class HubServer(ThreadingHTTPServer):
+    """跳过 ``HTTPServer.server_bind`` 里的 ``socket.getfqdn()``。
+
+    那句反查在 macOS 上走 mDNSResponder，没有解析服务时会卡几十秒，hub 在
+    这段时间里根本还没 listen（监听 backlog 未建立），客户端只能看到连接被
+    拒。``server_name`` 只给 CGI 环境变量用，这里不需要。
+    """
+
+    daemon_threads = True
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
+
 def serve(config: Config) -> None:
     hub = Hub(config)
     hub.start_janitor()
     hub.start_upstreams()
-    server = ThreadingHTTPServer((config.hub_bind, config.hub_port), Handler)
-    server.daemon_threads = True
+    server = HubServer((config.hub_bind, config.hub_port), Handler)
     server.hub = hub  # type: ignore[attr-defined]
     print(f"calltable hub listening on {config.hub_bind}:{config.hub_port} "
           f"(version {__version__}, data {config.data_dir})", flush=True)

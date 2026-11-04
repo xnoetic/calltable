@@ -425,5 +425,29 @@ class HubTests(unittest.TestCase):
         self.assertEqual(gitops.keep_refs(mirror), [])
 
 
+class HubServerTests(unittest.TestCase):
+    """hub 监听时不能做反向 DNS。
+
+    ``HTTPServer.server_bind`` 会调 ``socket.getfqdn()``；macOS 上这句走
+    mDNSResponder，解析服务不可用时会卡几十秒，期间 hub 还没 listen。
+    """
+
+    def test_bind_does_not_look_up_reverse_dns(self):
+        from unittest import mock
+
+        from calltable.hub import Handler, HubServer
+
+        def explode(*args, **kwargs):
+            raise AssertionError("hub must not resolve reverse DNS at bind time")
+
+        with mock.patch("socket.getfqdn", side_effect=explode):
+            server = HubServer(("127.0.0.1", 0), Handler)
+            try:
+                self.assertEqual(server.server_name, "127.0.0.1")
+                self.assertGreater(server.server_port, 0)
+            finally:
+                server.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()

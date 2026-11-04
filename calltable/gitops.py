@@ -39,13 +39,18 @@ GIT_CONFIG_OPTS = ["-c", "core.autocrlf=false", "-c", "core.longpaths=true",
 def git(args: list[str], cwd: str | Path | None = None,
         env: dict | None = None, check: bool = True,
         input_data: bytes | None = None,
-        timeout: float | None = None) -> subprocess.CompletedProcess:
+        timeout: float | None = None,
+        config_opts: list[str] | None = None) -> subprocess.CompletedProcess:
+    """跑一次 git。``config_opts=None`` 表示带上默认的 GIT_CONFIG_OPTS；
+    传 ``[]`` 表示用仓库自己的配置（``git status`` 这类「用户视角」的判断必须
+    这样，否则 Windows 上 autocrlf 检出的 CRLF 工作区会被误判成有改动）。"""
+    opts = GIT_CONFIG_OPTS if config_opts is None else config_opts
     full_env = os.environ.copy()
     full_env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if env:
         full_env.update(env)
     proc = subprocess.run(
-        ["git", *GIT_CONFIG_OPTS, *args], cwd=str(cwd) if cwd else None,
+        ["git", *opts, *args], cwd=str(cwd) if cwd else None,
         env=full_env, input=input_data, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=timeout,
     )
@@ -81,8 +86,16 @@ def rev_parse(repo: Path, rev: str) -> str | None:
 
 
 def is_dirty(repo: Path) -> bool:
-    """工作区/index 是否有任何改动（含未跟踪、未忽略文件）。"""
-    out = git(["status", "--porcelain", "--untracked-files=normal"], cwd=repo).stdout
+    """工作区/index 是否有任何改动（含未跟踪、未忽略文件）。
+
+    这里**不能**套 GIT_CONFIG_OPTS：它把 ``core.autocrlf`` 钉成 false，而
+    Windows 上 autocrlf 检出的工作区是 CRLF（Python 写文件也会变成 CRLF），
+    对照 LF blob 就会被判成「已修改」——一个干净仓库被当成脏树。判断
+    「有没有改动」必须用仓库自己的换行转换规则，也就是用户 ``git status``
+    看到的结果。
+    """
+    out = git(["status", "--porcelain", "--untracked-files=normal"], cwd=repo,
+              config_opts=[]).stdout
     return bool(out.strip())
 
 

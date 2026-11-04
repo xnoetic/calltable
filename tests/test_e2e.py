@@ -39,6 +39,24 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+def tail(path: Path, lines: int = 40) -> str:
+    """读日志尾部；日志不存在/读不了都不要把测试的失败原因盖掉。"""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<no log at {path}: {exc}>"
+    return "\n".join(text.splitlines()[-lines:])
+
+
+def proxy_note() -> str:
+    """回环地址不该走代理；失败信息里带上环境里的代理设置以免误判。"""
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception as exc:  # pragma: no cover - 极端环境
+        return f"getproxies failed: {type(exc).__name__}: {exc}"
+    return f"proxies={proxies}"
+
+
 def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                           text=True, check=True).stdout.strip()
@@ -152,18 +170,22 @@ class EndToEndTests(unittest.TestCase):
     @classmethod
     def _wait_health(cls, timeout=30):
         deadline = time.time() + timeout
+        last = "no attempt"
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{cls.port}/api/health", timeout=2):
                     return
-            except (urllib.error.URLError, OSError):
+            except (urllib.error.URLError, OSError) as exc:
+                last = f"{type(exc).__name__}: {exc}"
                 if cls.hub.poll() is not None:
                     raise RuntimeError("hub exited early:\n" +
                                        (cls.root / "hub.log").read_text(
                                            encoding="utf-8", errors="replace"))
                 time.sleep(0.2)
-        raise RuntimeError("hub did not become healthy")
+        raise RuntimeError(
+            f"hub did not become healthy on port {cls.port} ({last}; "
+            f"{proxy_note()})\nhub log:\n{tail(cls.root / 'hub.log')}")
 
     @classmethod
     def _wait_host_online(cls, timeout=30):

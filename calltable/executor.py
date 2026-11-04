@@ -584,7 +584,8 @@ class Executor:
     def _checkpoint(self, job_id: str, deadline: float, stage: str = "") -> None:
         if self._cancel_flags.get(job_id):
             raise Aborted("cancelled")
-        if time.time() > deadline:
+        # 用 >=：预算为 0（timeout=0）时必须立刻中止，不能靠时钟再走一格里。
+        if time.time() >= deadline:
             raise Aborted("timeout")
 
     def _supervise(self, job: dict, tree, job_id: str) -> tuple[str, str]:
@@ -784,7 +785,9 @@ class Executor:
                 if name not in ARTIFACT_SKIP_DIRS
                 and not (Path(dirpath) / name).is_symlink())
             for name in sorted(filenames):
-                if time.monotonic() > deadline:
+                # 用 >=：时间预算 0 表示「不允许扫描」，必须立即计为截断（
+                # Windows 上 time.monotonic() 精度 ~15.6ms，用 > 会漏判）。
+                if time.monotonic() >= deadline:
                     truncated = True
                     break
                 path = Path(dirpath) / name

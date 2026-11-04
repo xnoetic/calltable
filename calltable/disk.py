@@ -60,7 +60,7 @@ def directory_size(path: Path, deadline: float | None = None) -> int:
     """目录总大小；符号链接不跟随，错误静默跳过。超过 deadline 提前返回。"""
     total = 0
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
-        if deadline is not None and time.monotonic() > deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             break
         dirnames[:] = [name for name in dirnames
                        if not (Path(dirpath) / name).is_symlink()]
@@ -130,14 +130,14 @@ def runs_size(runs_root: Path, cache: dict | None = None,
         if cached and cached[0] == mtime:
             total += cached[1]
             continue
-        if time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             partial = True
             if cached:
                 total += cached[1]
             continue
         size = directory_size(entry, deadline=deadline)
         total += size
-        if time.monotonic() > deadline:
+        if time.monotonic() >= deadline:
             # walk 可能被截断：不要把这个偏小的值当成完整大小缓存下来。
             partial = True
             continue

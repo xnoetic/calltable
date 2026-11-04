@@ -26,6 +26,15 @@ def free_port() -> int:
         return sock.getsockname()[1]
 
 
+def tail(path, lines: int = 40) -> str:
+    """读日志尾部；读不了也不要把原本的失败原因盖掉。"""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<no log at {path}: {exc}>"
+    return "\n".join(text.splitlines()[-lines:])
+
+
 def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                           text=True, check=True).stdout.strip()
@@ -108,7 +117,8 @@ class RecoveryTests(unittest.TestCase):
     # ------------------------------------------------------------ 进程
     @classmethod
     def _start_hub(cls):
-        handle = (cls.logs / f"hub-{time.time_ns()}.log").open("w", encoding="utf-8")
+        cls.hub_log_path = cls.logs / f"hub-{time.time_ns()}.log"
+        handle = cls.hub_log_path.open("w", encoding="utf-8")
         cls.hub_log = handle
         cls.hub = subprocess.Popen(
             [sys.executable, "-m", "calltable", "hub", "--config",
@@ -116,14 +126,21 @@ class RecoveryTests(unittest.TestCase):
             cwd=str(REPO_ROOT), env=cls.env, stdout=handle,
             stderr=subprocess.STDOUT)
         deadline = time.time() + 30
+        last = "no attempt"
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(
                         f"http://127.0.0.1:{cls.port}/api/health", timeout=2):
                     return
-            except (OSError, urllib.error.URLError):
+            except (OSError, urllib.error.URLError) as exc:
+                last = f"{type(exc).__name__}: {exc}"
+                if cls.hub.poll() is not None:
+                    raise RuntimeError(
+                        "hub exited early:\n" + tail(cls.hub_log_path))
                 time.sleep(0.1)
-        raise RuntimeError("hub did not start")
+        raise RuntimeError(
+            f"hub did not start on port {cls.port} ({last})\n"
+            f"hub log:\n{tail(cls.hub_log_path)}")
 
     @classmethod
     def _stop_hub(cls):
@@ -140,7 +157,8 @@ class RecoveryTests(unittest.TestCase):
 
     @classmethod
     def _start_executor(cls):
-        handle = (cls.logs / f"exec-{time.time_ns()}.log").open("w", encoding="utf-8")
+        cls.exec_log_path = cls.logs / f"exec-{time.time_ns()}.log"
+        handle = cls.exec_log_path.open("w", encoding="utf-8")
         cls.exec_log = handle
         cls.executor = subprocess.Popen(
             [sys.executable, "-m", "calltable", "exec", "--config",
@@ -202,6 +220,7 @@ class RecoveryTests(unittest.TestCase):
     @classmethod
     def _wait_log(cls, job_id: str, text: str, timeout: float = 60):
         deadline = time.time() + timeout
+        job = None
         while time.time() < deadline:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{cls.port}/api/jobs/{job_id}/logs?offset=0",
@@ -212,8 +231,15 @@ class RecoveryTests(unittest.TestCase):
                         return
             except (OSError, urllib.error.URLError):
                 pass
+            try:
+                job = cls._api(f"/api/jobs/{job_id}")
+            except Exception:  # pragma: no cover - hub 正在重启等
+                pass
             time.sleep(0.2)
-        raise AssertionError(f"log never contained {text!r}")
+        raise AssertionError(
+            f"log never contained {text!r} within {timeout:.0f}s\n"
+            f"job: {job}\n"
+            f"executor log:\n{tail(getattr(cls, 'exec_log_path', ''))}")
 
     def _submit(self, label: str, command: list[str]) -> str:
         cli = subprocess.run(
