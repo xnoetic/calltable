@@ -135,7 +135,8 @@ class EndToEndM1Tests(unittest.TestCase):
             "hub_bind": "127.0.0.1",
             "hub_port": cls.port,
             "public_url": f"http://127.0.0.1:{cls.port}",
-            "hosts": {"testhost": {"slots": {"light": 2}}},
+            "hosts": {"testhost": {"slots": {"light": 2}},
+                      "idlehost": {"slots": {"light": 1}}},
             "exec_host": "testhost",
             "runs_root": str(root / "runs"),
             "mirror_root": str(root / "mirrors"),
@@ -284,10 +285,11 @@ class EndToEndM1Tests(unittest.TestCase):
 
     # ------------------------------------------------------------ 兼容性
     def test_legacy_payload_and_plain_get_are_unchanged(self):
+        # 用一个没有 executor 的主机，任务不会跑，状态断言是确定的。
         request = urllib.request.Request(
             f"http://127.0.0.1:{self.port}/api/jobs",
             data=json.dumps({
-                "project": "demo", "host": "testhost",
+                "project": "demo", "host": "idlehost",
                 "client_version": "0.2.0", "slot": "light",
                 "cmd": ["true"], "sha": ""}).encode(),
             method="POST",

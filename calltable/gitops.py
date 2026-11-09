@@ -188,11 +188,19 @@ def bundle_prerequisites(path: Path) -> list[str]:
     out = git(["bundle", "list-heads", str(path)], check=False)
     if out.returncode != 0:
         raise GitError(f"not a bundle: {path}: {out.stderr.strip()}")
-    # git bundle list-heads 只列 refs；前置提交要解析 pack 头部的注释。
+    # git bundle list-heads 只列 refs；前置提交要解析 bundle 头部注释。
+    # 只读头部（到空行为止）：pack 数据是二进制的，按行解码会随机产生
+    # 以 "-" 开头的垃圾行（历史上偶发把二进制当成了前置提交）。
+    header = b""
     with open(path, "rb") as handle:
-        head = handle.read(4096).decode("utf-8", "replace")
+        while b"\n\n" not in header and len(header) < 1024 * 1024:
+            chunk = handle.read(4096)
+            if not chunk:
+                break
+            header += chunk
+    text = header.split(b"\n\n", 1)[0].decode("utf-8", "replace")
     result = []
-    for line in head.splitlines():
+    for line in text.splitlines():
         if line.startswith("-"):
             token = line[1:].split()
             if token:
