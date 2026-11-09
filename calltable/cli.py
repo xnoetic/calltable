@@ -281,6 +281,9 @@ def cmd_run(config: Config, args) -> int:
                                     f"calltable snapshot ({submitter})")
     sha = submission["sha"]
     dirty = submission["dirty"]
+    # 内容身份：干净树用 commit sha，脏树用快照的 tree hash（重试内容不变
+    # 时 tree hash 不变，commit 时间戳不会导致幂等 key 冲突）。
+    code_tree = gitops.tree_sha(repo, sha) if sha else ""
     if base_ref and not submission["base_ref_sha"]:
         print(f"warning: base ref {base_ref!r} not found locally; "
               f"submitting without it", file=sys.stderr)
@@ -338,6 +341,7 @@ def cmd_run(config: Config, args) -> int:
             "base_ref_sha": submission["base_ref_sha"],
             "base_sha": submission["base_sha"],
             "dirty": dirty,
+            "tree_sha": code_tree,
             "timeout": (parse_duration(args.timeout)
                         if args.timeout else None),
             "bundle_id": server_bundle,

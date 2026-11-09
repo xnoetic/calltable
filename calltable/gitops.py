@@ -85,6 +85,13 @@ def rev_parse(repo: Path, rev: str) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
+def tree_sha(repo: Path, rev: str) -> str:
+    """提交（或快照提交）的 tree hash：内容相同则相同，与 commit 时间无关。"""
+    proc = git(["rev-parse", "--verify", "--quiet", f"{rev}^{{tree}}"],
+               cwd=repo, check=False)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
 def is_dirty(repo: Path) -> bool:
     """工作区/index 是否有任何改动（含未跟踪、未忽略文件）。
 

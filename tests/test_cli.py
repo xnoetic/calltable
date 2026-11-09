@@ -54,9 +54,14 @@ class ConfigSearchTests(unittest.TestCase):
                 self.assertEqual(find_config(None), self.user_cfg)
 
     def test_missing_everything_is_an_actionable_error(self):
-        with mock.patch("pathlib.Path.home", return_value=self.root / "nohome"):
-            with self.assertRaises(ConfigError) as ctx:
-                find_config(None)
+        # 测试环境总是设置 CALLTABLE_CONFIG（指向一个不存在的临时文件），
+        # 这个用例要模拟「什么都没有」，所以先清掉它。
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CALLTABLE_CONFIG", None)
+            with mock.patch("pathlib.Path.home",
+                            return_value=self.root / "nohome"):
+                with self.assertRaises(ConfigError) as ctx:
+                    find_config(None)
         self.assertIn("ct setup", str(ctx.exception))
 
     def test_profiles_dir_falls_back_to_the_install(self):
@@ -71,8 +76,10 @@ class ConfigSearchTests(unittest.TestCase):
             self.assertEqual(cfg.profiles_dir, custom)
 
     def test_default_hub_and_owner_tailnet(self):
-        with mock.patch("pathlib.Path.home", return_value=self.home):
-            config = load_config(None)
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CALLTABLE_CONFIG", None)
+            with mock.patch("pathlib.Path.home", return_value=self.home):
+                config = load_config(None)
         self.assertEqual(config.hub_url, DEFAULT_HUB_URL)
         self.assertTrue(DEFAULT_HUB_URL.startswith("http://127.0.0.1"))
         self.assertEqual(config.owner_tailnet, DEFAULT_OWNER_TAILNET)

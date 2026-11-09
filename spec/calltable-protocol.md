@@ -326,9 +326,12 @@ older than their tolerance (5 minutes is typical), compare in constant time,
 and de-duplicate on `webhook-id`.
 
 Retry semantics: delivery happens on a background thread, never in the
-scheduler path. Failures (network error, non-2xx) retry with exponential
-backoff `base * 2^(attempt-1)` capped at `max_delay` (defaults: base 2 s, cap
-300 s, 6 attempts). Each attempt is persisted (`attempts`, `next_attempt`,
+scheduler path. `2xx` is success. HTTP `408`, `429`, any `5xx`, and network
+errors are retried with exponential backoff `base * 2^(attempt-1)` capped at
+`max_delay` (defaults: base 2 s, cap 300 s, 6 attempts). Every other `4xx` means
+the request itself is wrong (bad URL, revoked endpoint, signature rejected):
+the delivery is marked `failed` immediately with the HTTP status recorded and
+is **not** retried. Each attempt is persisted (`attempts`, `next_attempt`,
 `last_error`) before it happens; a hub restart resumes pending deliveries.
 After the last attempt the delivery is marked `failed` and stays visible in
 `ct show`. A failed webhook never affects job state.
@@ -347,13 +350,21 @@ makes ticket taking safe to retry.
   are pruned.
 * The hub computes a fingerprint over the submission parameters:
   `project`, `host`, `cmd`, `base_ref`, `dirty`, resolved `slot`, resolved
-  `locks`, resolved `timeout`, `label`. Content-addressed inputs (`sha`,
-  `base_sha`, `base_ref_sha`, `bundle_id`) are **excluded** because `ct run`
-  creates a fresh snapshot commit — and therefore a fresh sha — on every
-  attempt, so a retry after a network failure must still match. `submitter`,
-  `agent`, and `webhooks` are excluded because the transport identity may
-  differ. Within one idempotency key, code changes are *not* a parameter; use a
-  new key when the submission meaning changes.
+  `locks`, resolved `timeout`, `label`, and a **code identity**:
+  * clean worktree: the commit `sha` (`commit:<sha>`);
+  * dirty worktree: the snapshot's **tree hash**, sent by the client as
+    `tree_sha` (`tree:<tree_sha>`). A tree hash depends only on content, not on
+    the snapshot commit's timestamp, so retrying unchanged content reuses the
+    ticket while any content change produces a different identity and `409`.
+  * If a third-party client sends `dirty: true` without `tree_sha`, the hub
+    falls back to the commit sha; such clients should send `tree_sha` to get
+    stable retries.
+  `base_sha`, `base_ref_sha`, and `bundle_id` are excluded because `ct run`
+  creates a fresh snapshot commit and re-uploads the bundle on every attempt.
+  `submitter`, `agent`, and `webhooks` are excluded because the transport
+  identity may differ. Within one idempotency key, changing the code is a
+  different submission and is rejected with `409`; use a new key for a new
+  verification.
 * Same key + same fingerprint inside the window → the original job is returned
   with `200` and `X-Calltable-Idempotent-Replay: true`; no new job, no new
   queue position, no new webhook.

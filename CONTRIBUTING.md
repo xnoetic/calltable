@@ -32,6 +32,14 @@ Some tests exercise real `git` repositories and real subprocesses; they create
 their fixtures in temporary directories and clean up after themselves. Tests
 that need a specific platform are skipped elsewhere.
 
+**Test isolation is mandatory.** Importing `tests` repoints `HOME`,
+`USERPROFILE`, `HOMEDRIVE`/`HOMEPATH` and `CALLTABLE_CONFIG` at a throwaway
+directory before any test loads `calltable`; a guard fails the suite if any
+user config/data path resolves into the real home. Never bypass that (for
+example by passing `--config` after `--` in a CLI argument list, which makes
+the CLI fall back to the user config), and never start a hub, executor or CLI
+against a real deployment from a test.
+
 ## Pull requests
 
 1. Keep changes focused; one behaviour per pull request when practical.

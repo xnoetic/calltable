@@ -355,8 +355,8 @@ class EndToEndM1Tests(unittest.TestCase):
 
             job = self._api(f"/api/jobs/{job_id}")
             self.assertEqual(job["webhooks"], [receiver.url])
-            self.assertIn("queue", job)
-            self.assertIn("runtime_seconds", job["queue"])
+            # 回执里的 queue/estimate 在提交响应上断言（stdout）；这里任务
+            # 可能已经开跑，不能再要求 queue 字段。
 
             waited = self._cli("wait", job_id, "--until", "done",
                                "--timeout", "120")
@@ -480,8 +480,26 @@ class EndToEndM1Tests(unittest.TestCase):
             self.assertEqual(dirty_second.returncode, 0, dirty_second.stderr)
             self.assertEqual(job_id_from(dirty_first.stdout),
                              job_id_from(dirty_second.stdout))
+            # 内容变了（tree hash 变了）：同一个 key 必须 409
+            dirty_file.write_text("dirty-changed", encoding="utf-8")
+            dirty_changed = self._submit(
+                "--detach", "--idempotency-key", "e2e-idem-dirty",
+                label="idem-dirty")
+            self.assertEqual(dirty_changed.returncode, 2, dirty_changed.stdout)
+            self.assertIn("different", dirty_changed.stderr)
         finally:
             dirty_file.unlink(missing_ok=True)
+
+        # 干净树：换一个 commit（内容可能相同）也算新代码，同一 key 必须 409。
+        head = git(self.repo, "rev-parse", "HEAD")
+        try:
+            git(self.repo, "commit", "--allow-empty", "-qm", "idem code bump")
+            bumped = self._submit("--detach", "--idempotency-key",
+                                  "e2e-idem-1", label="idem")
+            self.assertEqual(bumped.returncode, 2, bumped.stdout)
+            self.assertIn("different", bumped.stderr)
+        finally:
+            git(self.repo, "reset", "--hard", "-q", head)
 
         conflict = self._submit("--detach", "--idempotency-key", "e2e-idem-1",
                                 label="idem-other")

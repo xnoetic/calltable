@@ -178,9 +178,12 @@ each URL's `pending`/`delivered`/`failed` state. Examples:
 
 `ct run --idempotency-key <key>` (or the `Idempotency-Key` HTTP header) makes a
 retried submission reuse the same job inside the hub window (default 24 h).
-Same key + same parameters (project, host, cmd, sha, base refs, slot, locks,
-timeout, label) returns the original job with no new queue place; different
-parameters get `409` explaining the conflict. Details: spec §8.
+Same key + same parameters (project, host, cmd, base ref, slot, locks, timeout,
+label) **and the same code content** returns the original job with no new queue
+place. Code identity is the commit sha for a clean tree and the snapshot's tree
+hash for a dirty tree, so a retry after a network failure (same content) reuses
+the ticket while changed content gets `409` explaining the conflict. Details:
+spec §8.
 
 ### Queue-hold heartbeat (0.3)
 

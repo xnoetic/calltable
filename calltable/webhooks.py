@@ -139,11 +139,18 @@ class WebhookDispatcher(threading.Thread):
     def deliver(self, delivery: dict) -> bool:
         attempts = self.store.webhook_attempt(delivery["id"])
         payload = str(delivery["payload"]).encode("utf-8")
-        ok, status_code, error = self._post(delivery["url"], delivery["msg_id"],
-                                            payload)
+        ok, status_code, error, retryable = self._post(
+            delivery["url"], delivery["msg_id"], payload)
         if ok:
             self.store.webhook_delivered(delivery["id"], status_code)
             return True
+        if not retryable:
+            # 其他 4xx：请求本身错了，重试也没用，直接永久失败。
+            self.store.webhook_failed(delivery["id"], status_code, error)
+            print(f"[hub] webhook {delivery['event']} to "
+                  f"{redact_url(delivery['url'])} rejected permanently "
+                  f"(HTTP {status_code}); not retrying", flush=True)
+            return False
         if attempts >= self.max_attempts:
             self.store.webhook_failed(delivery["id"], status_code, error)
             print(f"[hub] webhook {delivery['event']} to "
@@ -159,10 +166,16 @@ class WebhookDispatcher(threading.Thread):
               f"retry in {delay:.1f}s): {error}", flush=True)
         return False
 
+    @staticmethod
+    def _retryable_status(status: int | None) -> bool:
+        if status is None:
+            return True  # 网络错误
+        return status in (408, 429) or status >= 500
+
     def _post(self, url: str, msg_id: str, payload: bytes
-              ) -> tuple[bool, int | None, str]:
+              ) -> tuple[bool, int | None, str, bool]:
         if not self.secret:
-            return False, None, "hub has no webhook_secret configured"
+            return False, None, "hub has no webhook_secret configured", False
         headers = build_headers(self.secret, msg_id, payload,
                                 version=self.version)
         request = urllib.request.Request(url, data=payload, method="POST",
@@ -172,20 +185,19 @@ class WebhookDispatcher(threading.Thread):
                 resp.read(1024)
                 status = int(getattr(resp, "status", 200))
                 if 200 <= status < 300:
-                    return True, status, ""
-                return False, status, f"HTTP {status}"
+                    return True, status, "", False
+                return (False, status, f"HTTP {status}",
+                        self._retryable_status(status))
         except urllib.error.HTTPError as exc:
             try:
                 exc.read(1024)
             except OSError:
                 pass
-            message = f"HTTP {exc.code}"
-            if exc.code >= 500 or exc.code == 429:
-                return False, exc.code, message
-            return False, exc.code, message
+            return (False, exc.code, f"HTTP {exc.code}",
+                    self._retryable_status(exc.code))
         except (urllib.error.URLError, OSError, ValueError) as exc:
             detail = getattr(exc, "reason", exc)
-            return False, None, f"{type(exc).__name__}: {detail}"
+            return False, None, f"{type(exc).__name__}: {detail}", True
 
 
 def deliveries_for_display(rows: list[dict]) -> list[dict]:

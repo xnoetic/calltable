@@ -29,8 +29,9 @@ SECRET = "whsec_" + base64.b64encode(RAW_SECRET).decode()
 class Receiver:
     """本地 HTTP 接收端：记录请求，按预设状态码回应。"""
 
-    def __init__(self, status: int = 204):
+    def __init__(self, status: int = 204, statuses: list[int] | None = None):
         self.status = status
+        self.statuses = list(statuses or [])
         self.requests: list[dict] = []
         outer = self
 
@@ -48,7 +49,8 @@ class Receiver:
                                 for key, value in self.headers.items()},
                     "body": body,
                 })
-                self.send_response(outer.status)
+                code = outer.statuses.pop(0) if outer.statuses else outer.status
+                self.send_response(code)
                 self.send_header("Content-Length", "0")
                 self.end_headers()
 
@@ -309,6 +311,48 @@ class DispatcherTests(unittest.TestCase):
                              {"delivered"})
         finally:
             reopened.close()
+
+    def test_other_4xx_is_a_permanent_failure(self):
+        self.receiver.status = 404
+        hub = self._hub()
+        try:
+            job = self._job(hub, webhooks=[self.receiver.url])
+            dispatcher = WebhookDispatcher(hub.store, hub.config)
+            hub.store.claim("h1", "w1")
+            self.assertEqual(dispatcher.run_once(), 1)
+            row = hub.store.webhook_deliveries(job["id"])[0]
+            self.assertEqual(row["status"], "failed")
+            self.assertEqual(row["attempts"], 1)
+            self.assertEqual(row["last_status"], 404)
+            self.assertIn("HTTP 404", row["last_error"])
+            # 不再重试，也不会再打接收端
+            self.assertEqual(dispatcher.run_once(), 0)
+            self.assertEqual(len(self.receiver.requests), 1)
+        finally:
+            hub.close()
+            hub.store.close()
+
+    def test_429_is_retried(self):
+        self.receiver.close()
+        self.receiver = Receiver(status=204, statuses=[429])
+        hub = self._hub()
+        try:
+            job = self._job(hub, webhooks=[self.receiver.url])
+            dispatcher = WebhookDispatcher(hub.store, hub.config)
+            hub.store.claim("h1", "w1")
+            self.assertEqual(dispatcher.run_once(), 1)
+            row = hub.store.webhook_deliveries(job["id"])[0]
+            self.assertEqual(row["status"], "pending")
+            self.assertEqual(row["attempts"], 1)
+            time.sleep(0.15)
+            self.assertEqual(dispatcher.run_once(), 1)
+            row = hub.store.webhook_deliveries(job["id"])[0]
+            self.assertEqual(row["status"], "delivered")
+            self.assertEqual(row["attempts"], 2)
+            self.assertEqual(len(self.receiver.requests), 2)
+        finally:
+            hub.close()
+            hub.store.close()
 
     def test_repeated_finish_does_not_enqueue_a_second_delivery(self):
         hub = self._hub()

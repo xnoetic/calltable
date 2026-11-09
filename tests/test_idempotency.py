@@ -161,6 +161,48 @@ class IdempotencyHttpTests(unittest.TestCase):
             self._post(self._body(), key="bad key with spaces")
         self.assertEqual(ctx.exception.code, 400)
 
+    def test_clean_tree_code_identity_is_the_commit_sha(self):
+        body = dict(self._body("code-clean"), dirty=False, sha="1" * 40,
+                    tree_sha="2" * 40)
+        with self._post(body, key="code-clean-key") as resp:
+            first = json.loads(resp.read())
+            self.assertEqual(resp.status, 201)
+        # 同样的内容（同 sha）重试 -> 复用
+        with self._post(body, key="code-clean-key") as resp:
+            second = json.loads(resp.read())
+            self.assertEqual(resp.status, 200)
+        self.assertEqual(first["id"], second["id"])
+        # 新的提交（sha 变了）-> 409，不能把旧结果当成新代码的结果
+        changed = dict(body, sha="3" * 40)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(changed, key="code-clean-key")
+        self.assertEqual(ctx.exception.code, 409)
+
+    def test_dirty_tree_code_identity_is_the_tree_hash(self):
+        dirty = dict(self._body("code-dirty"), dirty=True, sha="4" * 40,
+                     tree_sha="5" * 40)
+        with self._post(dirty, key="code-dirty-key") as resp:
+            first = json.loads(resp.read())
+            self.assertEqual(resp.status, 201)
+        # 重新生成的快照 commit sha 不同，但 tree hash 相同 -> 复用
+        regenerated = dict(dirty, sha="6" * 40)
+        with self._post(regenerated, key="code-dirty-key") as resp:
+            second = json.loads(resp.read())
+            self.assertEqual(resp.status, 200)
+        self.assertEqual(first["id"], second["id"])
+        # 内容变了，tree hash 变了 -> 409
+        changed = dict(dirty, sha="7" * 40, tree_sha="8" * 40)
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(changed, key="code-dirty-key")
+        self.assertEqual(ctx.exception.code, 409)
+
+    def test_malformed_tree_sha_is_rejected(self):
+        body = dict(self._body("bad-tree"), dirty=True, sha="9" * 40,
+                    tree_sha="not-a-hash")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self._post(body, key="bad-tree-key")
+        self.assertEqual(ctx.exception.code, 400)
+
     def test_response_includes_queue_and_capabilities(self):
         with self._post(self._body("receipt")) as resp:
             job = json.loads(resp.read())

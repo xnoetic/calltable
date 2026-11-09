@@ -360,6 +360,8 @@ class Hub:
         hold_seconds = self._job_hold_seconds(body)
         idempotency = self._job_idempotency(
             body, project=project, host=host, cmd=cmd,
+            sha=str(body.get("sha") or ""),
+            tree_sha=str(body.get("tree_sha") or "").strip(),
             base_ref=str(body.get("base_ref") or ""),
             dirty=bool(body.get("dirty")), slot=slot, locks=locks,
             timeout=timeout, label=str(body.get("label") or ""))
@@ -409,7 +411,8 @@ class Hub:
         return min(hold, 7 * 86400)
 
     def _job_idempotency(self, body: dict, *, project: str, host: str,
-                         cmd: list[str], base_ref: str, dirty: bool,
+                         cmd: list[str], sha: str, tree_sha: str,
+                         base_ref: str, dirty: bool,
                          slot: str, locks: list[str], timeout: int,
                          label: str) -> dict | None:
         key = str(body.get("idempotency_key") or "").strip()
@@ -418,10 +421,18 @@ class Hub:
         if not IDEMPOTENCY_RE.fullmatch(key):
             raise ValueError(
                 "idempotency key must be 1-200 characters of A-Z a-z 0-9 . _ : -")
+        if tree_sha and not re.fullmatch(r"[0-9a-f]{40}", tree_sha):
+            raise ValueError("tree_sha must be a 40-character hex object id")
+        # 代码身份也进入指纹：干净树 = commit sha；脏树 = 快照 tree hash。
+        # 重试同样的内容会复用，内容一变就 409，避免把旧结果当成新代码的结果。
+        if dirty and tree_sha:
+            code_identity = "tree:" + tree_sha
+        else:
+            code_identity = "commit:" + sha
         fingerprint = submission_fingerprint(
             project=project, host=host, cmd=list(cmd), base_ref=base_ref,
-            dirty=bool(dirty), slot=slot, locks=list(locks), timeout=timeout,
-            label=label)
+            dirty=bool(dirty), code_identity=code_identity, slot=slot,
+            locks=list(locks), timeout=timeout, label=label)
         return {"key": key, "fingerprint": fingerprint,
                 "window": self.config.idempotency_window_seconds}
 
