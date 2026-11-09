@@ -967,7 +967,7 @@ tr.row-flash td { animation: rowFlash .9s var(--ease); }
   margin-bottom: 26px;
 }
 .detail-grid > .card { display: flex; flex-direction: column; }
-.detail-grid > .card > .toolbar { margin-top: auto; }
+.detail-grid > .card > .toolbar { margin-top: auto; padding-top: 14px; }
 .meta {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(158px, 1fr));
@@ -994,6 +994,16 @@ tr.row-flash td { animation: rowFlash .9s var(--ease); }
   border-top: 1px dashed var(--line);
 }
 .meta-item.wide .meta-v { font-family: var(--mono); font-size: 12px; color: var(--text-2); }
+.meta-item.cmd .meta-v {
+  max-height: 12.5em;
+  overflow-y: auto;
+  margin-top: 4px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-3);
+  overscroll-behavior: contain;
+}
 .toolbar { display: flex; gap: 9px; flex-wrap: wrap; margin-top: 16px; }
 
 .term {
@@ -1336,7 +1346,7 @@ _BODY = r"""<header class="topbar">
         <div class="meta" id="d-meta"></div>
         <div class="toolbar">
           <button class="ghost-btn" type="button" id="follow" aria-pressed="true" onclick="toggleFollow()">自动刷新：开</button>
-          <button class="ghost-btn danger" type="button" onclick="cancelJob()">取消任务</button>
+          <button class="ghost-btn danger" type="button" id="d-cancel" onclick="cancelJob()">取消任务</button>
         </div>
       </section>
 
@@ -2261,7 +2271,7 @@ function renderDetail(job) {
   rows.push(metaItem('峰值核数', (job.cpu_peak_cores || 0).toFixed(2) + 'c'));
   rows.push(metaItem('内存峰值', esc(fmtBytes(job.mem_peak))));
   rows.push(metaItem('命令', '<span class="mono">' +
-    esc((job.cmd || []).join(' ') || '–') + '</span>', 'wide'));
+    esc((job.cmd || []).join(' ') || '–') + '</span>', 'wide cmd'));
   if (job.error) rows.push(metaItem('错误', esc(job.error), 'wide'));
   document.getElementById('d-meta').innerHTML = rows.join('');
 }
@@ -2477,6 +2487,15 @@ function cancelJob() {
     .catch(function () { alert('取消失败'); });
 }
 
+function renderMissing(jobId) {
+  setText(document.getElementById('d-id'), jobId);
+  setText(document.getElementById('d-sub'), '找不到这个任务：可能编号有误，或已按保留期清理。');
+  document.getElementById('d-status').innerHTML =
+    '<span class="chip chip-warn">' + icon('alert') + '任务不存在</span>';
+  document.getElementById('d-steps').innerHTML = '';
+  document.getElementById('d-cancel').hidden = true;
+}
+
 function refreshDetail() {
   if (!detailId || busyDetail) return;
   busyDetail = true;
@@ -2497,7 +2516,14 @@ function refreshDetail() {
         if (jobId === detailId) drawChart(payload.samples || payload || []);
       });
   }).catch(function (err) {
-    if (String(err && err.message) !== 'unauthorized') setConn(false);
+    const msg = String(err && err.message);
+    if (msg.indexOf('404') === 0) {
+      /* hub 正常，只是没有这个任务：别报「连接中断」，也别一直显示载入中 */
+      setConn(true);
+      if (jobId === detailId) renderMissing(jobId);
+    } else if (msg !== 'unauthorized') {
+      setConn(false);
+    }
   }).then(function () {
     busyDetail = false;
     spin(false);
@@ -2547,6 +2573,7 @@ function route() {
       document.getElementById('d-meta').innerHTML = '';
       document.getElementById('d-artifacts').innerHTML = '';
       document.getElementById('d-webhooks').innerHTML = '';
+      document.getElementById('d-cancel').hidden = false;
       document.getElementById('d-status').innerHTML = '';
       setText(document.getElementById('d-logsize'), '末尾 200 KB');
     }
