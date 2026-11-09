@@ -312,6 +312,34 @@ class EndToEndM1Tests(unittest.TestCase):
             self.assertIsNone(resp.headers.get("X-Calltable-Wait-Result"))
             self.assertEqual(json.loads(resp.read())["status"], "cancelled")
 
+    def test_old_executor_protocol_still_works(self):
+        """0.2 执行器的请求形状（heartbeat/claim/finish）在新 hub 上照常工作。"""
+        created = self._api("/api/jobs", method="POST", body={
+            "project": "demo", "host": "idlehost", "client_version": "0.2.0",
+            "slot": "light", "cmd": ["true"], "sha": ""})
+        self.assertEqual(created["status"], "queued")
+
+        heartbeat = self._api("/api/hosts/heartbeat", method="POST", body={
+            "host": "idlehost", "worker": "old-executor-1", "running": [],
+            "os": "linux-posix", "version": "0.2.0"})
+        self.assertTrue(heartbeat["ok"])
+
+        claimed = self._api("/api/exec/claim", method="POST", body={
+            "host": "idlehost", "worker": "old-executor-1"})
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed["id"], created["id"])
+        self.assertEqual(claimed["status"], "running")
+
+        finished = self._api(
+            f"/api/exec/jobs/{created['id']}/finish", method="POST",
+            body={"status": "succeeded", "exit_code": 0})
+        self.assertEqual(finished["status"], "succeeded")
+        self.assertEqual(finished["exit_code"], 0)
+        detail = self._api(f"/api/jobs/{created['id']}")
+        self.assertEqual(detail["status"], "succeeded")
+        self.assertIsNotNone(detail["started"])
+        self.assertIsNotNone(detail["finished"])
+
     # ------------------------------------------------------------ 回执 + 等待 + webhook
     def test_receipt_wait_and_signed_webhooks(self):
         receiver = Receiver()
