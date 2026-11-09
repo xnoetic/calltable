@@ -20,6 +20,15 @@ from .config import (DEFAULT_HUB_URL, DEFAULT_OWNER_TAILNET, Config,
 from .profiles import find_profile, load_profiles, resolve_job, resolve_host
 from .seed import SeedError, mirror_root_for, seed as seed_mirror
 from .util import human_bytes, human_duration, parse_duration
+from .webhooks import validate_url
+
+TERMINAL_STATUSES = ("succeeded", "failed", "cancelled", "timeout", "error")
+#: 本地 --timeout 先到期（任务可能还在跑）：agent 可据此重试。
+EXIT_WAIT_TIMEOUT = 75
+#: 长轮询单次最长等待（服务端也会截到 60s）。
+WAIT_CHUNK = 60
+#: `ct run --wait` 要让日志尽快刷出来，用更小的块。
+RUN_WAIT_CHUNK = 5
 
 #: 超过这个大小的 bundle 会在慢链路上传很久，先提示去 seed。
 SEED_WARN_BYTES = 20 * 1024 * 1024
@@ -82,7 +91,8 @@ def _job_line(job: dict) -> str:
     queue = ""
     if job.get("status") == "queued":
         queue = (f" [queued {human_duration(job.get('queued_seconds', 0))}, "
-                 f"{job.get('ahead', 0)} ahead]")
+                 f"{job.get('ahead', 0)} ahead, "
+                 f"est {_estimate_short(job.get('queue'))}]")
     return (f"{job['id']:<28} {job['project']:<10} {job['host']:<10} "
             f"{job['status']:<10}{tail:<6} {human_duration(dur):>8} "
             f"cpu={job.get('cpu_total_sec', 0):.1f}s/"
@@ -90,6 +100,46 @@ def _job_line(job: dict) -> str:
             f"mem={_fmt_mem(job.get('mem_peak'))} "
             f"{('[' + job['agent'] + '] ') if job.get('agent') else ''}"
             f"{job.get('label', '')}{queue}")
+
+
+def _estimate_short(queue: dict | None) -> str:
+    """排队行的一行式预计：`wait 3m20s / run 5m00s` 或 `unknown`。"""
+    if not queue or not queue.get("known"):
+        return "unknown"
+    return (f"wait {human_duration(queue.get('wait_seconds'))} / "
+            f"run {human_duration(queue.get('runtime_seconds'))}")
+
+
+def _estimate_lines(job: dict) -> list[str]:
+    """回执/详情里的预计说明，明确区分已知与未知（不猜）。"""
+    queue = job.get("queue") or {}
+    if job.get("status") != "queued":
+        return []
+    ahead = int(queue.get("ahead", job.get("ahead") or 0))
+    where = job.get("group_name") or job.get("host")
+    lines = [f"  queue: {ahead} ahead of you on {where} (slot {job.get('slot')}), "
+             f"waiting {human_duration(job.get('queued_seconds', 0))}"]
+    wait = queue.get("wait_seconds")
+    runtime = queue.get("runtime_seconds")
+    samples = int(queue.get("runtime_samples") or 0)
+    blockers = int(queue.get("wait_unknown_blockers") or 0)
+    basis = queue.get("runtime_basis") or ""
+    detail = (f"median of {samples} recent succeeded run(s)"
+              + (f" for {basis}" if basis else ""))
+    if not queue:
+        lines.append("  estimate: unknown (hub does not report estimates)")
+    elif runtime is None:
+        lines.append(
+            f"  estimate: unknown (runtime history {samples} sample(s), "
+            f"{blockers} blocker(s) without an estimate)")
+    elif wait is None:
+        lines.append(f"  estimate: wait unknown ({blockers} blocker(s) "
+                     f"without an estimate), run {human_duration(runtime)} "
+                     f"({detail})")
+    else:
+        lines.append(f"  estimate: wait {human_duration(wait)}, "
+                     f"run {human_duration(runtime)} ({detail})")
+    return lines
 
 
 # ------------------------------------------------------------------ run
@@ -171,6 +221,12 @@ def plan_bundle(repo: Path, sha: str, base_ref_sha: str,
 
 def cmd_run(config: Config, args) -> int:
     dry_run = bool(getattr(args, "dry_run", False))
+    try:
+        notify = _validated_webhooks(getattr(args, "notify", None) or [])
+        hold_seconds = _hold_seconds(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     try:
         repo = gitops.repo_root(args.repo or ".")
     except gitops.GitError:
@@ -263,7 +319,8 @@ def cmd_run(config: Config, args) -> int:
             server_bundle = result["bundle_id"]
         else:
             print("  bundle=none (hub already has these commits)", flush=True)
-        job = client.post_json("/api/jobs", {
+        idempotency_key = (getattr(args, "idempotency_key", "") or "").strip()
+        body = {
             "project": args.project,
             "host": host,
             # 只送显式值；规则与 profile 默认值交给 hub 统一算。
@@ -284,11 +341,30 @@ def cmd_run(config: Config, args) -> int:
             "timeout": (parse_duration(args.timeout)
                         if args.timeout else None),
             "bundle_id": server_bundle,
-        })
+            "webhooks": notify,
+            "hold_seconds": hold_seconds,
+        }
+        if idempotency_key:
+            body["idempotency_key"] = idempotency_key
+        try:
+            job, response_headers = client.request(
+                "POST", "/api/jobs", json_body=body,
+                headers={"Idempotency-Key": idempotency_key}
+                if idempotency_key else None)
+        except HubError as exc:
+            detail = None
+            if isinstance(exc.payload, dict):
+                detail = exc.payload.get("error")
+            print(f"error: {detail or exc}", file=sys.stderr)
+            return 2 if exc.status and 400 <= exc.status < 500 else 1
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
-    print(f"queued {job['id']}")
+    replay = bool(job.get("idempotent_replay")
+                  or response_headers.get("X-Calltable-Idempotent-Replay"))
+    print(("already queued " if replay else "queued ") + job["id"])
+    if replay:
+        print("  idempotency: replayed an existing job; no new ticket taken")
     print(f"  project={job['project']} host={job['host']} slot={job['slot']} "
           f"locks={','.join(job.get('locks_display') or job['locks']) or '-'} "
           f"timeout={human_duration(job.get('timeout'))}")
@@ -306,11 +382,55 @@ def cmd_run(config: Config, args) -> int:
     if base_ref:
         print(f"  {base_ref}={submission['base_ref_sha'][:12] or '-'} "
               f"(baseline {submission['base_sha'][:12] or '-'})")
+    for line in _estimate_lines(job):
+        print(line)
+    _warn_old_hub(args, job, hold_seconds)
+    if job.get("webhooks"):
+        print(f"  notify: {len(job['webhooks'])} webhook(s) on job.started/"
+              "job.finished (Standard Webhooks signature)")
+    if hold_seconds and job.get("hold_seconds"):
+        print(f"  hold: ticket is cancelled if no heartbeat arrives for "
+              f"{human_duration(job['hold_seconds'])} while queued; "
+              f"`ct wait {job['id']}` keeps it alive automatically")
     if not args.wait:
-        print(f"  follow: {_cli_prefix(args)} logs {job['id']} -f")
+        print(f"  follow: {_cli_prefix(args)} wait {job['id']} "
+              "--until done   (or: logs -f)")
         return 0
 
-    return _follow(client, job["id"], timeout=timeout + 120)
+    return _follow(client, job["id"], timeout=timeout + 120,
+                   until="done", chunk=RUN_WAIT_CHUNK, stream_logs=True)
+
+
+def _validated_webhooks(urls: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in urls:
+        url = validate_url(value)
+        if url not in result:
+            result.append(url)
+    return result
+
+
+def _hold_seconds(args) -> int:
+    if not getattr(args, "hold_while_alive", False):
+        return 0
+    try:
+        seconds = parse_duration(getattr(args, "hold_timeout", None), 180)
+    except ValueError as exc:
+        raise ValueError(f"--hold-timeout: {exc}") from None
+    return max(1, int(seconds))
+
+
+def _warn_old_hub(args, job: dict, hold_seconds: int) -> None:
+    """新客户端连旧 hub：功能不可用时明确告警，而不是默默失效。"""
+    if (getattr(args, "notify", None) or []) and not job.get("webhooks"):
+        print("warning: hub did not accept webhooks (hub older than 0.3); "
+              "no notifications will be sent", file=sys.stderr)
+    if getattr(args, "idempotency_key", "") and not job.get("idempotency_key"):
+        print("warning: hub did not echo idempotency_key (hub older than 0.3); "
+              "a retry may take a second ticket", file=sys.stderr)
+    if hold_seconds and not job.get("hold_seconds"):
+        print("warning: hub ignored --hold-while-alive (hub older than 0.3); "
+              "the ticket will not expire while queued", file=sys.stderr)
 
 
 def _cli_prefix(args) -> str:
@@ -321,46 +441,117 @@ def _cli_prefix(args) -> str:
     return prefix
 
 
-def _follow(client: HubClient, job_id: str, timeout: float) -> int:
-    offset = 0
+def _follow(client: HubClient, job_id: str, timeout: float,
+            until: str = "done", chunk: float = WAIT_CHUNK,
+            stream_logs: bool = True) -> int:
+    """用长轮询等到条件满足；旧 hub 忽略 wait 时降级为 2s 轮询。"""
     deadline = time.time() + timeout
-    job = None
-    last_queue_print = 0.0
+    offset = 0
+    last_progress = None
+    # 先探一次任务，拿到 hold_seconds：长轮询块不能长于 hold/3，否则
+    # 客户端在阻塞期间无法心跳，会被 hub 当成弃号取消。
+    hold = 0
+    job0 = None
+    try:
+        job0, _ = client.request("GET", f"/api/jobs/{job_id}")
+        if job0:
+            hold = int(job0.get("hold_seconds") or 0)
+    except HubError:
+        pass
+    if hold:
+        chunk = min(chunk, max(1.0, hold / 3.0))
+        if (job0 or {}).get("status") == "queued":
+            try:
+                client.post_json(f"/api/jobs/{job_id}/heartbeat", {})
+            except HubError:
+                pass
     while True:
-        try:
-            job = client.get_json(f"/api/jobs/{job_id}")
-            if job.get("status") == "queued" and time.time() - last_queue_print >= 60:
-                last_queue_print = time.time()
-                print(f"queued {human_duration(job.get('queued_seconds', 0))}, "
-                      f"{job.get('ahead', 0)} ahead", flush=True)
-            payload, headers = client.request(
-                "GET", f"/api/jobs/{job_id}/logs", params={"offset": offset},
-                raw=True)
-            if payload:
-                sys.stdout.write(payload.decode("utf-8", "replace"))
-                sys.stdout.flush()
-                offset = int(headers.get("X-Calltable-Next", offset + len(payload)))
-        except HubError as exc:
-            print(f"\n[hub] {exc}", file=sys.stderr)
-            return 1
-        if job["status"] in ("succeeded", "failed", "cancelled", "timeout", "error"):
-            # 收尾再拉一次，确保最后一块日志不丢
-            payload, headers = client.request(
-                "GET", f"/api/jobs/{job_id}/logs", params={"offset": offset},
-                raw=True)
-            if payload:
-                sys.stdout.write(payload.decode("utf-8", "replace"))
-                sys.stdout.flush()
-            print(f"\n[{job['status']}] exit={job.get('exit_code')} "
-                  f"duration={human_duration((job.get('finished') or time.time()) - job['started'] if job.get('started') else 0)}")
-            if job.get("error"):
-                print(f"error: {job['error']}", file=sys.stderr)
-            return _exit_code(job)
-        if time.time() > deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
             print("\n[calltable] local wait timed out; job may still be running",
                   file=sys.stderr)
-            return 124
-        time.sleep(0.7)
+            return EXIT_WAIT_TIMEOUT
+        try:
+            job, headers = _wait_call(client, job_id, until,
+                                      min(chunk, remaining))
+        except HubError as exc:
+            if exc.status == 503:  # 并发等待上限：稍后重试，不是错误
+                time.sleep(min(1.0, max(0.05, remaining)))
+                continue
+            print(f"\n[hub] {exc}", file=sys.stderr)
+            return 1
+        if job is None:
+            print(f"[hub] no such job: {job_id}", file=sys.stderr)
+            return 2
+        result = headers.get("X-Calltable-Wait-Result")
+        if job.get("status") == "queued":
+            if job.get("hold_seconds"):
+                try:
+                    client.post_json(f"/api/jobs/{job_id}/heartbeat", {})
+                except HubError:
+                    pass
+            progress = (job.get("ahead"), int(job.get("queued_seconds") or 0) // 60)
+            if progress != last_progress:
+                last_progress = progress
+                print(f"queued {human_duration(job.get('queued_seconds', 0))}, "
+                      f"{job.get('ahead', 0)} ahead, "
+                      f"est {_estimate_short(job.get('queue'))}", flush=True)
+        if stream_logs:
+            offset = _fetch_logs(client, job_id, offset)
+        if _satisfied(job, until):
+            if stream_logs:
+                _fetch_logs(client, job_id, offset)
+            _report_wait_result(job, until)
+            if until == "started" and job.get("status") not in TERMINAL_STATUSES:
+                return 0
+            return _exit_code(job)
+        if result is None:
+            # 0.2 hub 没有 X-Calltable-Wait-Result，说明 wait 被忽略：
+            # 按文档降级成 2s 轮询，避免空转。
+            time.sleep(min(2.0, max(0.2, remaining)))
+
+
+def _wait_call(client: HubClient, job_id: str, until: str,
+               chunk: float) -> tuple[dict | None, dict]:
+    params: dict = {"until": until}
+    if chunk and chunk > 0:
+        params["wait"] = max(1, int(chunk))
+    payload, headers = client.request("GET", f"/api/jobs/{job_id}",
+                                      params=params)
+    return payload, headers
+
+
+def _fetch_logs(client: HubClient, job_id: str, offset: int) -> int:
+    payload, headers = client.request(
+        "GET", f"/api/jobs/{job_id}/logs", params={"offset": offset},
+        raw=True)
+    if payload:
+        sys.stdout.write(payload.decode("utf-8", "replace"))
+        sys.stdout.flush()
+        return int(headers.get("X-Calltable-Next", offset + len(payload)))
+    return offset
+
+
+def _satisfied(job: dict, until: str) -> bool:
+    if job.get("status") in TERMINAL_STATUSES:
+        return True
+    if until == "started":
+        return job.get("started") is not None
+    return False
+
+
+def _report_wait_result(job: dict, until: str) -> None:
+    if until == "started" and job.get("status") not in TERMINAL_STATUSES:
+        print(f"[started] {job['id']} host={job.get('host')} "
+              f"slot={job.get('slot')}")
+        return
+    duration = 0
+    if job.get("started"):
+        duration = (job.get("finished") or time.time()) - job["started"]
+    print(f"\n[{job['status']}] exit={job.get('exit_code')} "
+          f"duration={human_duration(duration)}")
+    if job.get("error"):
+        print(f"error: {job['error']}", file=sys.stderr)
 
 
 def _exit_code(job: dict) -> int:
@@ -422,6 +613,11 @@ def cmd_show(config: Config, args) -> int:
     if job.get("status") == "queued":
         print(f"queued    {human_duration(job.get('queued_seconds', 0))} "
               f"({job.get('ahead', 0)} ahead of it for the same slot/locks)")
+        for line in _estimate_lines(job):
+            print(line.strip())
+    if job.get("hold_seconds"):
+        print(f"hold      {human_duration(job['hold_seconds'])} without a "
+              "queue heartbeat cancels it; `ct wait` heartbeats automatically")
     print(f"started   {_fmt_time(job.get('started'))}")
     print(f"finished  {_fmt_time(job.get('finished'))}")
     if job.get("started"):
@@ -432,6 +628,18 @@ def cmd_show(config: Config, args) -> int:
           f"mem={_fmt_mem(job.get('mem_peak'))}")
     if job.get("error"):
         print(f"error     {job['error']}")
+    deliveries = job.get("webhook_deliveries") or []
+    if deliveries:
+        print("webhooks")
+        for entry in deliveries:
+            print(f"  {entry['url']}")
+            for event in entry.get("events") or []:
+                detail = (f"    {event['event']:<13} {event['status']:<10} "
+                          f"attempts={event.get('attempts', 0)} "
+                          f"last={event.get('last_status') or '-'}")
+                if event.get("last_error"):
+                    detail += f" error={event['last_error']}"
+                print(detail)
     artifacts = job.get("artifacts") or []
     if artifacts:
         print("artifacts")
@@ -476,11 +684,24 @@ def cmd_seed(config: Config, args) -> int:
 
 
 def cmd_wait(config: Config, args) -> int:
-    """重新挂到一个 detach 的任务上，并以它的退出码退出。"""
+    """等一个任务：长轮询到 started/done，并以任务的退出码退出。"""
     client = _client(config, args)
-    job = client.get_json(f"/api/jobs/{args.id}")
-    timeout = float(job.get("timeout") or 3600) + 300
-    return _follow(client, args.id, timeout=timeout)
+    try:
+        job = client.get_json(f"/api/jobs/{args.id}")
+    except HubError as exc:
+        print(f"[hub] {exc}", file=sys.stderr)
+        return 2 if exc.status == 404 else 1
+    until = getattr(args, "until", "done") or "done"
+    if getattr(args, "timeout", None):
+        try:
+            timeout = float(parse_duration(args.timeout))
+        except ValueError as exc:
+            print(f"error: --timeout: {exc}", file=sys.stderr)
+            return 2
+    else:
+        timeout = float(job.get("timeout") or 3600) + 300
+    return _follow(client, args.id, timeout=timeout, until=until,
+                   chunk=WAIT_CHUNK, stream_logs=(until == "done"))
 
 
 def cmd_doctor(config: Config | None, args) -> int:
@@ -672,6 +893,18 @@ def build_parser() -> argparse.ArgumentParser:
                      help="upload even when the bundle is larger than 20MB")
     run.add_argument("--wait", action="store_true", help="stream logs and exit with job code")
     run.add_argument("--detach", action="store_true", help="return immediately (default)")
+    run.add_argument("--notify", action="append", default=[], metavar="URL",
+                     help="webhook URL for job.started/job.finished (repeatable; "
+                          "http/https only, Standard Webhooks signature)")
+    run.add_argument("--idempotency-key", metavar="KEY",
+                     help="reuse one job for repeated submissions within the hub "
+                          "window instead of taking a new ticket")
+    run.add_argument("--hold-while-alive", action="store_true",
+                     help="cancel the ticket if the client stops heartbeating "
+                          "while the job is queued (ct wait heartbeats for you)")
+    run.add_argument("--hold-timeout", default="180", metavar="DURATION",
+                     help="silence before a --hold-while-alive ticket expires "
+                          "(default 180s; e.g. 90s, 5m)")
     run.add_argument("--label", default="")
     run.add_argument("--submitter", default="")
     run.add_argument("--agent", default="",
@@ -712,9 +945,23 @@ def build_parser() -> argparse.ArgumentParser:
                            "executor: mirror_root)")
     seed.set_defaults(func=cmd_seed)
 
-    wait = csub.add_parser("wait", help="re-attach to a job and exit with its code")
+    wait = csub.add_parser(
+        "wait", help="block until a job starts/finishes and exit with its code",
+        epilog=("exit codes: the job's own code when done (0 = success), 0 for "
+                "--until started, 130 = cancelled, 124 = job timeout, "
+                "75 = local --timeout expired while the job may still run, "
+                "1 = hub/API error, 2 = unknown job or bad usage. "
+                "Uses the hub's long poll (no sleep loop); against a 0.2 hub it "
+                "falls back to a 2s poll."),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     _add_cli_options(wait)
     wait.add_argument("id")
+    wait.add_argument("--until", choices=["started", "done"], default="done",
+                      help="return as soon as the job starts, or wait for the "
+                           "terminal state (default: done)")
+    wait.add_argument("--timeout", metavar="DURATION",
+                      help="give up after this long (e.g. 30m); exits 75 "
+                           "while the job may still be running")
     wait.set_defaults(func=cmd_wait)
 
     doctor = csub.add_parser("doctor", help="check this machine can use calltable")

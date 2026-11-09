@@ -20,10 +20,12 @@ hub 启动时把遗留的 running 任务标成 ``needs_reconcile``，但不刷�
 from __future__ import annotations
 
 import sqlite3
+import statistics
 import threading
+import uuid
 from pathlib import Path
 
-from .util import json_dumps, json_loads, new_id, now
+from .util import iso, json_dumps, json_loads, new_id, now
 
 #: 主机心跳超时（秒）。15 分钟：网络抖动/短暂挂起不应该误杀任务。
 HOST_STALE_SECONDS = 900
@@ -31,6 +33,12 @@ HOST_STALE_SECONDS = 900
 MISSING_STRIKES = 2
 #: 单任务日志硬上限。
 DEFAULT_LOG_CAP = 256 * 1024 * 1024
+#: 预计耗时：同一 estimate key 最近多少个成功任务参与中位数。
+ESTIMATE_WINDOW = 20
+#: 预计耗时：样本少于此数时明确显示未知，不做猜测。
+ESTIMATE_MIN_SAMPLES = 3
+#: 预计耗时的进程内缓存时间（秒）。任务完成时会整体失效。
+ESTIMATE_CACHE_SECONDS = 10.0
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS hosts (
@@ -127,6 +135,45 @@ CREATE TABLE IF NOT EXISTS artifacts (
     stored TEXT NOT NULL,
     PRIMARY KEY (job_id, name)
 );
+
+-- 0.3：单调递增的事件日志（SSE 断线续传 / webhook 派发来源）。
+CREATE TABLE IF NOT EXISTS events (
+    seq    INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts     REAL NOT NULL,
+    job_id TEXT NOT NULL DEFAULT '',
+    type   TEXT NOT NULL,
+    data   TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS events_job ON events(job_id, seq);
+
+-- 0.3：webhook 投递记录，落库以便 hub 重启后继续投递。
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id       TEXT NOT NULL,
+    event        TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    msg_id       TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    next_attempt REAL NOT NULL DEFAULT 0,
+    last_status  INTEGER,
+    last_error   TEXT NOT NULL DEFAULT '',
+    created      REAL NOT NULL,
+    updated      REAL NOT NULL,
+    UNIQUE(job_id, event, url)
+);
+CREATE INDEX IF NOT EXISTS webhook_due
+    ON webhook_deliveries(status, next_attempt);
+
+-- 0.3：幂等取号（key 在窗口内映射到同一个 job）。
+CREATE TABLE IF NOT EXISTS idempotency (
+    key         TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created     REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency(created);
 """
 
 #: 旧库升级：(表, 列, 定义)
@@ -147,6 +194,11 @@ MIGRATIONS = [
     ("jobs", "misses", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "needs_reconcile", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "purged", "INTEGER NOT NULL DEFAULT 0"),
+    # 0.3
+    ("jobs", "webhooks", "TEXT NOT NULL DEFAULT '[]'"),
+    ("jobs", "hold_seconds", "INTEGER NOT NULL DEFAULT 0"),
+    ("jobs", "last_hold", "REAL"),
+    ("jobs", "idempotency_key", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 RUNNING = "running"
@@ -174,20 +226,50 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+class IdempotencyConflict(ValueError):
+    """同一个 idempotency key 被用于不同参数的提交。"""
+
+
 class Store:
     """每个进程一个连接；hub 是 ThreadingHTTPServer，用一个锁串行化写事务。"""
 
-    def __init__(self, db_path: str | Path, log_cap: int = DEFAULT_LOG_CAP):
+    def __init__(self, db_path: str | Path, log_cap: int = DEFAULT_LOG_CAP,
+                 estimate_window: int = ESTIMATE_WINDOW,
+                 estimate_min_samples: int = ESTIMATE_MIN_SAMPLES):
         self.path = str(db_path)
         self.log_cap = int(log_cap)
+        self.estimate_window = max(1, int(estimate_window))
+        self.estimate_min_samples = max(1, int(estimate_min_samples))
+        # hub 注入：全局 webhook URL / 看板链接 / 幂等窗口。
+        self.webhook_urls: list[str] = []
+        self.dashboard_base_url = ""
+        self.idempotency_window = 86400
         self.lock = threading.RLock()
         self.conn = connect(db_path)
+        # 状态变化通知：长轮询与 SSE 用条件变量等待，不短间隔轮询。
+        self._changed = threading.Condition(self.lock)
+        self.change_seq = 0
+        self._estimate_cache: dict[tuple, tuple[float, dict | None]] = {}
 
     def close(self) -> None:
         try:
             self.conn.close()
         except Exception:
             pass
+
+    # ------------------------------------------------------------ 变化通知
+    def _bump(self) -> None:
+        """状态变化：唤醒长轮询 / SSE 线程（调用方已持有 self.lock）。"""
+        self.change_seq += 1
+        self._changed.notify_all()
+
+    def wait_change(self, seq: int, timeout: float) -> int:
+        """等待状态变化；返回当前 change_seq。"""
+        with self._changed:
+            if self.change_seq != seq:
+                return self.change_seq
+            self._changed.wait(max(0.0, float(timeout)))
+            return self.change_seq
 
     # ------------------------------------------------------------ 启动
     def mark_running_for_reconcile(self) -> int:
@@ -404,23 +486,79 @@ class Store:
                    base_ref: str = "", base_ref_sha: str = "",
                    base_sha: str = "", dirty: bool = False,
                    timeout: int = 10800, bundle_id: str = "",
-                   group_name: str = "", targets: list[str] | None = None) -> dict:
+                   group_name: str = "", targets: list[str] | None = None,
+                   webhooks: list[str] | None = None,
+                   hold_seconds: int = 0,
+                   idempotency: dict | None = None) -> dict:
+        """创建任务；``idempotency`` = {key, fingerprint, window} 时原子去重。"""
         job_id = new_id()
+        replay_id = ""
         with self.lock:
-            self.conn.execute(
-                """INSERT INTO jobs(id, project, host, slot, locks, cmd, profile,
-                       submitter, agent, label, sha, base_ref, base_ref_sha,
-                       base_sha, dirty, status, created, timeout, bundle_id,
-                       group_name, targets)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job_id, project, host, slot, json_dumps(locks), json_dumps(cmd),
-                 profile, submitter, agent, label, sha, base_ref, base_ref_sha,
-                 base_sha, 1 if dirty else 0, QUEUED, now(), timeout, bundle_id,
-                 group_name, json_dumps(targets or [host])))
-            if bundle_id:
-                self.conn.execute("UPDATE bundles SET job_id=? WHERE id=?",
-                                  (job_id, bundle_id))
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                if idempotency:
+                    replay_id = self._idempotent_job_locked(idempotency)
+                    if replay_id:
+                        self.conn.execute("COMMIT")
+                        job = self.job(replay_id)
+                        if job is not None:
+                            job["idempotent_replay"] = True
+                            return job
+                        replay_id = ""
+                self.conn.execute(
+                    """INSERT INTO jobs(id, project, host, slot, locks, cmd, profile,
+                           submitter, agent, label, sha, base_ref, base_ref_sha,
+                           base_sha, dirty, status, created, timeout, bundle_id,
+                           group_name, targets, webhooks, hold_seconds,
+                           last_hold, idempotency_key)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (job_id, project, host, slot, json_dumps(locks), json_dumps(cmd),
+                     profile, submitter, agent, label, sha, base_ref, base_ref_sha,
+                     base_sha, 1 if dirty else 0, QUEUED, now(), timeout, bundle_id,
+                     group_name, json_dumps(targets or [host]),
+                     json_dumps(webhooks or []), int(hold_seconds or 0),
+                     (now() if hold_seconds else None),
+                     (idempotency or {}).get("key", "")))
+                if bundle_id:
+                    self.conn.execute("UPDATE bundles SET job_id=? WHERE id=?",
+                                      (job_id, bundle_id))
+                if idempotency:
+                    self.conn.execute(
+                        "INSERT OR REPLACE INTO idempotency(key, job_id, "
+                        "fingerprint, created) VALUES(?,?,?,?)",
+                        (idempotency["key"], job_id, idempotency["fingerprint"],
+                         now()))
+                self._emit_locked(job_id, "job.queued")
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
         return self.job(job_id)
+
+    def _idempotent_job_locked(self, idempotency: dict) -> str:
+        """已有 key：一致则返回旧 job id，不一致抛 IdempotencyConflict。
+
+        过期的 key 直接删掉，按新提交处理。
+        """
+        key = idempotency["key"]
+        row = self.conn.execute(
+            "SELECT * FROM idempotency WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return ""
+        window = float(idempotency.get("window") or 86400)
+        if now() - float(row["created"]) > window:
+            self.conn.execute("DELETE FROM idempotency WHERE key=?", (key,))
+            return ""
+        existing = self.job(row["job_id"])
+        if existing is None:  # 任务行已被清掉：允许重用 key
+            self.conn.execute("DELETE FROM idempotency WHERE key=?", (key,))
+            return ""
+        if row["fingerprint"] != idempotency["fingerprint"]:
+            raise IdempotencyConflict(
+                f"idempotency key {key!r} was already used with different "
+                f"submission parameters (existing job {row['job_id']}); use a "
+                "new key or resubmit with the same parameters")
+        return row["job_id"]
 
     def job(self, job_id: str) -> dict | None:
         with self.lock:
@@ -439,6 +577,8 @@ class Store:
         data["locks"] = json_loads(data["locks"], [])
         data["cmd"] = json_loads(data["cmd"], [])
         data["targets"] = json_loads(data.get("targets"), [])
+        data["webhooks"] = json_loads(data.get("webhooks"), []) or []
+        data["hold_seconds"] = int(data.get("hold_seconds") or 0)
         data["locks_display"] = self._display_locks(
             data["locks"], data["targets"], data["host"], data["status"])
         data["dirty"] = bool(data["dirty"])
@@ -526,13 +666,116 @@ class Store:
         now_ts = now()
         info: dict[str, dict] = {}
         for index, job in enumerate(queued):
-            ahead = sum(1 for earlier in queued[:index]
-                        if self._competes(earlier, job))
+            ahead_ids = [earlier["id"] for earlier in queued[:index]
+                         if self._competes(earlier, job)]
             info[job["id"]] = {
                 "queued_seconds": max(0, int(now_ts - job["created"])),
-                "ahead": ahead,
+                "ahead": len(ahead_ids),
+                "ahead_ids": ahead_ids,
             }
         return info
+
+    # ------------------------------------------------------------ 预计时间
+    def _estimate_key(self, job: dict) -> tuple[str, str, str]:
+        """(profile, project, slot)：同一 profile 优先，否则按项目。"""
+        return (str(job.get("profile") or ""), str(job.get("project") or ""),
+                str(job.get("slot") or ""))
+
+    def duration_estimate(self, job: dict) -> dict | None:
+        """同一 estimate key 最近 N 次成功任务耗时的中位数。
+
+        样本不足 ``estimate_min_samples`` 时返回 None（客户端必须显示未知）。
+        """
+        profile, project, slot = self._estimate_key(job)
+        key = (profile, project, slot)
+        now_ts = now()
+        cached = self._estimate_cache.get(key)
+        if cached is not None and now_ts - cached[0] < ESTIMATE_CACHE_SECONDS:
+            return cached[1]
+        with self.lock:
+            if profile:
+                rows = self.conn.execute(
+                    "SELECT started, finished FROM jobs WHERE status='succeeded' "
+                    "AND slot=? AND profile=? AND started IS NOT NULL "
+                    "AND finished IS NOT NULL ORDER BY finished DESC, rowid DESC LIMIT ?",
+                    (slot, profile, self.estimate_window)).fetchall()
+            else:
+                rows = self.conn.execute(
+                    "SELECT started, finished FROM jobs WHERE status='succeeded' "
+                    "AND slot=? AND project=? AND (profile='' OR profile IS NULL) "
+                    "AND started IS NOT NULL AND finished IS NOT NULL "
+                    "ORDER BY finished DESC, rowid DESC LIMIT ?",
+                    (slot, project, self.estimate_window)).fetchall()
+        durations = [float(row["finished"]) - float(row["started"])
+                     for row in rows]
+        result = None
+        if len(durations) >= self.estimate_min_samples:
+            result = {
+                "seconds": max(0, int(round(statistics.median(durations)))),
+                "samples": len(durations),
+                "window": self.estimate_window,
+                "basis": f"{(profile or project)} / {slot}",
+            }
+        self._estimate_cache[key] = (now_ts, result)
+        return result
+
+    def queue_estimates(self, queued: list[dict] | None = None,
+                        running: list[dict] | None = None) -> dict[str, dict]:
+        """每个排队任务的预计耗时 / 预计等待时间（见 spec §3）。
+
+        等待时间 = 所有阻塞者贡献之和：
+
+        * 排在前面的竞争任务 -> 它自己的预计耗时；
+        * 正在跑且竞争的任务 -> max(0, 预计耗时 - 已跑时间)。
+
+        任一阻塞者样本不足就整体未知（``None``），不猜。
+        """
+        now_ts = now()
+        if queued is None:
+            with self.lock:
+                rows = self.conn.execute(
+                    "SELECT * FROM jobs WHERE status='queued' "
+                    "ORDER BY created, rowid").fetchall()
+            queued = [self._job_row(row) for row in rows]
+        if running is None:
+            with self.lock:
+                rows = self.conn.execute(
+                    "SELECT * FROM jobs WHERE status='running' "
+                    "ORDER BY started").fetchall()
+            running = [self._job_row(row) for row in rows]
+        result: dict[str, dict] = {}
+        for index, job in enumerate(queued):
+            own = self.duration_estimate(job)
+            blockers = 0
+            unknown = 0
+            for earlier in queued[:index]:
+                if not self._competes(earlier, job):
+                    continue
+                estimate = self.duration_estimate(earlier)
+                if estimate is None:
+                    unknown += 1
+                else:
+                    blockers += int(estimate["seconds"])
+            for active in running:
+                if not self._competes(active, job):
+                    continue
+                estimate = self.duration_estimate(active)
+                if estimate is None:
+                    unknown += 1
+                    continue
+                elapsed = max(0.0, now_ts - float(active.get("started") or now_ts))
+                blockers += max(0, int(estimate["seconds"] - elapsed))
+            result[job["id"]] = {
+                "runtime_seconds": (own["seconds"] if own else None),
+                "runtime_samples": (own["samples"] if own else 0),
+                "runtime_basis": (own["basis"] if own else
+                                  f"{job.get('profile') or job.get('project')} "
+                                  f"/ {job.get('slot')}"),
+                "wait_seconds": (None if unknown else blockers),
+                "wait_unknown_blockers": unknown,
+                "known": bool(own) and unknown == 0,
+            }
+        return result
 
     # ------------------------------------------------------------ 调度
     # ------------------------------------------------------------ 锁语义
@@ -644,6 +887,7 @@ class Store:
                     "WHERE id=? AND status='queued'",
                     (now(), worker, selected_host, json_dumps(locks),
                      chosen["id"]))
+                self._emit_locked(chosen["id"], "job.started")
                 self.conn.execute("COMMIT")
             except Exception:
                 self.conn.execute("ROLLBACK")
@@ -663,6 +907,7 @@ class Store:
                     self.conn.execute(
                         "UPDATE jobs SET status='cancelled', cancel_requested=1, "
                         "finished=?, exit_code=-2 WHERE id=?", (now(), job_id))
+                    self._emit_locked(job_id, "job.finished")
                 elif job["status"] == RUNNING:
                     self.conn.execute(
                         "UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))
@@ -672,6 +917,45 @@ class Store:
                 raise
         return self.job(job_id)
 
+    def touch_hold(self, job_id: str) -> dict | None:
+        """排队期间的号码绑定心跳；返回更新后的任务（没有任务返回 None）。"""
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT status, hold_seconds FROM jobs WHERE id=?",
+                (job_id,)).fetchone()
+            if row is None:
+                return None
+            if row["status"] == QUEUED and int(row["hold_seconds"] or 0) > 0:
+                self.conn.execute("UPDATE jobs SET last_hold=? WHERE id=?",
+                                  (now(), job_id))
+        return self.job(job_id)
+
+    def reap_queue_holds(self, now_ts: float | None = None) -> list[dict]:
+        """排队超时没心跳的 hold 任务自动取消（不影响 running）。"""
+        now_ts = now_ts or now()
+        reaped: list[dict] = []
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self.conn.execute(
+                    "SELECT * FROM jobs WHERE status='queued' AND "
+                    "hold_seconds>0 AND "
+                    "COALESCE(last_hold, created) + hold_seconds <= ?",
+                    (now_ts,)).fetchall()
+                for row in rows:
+                    last = float(row["last_hold"] or row["created"])
+                    self._finish_locked(
+                        row["id"], "cancelled", -2,
+                        "queue hold expired: no heartbeat for "
+                        f"{int(now_ts - last)}s (hold {int(row['hold_seconds'])}s); "
+                        "cancelled to free the queue")
+                    reaped.append(row["id"])
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return [self.job(job_id) for job_id in reaped]
+
     def finish(self, job_id: str, *, status: str, exit_code: int | None,
                error: str = "", cleanup_at: float | None = None) -> dict | None:
         with self.lock:
@@ -680,10 +964,16 @@ class Store:
 
     def _finish_locked(self, job_id: str, status: str, exit_code: int | None,
                        error: str = "", cleanup_at: float | None = None) -> None:
+        previous = self.conn.execute(
+            "SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
         self.conn.execute(
             "UPDATE jobs SET status=?, exit_code=?, finished=?, error=?, "
             "cleanup_at=COALESCE(?, cleanup_at), needs_reconcile=0 WHERE id=?",
             (status, exit_code, now(), error, cleanup_at, job_id))
+        # 已终结的任务重复上报（执行器重放）不再发第二次事件。
+        if previous is not None and previous["status"] not in TERMINAL:
+            self._emit_locked(job_id, "job.finished")
+            self._estimate_cache.clear()
 
     def append_error(self, job_id: str, note: str) -> None:
         """给任务追加一条说明，不改变 status / exit_code。"""
@@ -693,6 +983,153 @@ class Store:
             existing = (row["error"] if row else "") or ""
             merged = (existing + "; " + note) if existing else note
             self.conn.execute("UPDATE jobs SET error=? WHERE id=?", (merged, job_id))
+
+    # ------------------------------------------------------------ 事件 / webhook
+    def _job_snapshot_locked(self, job_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM jobs WHERE id=?",
+                                (job_id,)).fetchone()
+        return self._job_row(row) if row is not None else None
+
+    def _emit_locked(self, job_id: str, event_type: str) -> int | None:
+        """写一条事件（并给 job.started/finished 排 webhook 投递）。
+
+        调用方负责事务；``self.lock`` 必须已持有。返回事件序号。
+        """
+        job = self._job_snapshot_locked(job_id)
+        if job is None:
+            return None
+        payload: dict = {
+            "type": event_type,
+            "created_at": iso(now()),
+            "job": job,
+        }
+        started, finished = job.get("started"), job.get("finished")
+        if started and finished:
+            payload["duration_seconds"] = round(float(finished) - float(started), 3)
+        base = (self.dashboard_base_url or "").rstrip("/")
+        if base:
+            payload["dashboard_url"] = f"{base}/#/job/{job['id']}"
+        cursor = self.conn.execute(
+            "INSERT INTO events(ts, job_id, type, data) VALUES(?,?,?,?)",
+            (now(), job_id, event_type, json_dumps(payload)))
+        seq = int(cursor.lastrowid or 0)
+        payload["event_id"] = seq
+        data = json_dumps(payload)
+        self.conn.execute("UPDATE events SET data=? WHERE seq=?", (data, seq))
+        if event_type in ("job.started", "job.finished"):
+            urls = list(dict.fromkeys(
+                list(self.webhook_urls) + list(job.get("webhooks") or [])))
+            for url in urls:
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO webhook_deliveries(job_id, event, url, "
+                    "msg_id, payload, status, attempts, next_attempt, created, "
+                    "updated) VALUES(?,?,?,?,?,'pending',0,0,?,?)",
+                    (job_id, event_type, url, f"msg_{uuid.uuid4().hex}", data,
+                     now(), now()))
+        self._bump()
+        return seq
+
+    def events_after(self, after_seq: int, job_id: str | None = None,
+                     limit: int = 200) -> list[dict]:
+        sql = "SELECT * FROM events WHERE seq>?"
+        args: list = [int(after_seq)]
+        if job_id:
+            sql += " AND job_id=?"
+            args.append(job_id)
+        sql += " ORDER BY seq LIMIT ?"
+        args.append(int(limit))
+        with self.lock:
+            rows = self.conn.execute(sql, args).fetchall()
+        return [{"seq": row["seq"], "ts": row["ts"], "job_id": row["job_id"],
+                 "type": row["type"], "data": json_loads(row["data"], {})}
+                for row in rows]
+
+    def last_event_seq(self) -> int:
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) AS n FROM events").fetchone()
+        return int(row["n"])
+
+    def prune_events(self, keep: int = 10000) -> int:
+        keep = max(0, int(keep))
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM events WHERE seq <= (SELECT MAX(seq) - ? FROM events)",
+                (keep,))
+            return cursor.rowcount
+
+    # ------------------------------------------------------------ webhook 投递
+    def due_webhook_deliveries(self, now_ts: float | None = None,
+                               limit: int = 20) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM webhook_deliveries WHERE status='pending' "
+                "AND next_attempt<=? ORDER BY next_attempt, id LIMIT ?",
+                (now_ts if now_ts is not None else now(), int(limit))).fetchall()
+        return [dict(row) for row in rows]
+
+    def webhook_attempt(self, delivery_id: int) -> int:
+        """投递前先落库 attempts+1；返回新的 attempts。"""
+        with self.lock:
+            self.conn.execute(
+                "UPDATE webhook_deliveries SET attempts=attempts+1, updated=? "
+                "WHERE id=?", (now(), delivery_id))
+            row = self.conn.execute(
+                "SELECT attempts FROM webhook_deliveries WHERE id=?",
+                (delivery_id,)).fetchone()
+        return int(row["attempts"]) if row else 0
+
+    def webhook_delivered(self, delivery_id: int, status_code: int | None) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE webhook_deliveries SET status='delivered', "
+                "last_status=?, last_error='', updated=? WHERE id=?",
+                (status_code, now(), delivery_id))
+
+    def webhook_retry_later(self, delivery_id: int, next_attempt: float,
+                            status_code: int | None, error: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE webhook_deliveries SET next_attempt=?, last_status=?, "
+                "last_error=?, updated=? WHERE id=?",
+                (next_attempt, status_code, error[:500], now(), delivery_id))
+
+    def webhook_failed(self, delivery_id: int, status_code: int | None,
+                       error: str) -> None:
+        with self.lock:
+            self.conn.execute(
+                "UPDATE webhook_deliveries SET status='failed', last_status=?, "
+                "last_error=?, updated=? WHERE id=?",
+                (status_code, error[:500], now(), delivery_id))
+
+    def webhook_deliveries(self, job_id: str) -> list[dict]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT job_id, event, url, msg_id, status, attempts, "
+                "last_status, last_error, created, updated "
+                "FROM webhook_deliveries WHERE job_id=? "
+                "ORDER BY url, created, id", (job_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def pending_webhook_urls(self) -> list[str]:
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT DISTINCT url FROM webhook_deliveries "
+                "WHERE status='pending'").fetchall()
+        return [row["url"] for row in rows]
+
+    def prune_webhook_deliveries(self, older_than: float) -> int:
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM webhook_deliveries WHERE status!='pending' "
+                "AND updated<?", (older_than,))
+            return cursor.rowcount
+
+    def prune_idempotency(self, window: float) -> int:
+        with self.lock:
+            cursor = self.conn.execute(
+                "DELETE FROM idempotency WHERE created<?", (now() - window,))
+            return cursor.rowcount
 
     # ------------------------------------------------------------ 日志
     def append_log(self, job_id: str, data: bytes) -> tuple[int, bool]:

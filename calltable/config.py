@@ -50,6 +50,82 @@ class Config:
         return self.raw.get("beszel_url", "")
 
     @property
+    def public_url(self) -> str:
+        """对外可访问的看板地址（写进 webhook 载荷，不含 token）。"""
+        return str(self.raw.get("public_url") or self.hub_url).rstrip("/")
+
+    # ---- 0.3：预计时间 / 等待接口 / webhook / 幂等 / 心跳
+    @property
+    def estimate_window(self) -> int:
+        return max(1, int(self.raw.get("estimate_window", 20)))
+
+    @property
+    def estimate_min_samples(self) -> int:
+        return max(1, int(self.raw.get("estimate_min_samples", 3)))
+
+    @property
+    def max_wait_seconds(self) -> int:
+        """长轮询的服务端上限（秒）。"""
+        return max(1, min(600, int(self.raw.get("max_wait_seconds", 60))))
+
+    @property
+    def max_waiters(self) -> int:
+        """同时挂起的长轮询连接上限。"""
+        return max(1, int(self.raw.get("max_waiters", 16)))
+
+    @property
+    def max_event_streams(self) -> int:
+        return max(1, int(self.raw.get("max_event_streams", 8)))
+
+    @property
+    def event_heartbeat_seconds(self) -> float:
+        return max(0.1, float(self.raw.get("event_heartbeat_seconds", 15)))
+
+    @property
+    def event_retention(self) -> int:
+        return max(100, int(self.raw.get("event_retention", 10000)))
+
+    @property
+    def webhook_secret(self) -> str:
+        return str(self.raw.get("webhook_secret") or "").strip()
+
+    @property
+    def webhook_urls(self) -> list[str]:
+        """hub 级别的全局叫号通知地址。"""
+        configured = self.raw.get("webhook_urls") or []
+        if isinstance(configured, str):
+            configured = [configured]
+        return [str(url) for url in configured if url]
+
+    @property
+    def webhook_timeout(self) -> float:
+        return max(1.0, float(self.raw.get("webhook_timeout", 10)))
+
+    @property
+    def webhook_max_attempts(self) -> int:
+        return max(1, int(self.raw.get("webhook_max_attempts", 6)))
+
+    @property
+    def webhook_retry_base(self) -> float:
+        return max(0.05, float(self.raw.get("webhook_retry_base_seconds", 2)))
+
+    @property
+    def webhook_max_delay(self) -> float:
+        return max(0.05, float(self.raw.get("webhook_max_delay_seconds", 300)))
+
+    @property
+    def webhook_retention_seconds(self) -> int:
+        return max(60, int(self.raw.get("webhook_retention_seconds", 7 * 86400)))
+
+    @property
+    def idempotency_window_seconds(self) -> int:
+        return max(1, int(self.raw.get("idempotency_window_seconds", 86400)))
+
+    @property
+    def janitor_interval(self) -> float:
+        return max(0.05, float(self.raw.get("janitor_interval", 30)))
+
+    @property
     def token_value(self) -> str:
         return os.environ.get("CALLTABLE_TOKEN", "").strip() or self.token
 

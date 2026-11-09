@@ -113,6 +113,10 @@ code { color:var(--accent); }
       <h2>产物</h2>
       <div id="d-artifacts" class="sub"></div>
     </section>
+    <section>
+      <h2>叫号通知</h2>
+      <div id="d-webhooks" class="sub"></div>
+    </section>
   </div>
 </main>
 <script>
@@ -203,16 +207,21 @@ function renderHosts(hosts, groups) {
 function renderQueue(jobs) {
   const box = document.getElementById('queue');
   if (!jobs.length) { box.innerHTML = '<div class="empty">队列为空。</div>'; return; }
+  const est = v => v == null ? '未知' : fmtDur(v);
   box.innerHTML = `<table><thead><tr>
     <th>id</th><th>项目</th><th>主机</th><th>slot</th><th>锁</th>
-    <th>已等</th><th>前面</th>
+    <th>已等</th><th>前面</th><th>预计等待</th><th>预计耗时</th>
     <th>提交人</th><th>label</th><th>创建</th></tr></thead><tbody>` +
-    jobs.map(j => `<tr class="clickable" onclick="location.hash='#/job/${esc(j.id)}'">
+    jobs.map(j => {
+      const q = j.queue || {};
+      return `<tr class="clickable" onclick="location.hash='#/job/${esc(j.id)}'">
       <td><code>${esc(j.id)}</code></td><td>${esc(j.project)}</td><td>${esc(j.host)}</td>
       <td>${esc(j.slot)}</td><td>${esc((j.locks_display||j.locks||[]).join(', '))}</td>
       <td>${fmtDur(j.queued_seconds)}</td><td>${j.ahead == null ? '-' : j.ahead}</td>
+      <td>${est(q.wait_seconds)}</td><td>${est(q.runtime_seconds)}</td>
       <td>${esc(j.submitter)}</td><td class="wrap">${esc(j.label)}</td>
-      <td>${fmtTime(j.created)}</td></tr>`).join('') + '</tbody></table>';
+      <td>${fmtTime(j.created)}</td></tr>`;
+    }).join('') + '</tbody></table>';
 }
 
 function renderHistory(jobs) {
@@ -288,7 +297,8 @@ function renderDetail(job) {
     <div>base <b>${esc(job.base_ref || '-')}</b> = ${esc((job.base_ref_sha || '-').slice(0,12))}
       ${job.dirty ? '<span class="pill">baseline ' + esc((job.base_sha || '-').slice(0,12)) + '</span>' : ''}</div>
     <div>锁 <b>${esc(((job.locks_display||job.locks||[]).join(', ')) || '-')}</b></div>
-    ${job.status === 'queued' ? `<div>排队 <b>${fmtDur(job.queued_seconds)}</b> 前面 ${job.ahead == null ? '-' : job.ahead} 个</div>` : ''}
+    ${job.status === 'queued' ? `<div>排队 <b>${fmtDur(job.queued_seconds)}</b> 前面 ${job.ahead == null ? '-' : job.ahead} 个 · 预计等待 <b>${(job.queue||{}).wait_seconds == null ? '未知' : fmtDur(job.queue.wait_seconds)}</b> · 预计耗时 <b>${(job.queue||{}).runtime_seconds == null ? '未知' : fmtDur(job.queue.runtime_seconds)}</b></div>` : ''}
+    ${job.hold_seconds ? `<div>号码绑定 <b>${fmtDur(job.hold_seconds)}</b> 无心跳就自动取消</div>` : ''}
     <div>创建 <b>${fmtTime(job.created)}</b></div>
     <div>开始 <b>${fmtTime(job.started)}</b></div>
     <div>耗时 <b>${fmtDur(dur)}</b></div>
@@ -330,6 +340,18 @@ function loadLogs(jobId) {
   }).catch(() => {});
 }
 
+function renderWebhooks(deliveries) {
+  const box = document.getElementById('d-webhooks');
+  if (!box) return;
+  if (!deliveries.length) { box.innerHTML = '<span class="sub">没有叫号通知。</span>'; return; }
+  box.innerHTML = deliveries.map(d =>
+    `<div>${esc(d.url)}</div>` + (d.events || []).map(e =>
+      `<div class="sub">${esc(e.event)} · ${esc(e.status)} · 尝试 ${e.attempts || 0}` +
+      (e.last_status ? ` · HTTP ${e.last_status}` : '') +
+      (e.last_error ? ` · ${esc(e.last_error)}` : '') + '</div>').join('')
+  ).join('');
+}
+
 function downloadArtifact(jobId, name) {
   // 用 fetch 带 Authorization header 下载；不再把 token 拼进 URL（A9）。
   api(`/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(name)}`)
@@ -363,6 +385,7 @@ function refreshDetail() {
   api(`/api/jobs/${encodeURIComponent(detailId)}`).then(r => r.json()).then(job => {
     renderDetail(job);
     renderArtifacts(job.artifacts || [], job.id);
+    renderWebhooks(job.webhook_deliveries || []);
     if (follow) loadLogs(job.id);
     api(`/api/jobs/${encodeURIComponent(job.id)}/samples`).then(r => r.json())
       .then(s => drawChart(s.samples || s)).catch(() => {});

@@ -66,5 +66,22 @@
   "upstreams": {},
   "upstream_interval": 300,
   "min_free_gb": 20,
-  "runs_max_gb": 100
+  "runs_max_gb": 100,
+  "public_url": "",
+  "webhook_secret": "",
+  "webhook_urls": [],
+  "webhook_timeout": 10,
+  "webhook_max_attempts": 6,
+  "webhook_retry_base_seconds": 2,
+  "webhook_max_delay_seconds": 300,
+  "webhook_retention_seconds": 604800,
+  "estimate_window": 20,
+  "estimate_min_samples": 3,
+  "max_wait_seconds": 60,
+  "max_waiters": 16,
+  "max_event_streams": 8,
+  "event_heartbeat_seconds": 15,
+  "event_retention": 10000,
+  "idempotency_window_seconds": 86400,
+  "janitor_interval": 30
 }

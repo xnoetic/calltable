@@ -11,8 +11,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import select
+import socket
 import socketserver
 import threading
 import time
@@ -24,17 +27,26 @@ from pathlib import Path
 from . import RULES_CLIENT_VERSION, __version__, gitops
 from .config import Config
 from .dashboard import render_page
-from .db import QUEUED, TERMINAL, Store
+from .db import QUEUED, TERMINAL, IdempotencyConflict, Store
 from .profiles import (Profile, find_profile, load_profiles, match_rule,
                        resolve_job)
-from .util import (iso, now, parse_duration, valid_project_name,
+from .util import (iso, json_dumps, now, parse_duration, valid_project_name,
                    version_tuple)
+from .webhooks import (WebhookDispatcher, deliveries_for_display,
+                       validate_url)
 
 MAX_JSON = 8 * 1024 * 1024
 MAX_BUNDLE = 1024 * 1024 * 1024
 MAX_ARTIFACT = 512 * 1024 * 1024
 IO_BLOCK = 1024 * 1024
 UPLOAD_SLOTS = 2
+#: 单任务最多几个 webhook（防止误提交一个巨大的列表）。
+MAX_JOB_WEBHOOKS = 10
+#: 幂等 key 的合法字符与长度。
+IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9._:-]{1,200}")
+#: 0.3 新增能力的自述（客户端据此判断是否降级）。
+CAPABILITIES = ["queue_eta", "wait_longpoll", "events_sse", "webhooks",
+                "idempotency", "queue_hold"]
 
 
 class Hub:
@@ -50,13 +62,25 @@ class Hub:
                      self.upload_dir):
             path.mkdir(parents=True, exist_ok=True)
         self.store = store or Store(self.data_dir / "hub.sqlite3",
-                                    log_cap=config.log_cap_bytes)
+                                    log_cap=config.log_cap_bytes,
+                                    estimate_window=config.estimate_window,
+                                    estimate_min_samples=config.estimate_min_samples)
+        # 预计时间 / webhook / 幂等 / 心跳的 hub 级配置。
+        self.store.estimate_window = config.estimate_window
+        self.store.estimate_min_samples = config.estimate_min_samples
+        self.store.webhook_urls = (list(config.webhook_urls)
+                                   if config.webhook_secret else [])
+        self.store.dashboard_base_url = config.public_url
+        self.store.idempotency_window = config.idempotency_window_seconds
         self.profiles = load_profiles(config.profiles_dir)
         self.upload_slots = threading.BoundedSemaphore(UPLOAD_SLOTS)
+        self.wait_slots = threading.BoundedSemaphore(config.max_waiters)
+        self.event_slots = threading.BoundedSemaphore(config.max_event_streams)
         self._thick_locks: dict[str, threading.Lock] = {}
         self._thick_guard = threading.Lock()
         self._stop = threading.Event()
         self._janitor: threading.Thread | None = None
+        self._webhooks: WebhookDispatcher | None = None
         self._warned: set[str] = set()
         self.keep_ref_seconds = int(config.raw.get("keep_ref_days", 14) * 86400)
 
@@ -70,12 +94,26 @@ class Hub:
                                "hosts; it will never receive jobs")
         # hub 重启：遗留 running 任务进入「待对账」，由心跳或超时回收。
         self.store.mark_running_for_reconcile()
+        if self.config.webhook_urls and not self.config.webhook_secret:
+            self._warn("webhook_urls is configured but webhook_secret is empty; "
+                       "webhooks are disabled until a signing secret is set")
 
     # ------------------------------------------------------------ 生命周期
     def start_janitor(self) -> None:
-        self._janitor = threading.Thread(target=self._janitor_loop, daemon=True,
-                                         name="hub-janitor")
-        self._janitor.start()
+        if self._janitor is None:
+            self._janitor = threading.Thread(target=self._janitor_loop,
+                                             daemon=True, name="hub-janitor")
+            self._janitor.start()
+        self.start_webhooks()
+
+    def start_webhooks(self) -> None:
+        """后台投递线程：不阻塞调度；单独抽出来方便测试直接调 run_once。"""
+        if self._webhooks is not None:
+            return
+        if not self.config.webhook_secret:
+            return
+        self._webhooks = WebhookDispatcher(self.store, self.config, self._stop)
+        self._webhooks.start()
 
     def start_upstreams(self) -> None:
         """按配置后台拉取只读上游的 main，让客户端增量只剩自己的改动。"""
@@ -121,8 +159,8 @@ class Hub:
 
     def _janitor_loop(self) -> None:
         # 首次清理放到后台线程里跑，不阻塞 hub 启动（A12）。
-        time.sleep(2)
-        while not self._stop.wait(30):
+        time.sleep(min(2.0, self.config.janitor_interval))
+        while not self._stop.wait(self.config.janitor_interval):
             try:
                 self.janitor_once()
             except Exception as exc:  # pragma: no cover - 常驻兜底
@@ -131,6 +169,9 @@ class Hub:
     def janitor_once(self) -> None:
         for job in self.store.reap_stale_hosts():
             print(f"[hub] reaped {job['id']}: {job.get('error', '')}", flush=True)
+        for job in self.store.reap_queue_holds():
+            print(f"[hub] queue hold expired: {job['id']}: "
+                  f"{job.get('error', '')}", flush=True)
         for job in self.store.expired_jobs(now()):
             files = self.store.purge_job(job["id"])
             self._unlink(files)
@@ -144,6 +185,10 @@ class Hub:
         for path in self.store.purge_orphan_bundles(now()):
             self._unlink([path])
         self._prune_keep_refs()
+        self.store.prune_events(self.config.event_retention)
+        self.store.prune_webhook_deliveries(
+            now() - self.config.webhook_retention_seconds)
+        self.store.prune_idempotency(self.config.idempotency_window_seconds)
         self.store.checkpoint()
 
     def _prune_keep_refs(self) -> None:
@@ -164,6 +209,8 @@ class Hub:
 
     def close(self) -> None:
         self._stop.set()
+        if self._webhooks is not None:
+            self._webhooks.stop()
 
     # ------------------------------------------------------------ 项目/bundle
     def mirror_for(self, project: str) -> Path:
@@ -309,6 +356,13 @@ class Hub:
                 raise ValueError("bundle belongs to another project")
             if self.bundle_path(bundle_id) is None:
                 raise ValueError("bundle path rejected")
+        webhooks = self._job_webhooks(body)
+        hold_seconds = self._job_hold_seconds(body)
+        idempotency = self._job_idempotency(
+            body, project=project, host=host, cmd=cmd,
+            base_ref=str(body.get("base_ref") or ""),
+            dirty=bool(body.get("dirty")), slot=slot, locks=locks,
+            timeout=timeout, label=str(body.get("label") or ""))
         job = self.store.create_job(
             project=project, host=host, slot=slot, locks=locks, cmd=cmd,
             profile=(profile.name if profile else ""),
@@ -321,8 +375,55 @@ class Hub:
             base_sha=str(body.get("base_sha") or ""),
             dirty=bool(body.get("dirty")),
             timeout=timeout, bundle_id=bundle_id, group_name=group_name,
-            targets=targets)
+            targets=targets, webhooks=webhooks, hold_seconds=hold_seconds,
+            idempotency=idempotency)
         return job
+
+    # ------------------------------------------------------------ 0.3 提交扩展
+    def _job_webhooks(self, body: dict) -> list[str]:
+        raw = body.get("webhooks") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            raise ValueError("webhooks must be an array of URLs")
+        urls: list[str] = []
+        for value in raw:
+            url = validate_url(value)
+            if url not in urls:
+                urls.append(url)
+        if len(urls) > MAX_JOB_WEBHOOKS:
+            raise ValueError(f"at most {MAX_JOB_WEBHOOKS} webhooks per job")
+        if urls and not self.config.webhook_secret:
+            raise ValueError(
+                "this hub has no webhook signing secret configured "
+                "(webhook_secret); --notify is unavailable")
+        return urls
+
+    def _job_hold_seconds(self, body: dict) -> int:
+        try:
+            hold = int(body.get("hold_seconds") or 0)
+        except (TypeError, ValueError):
+            raise ValueError("hold_seconds must be an integer") from None
+        if hold < 0:
+            raise ValueError("hold_seconds must be >= 0")
+        return min(hold, 7 * 86400)
+
+    def _job_idempotency(self, body: dict, *, project: str, host: str,
+                         cmd: list[str], base_ref: str, dirty: bool,
+                         slot: str, locks: list[str], timeout: int,
+                         label: str) -> dict | None:
+        key = str(body.get("idempotency_key") or "").strip()
+        if not key:
+            return None
+        if not IDEMPOTENCY_RE.fullmatch(key):
+            raise ValueError(
+                "idempotency key must be 1-200 characters of A-Z a-z 0-9 . _ : -")
+        fingerprint = submission_fingerprint(
+            project=project, host=host, cmd=list(cmd), base_ref=base_ref,
+            dirty=bool(dirty), slot=slot, locks=list(locks), timeout=timeout,
+            label=label)
+        return {"key": key, "fingerprint": fingerprint,
+                "window": self.config.idempotency_window_seconds}
 
     def register_bundle(self, project: str, path: Path, size: int) -> dict:
         """登记一次已落盘的上传，执行 ingest 并返回 bundle id（B4）。"""
@@ -364,19 +465,67 @@ class Hub:
         self._warned.add(message)
         print(f"[hub] WARNING: {message}", flush=True)
 
+    # ------------------------------------------------------------ 队列可见性
     def with_queue_info(self, jobs: list[dict]) -> list[dict]:
-        """给排队中的任务补上「已等多久 / 前面还有几个」。"""
+        """给排队中的任务补上位置、预计等待与预计耗时（见 spec §3）。"""
         if not any(job.get("status") == QUEUED for job in jobs):
             return jobs
         info = self.store.queue_info()
+        estimates = self.store.queue_estimates()
         for job in jobs:
-            extra = info.get(job["id"])
-            if extra:
-                job.update(extra)
-            elif job.get("status") == QUEUED:
-                job.setdefault("queued_seconds", 0)
-                job.setdefault("ahead", 0)
+            if job.get("status") != QUEUED:
+                continue
+            extra = info.get(job["id"]) or {"queued_seconds": 0, "ahead": 0}
+            est = estimates.get(job["id"]) or {}
+            wait = est.get("wait_seconds")
+            job["ahead"] = int(extra.get("ahead", 0))
+            job["queued_seconds"] = int(extra.get("queued_seconds", 0))
+            job["queue"] = {
+                "ahead": job["ahead"],
+                "queued_seconds": job["queued_seconds"],
+                "targets": list(job.get("targets") or []),
+                "group": job.get("group_name") or "",
+                "wait_seconds": wait,
+                "runtime_seconds": est.get("runtime_seconds"),
+                "starts_in_seconds": wait,
+                "known": bool(est.get("known")),
+                "runtime_samples": int(est.get("runtime_samples") or 0),
+                "runtime_basis": est.get("runtime_basis") or "",
+                "wait_unknown_blockers": int(est.get("wait_unknown_blockers") or 0),
+            }
         return jobs
+
+    def with_webhook_info(self, job: dict) -> dict:
+        """详情接口：每个 webhook 的两条事件投递状态。"""
+        job["webhook_deliveries"] = deliveries_for_display(
+            self.store.webhook_deliveries(job["id"]))
+        return job
+
+    # ------------------------------------------------------------ 长轮询
+    @staticmethod
+    def _wait_satisfied(job: dict, until: str) -> bool:
+        if job.get("status") in TERMINAL:
+            return True
+        if until == "started":
+            return job.get("started") is not None
+        return False
+
+    def wait_for_job(self, job_id: str, until: str = "done",
+                     timeout: float = 0.0) -> tuple[dict | None, str]:
+        """阻塞到状态变化/条件满足/超时；返回 (job, done|timeout|missing)。"""
+        deadline = now() + max(0.0, float(timeout))
+        while True:
+            # 先取 seq 再读状态：如果期间有变化，wait_change 会立即返回。
+            seq = self.store.change_seq
+            job = self.store.job(job_id)
+            if job is None:
+                return None, "missing"
+            if self._wait_satisfied(job, until):
+                return job, "done"
+            remaining = deadline - now()
+            if remaining <= 0:
+                return job, "timeout"
+            self.store.wait_change(seq, remaining)
 
     # ------------------------------------------------------------ 执行器载荷
     def _exec_payload(self, job: dict) -> dict:
@@ -410,6 +559,12 @@ class Hub:
         if profile is None and job.get("profile"):
             profile = self.profiles.get(job["profile"])
         return profile
+
+
+def submission_fingerprint(**fields) -> str:
+    """幂等指纹：只覆盖语义参数（bundle_id/传输身份不参与，见 spec §8）。"""
+    payload = json_dumps({key: fields[key] for key in sorted(fields)})
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def profile_to_dict(profile: Profile | None) -> dict:
@@ -554,6 +709,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {
                     "ok": True, "version": __version__,
                     "rules_client_version": RULES_CLIENT_VERSION,
+                    "capabilities": list(CAPABILITIES),
+                    "webhooks": {
+                        "enabled": bool(self.hub.config.webhook_secret),
+                        "signature_version": "v1" if self.hub.config.webhook_secret else "",
+                    },
                     "time": iso(now())})
             if path == "/":
                 token = (self.query.get("token") or [""])[0]
@@ -571,6 +731,8 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return self._error(401, "unauthorized")
 
+            if path == "/api/events":
+                return self._stream_events()
             if path == "/api/state":
                 return self._json(200, self._state())
             if path == "/api/hosts":
@@ -587,11 +749,7 @@ class Handler(BaseHTTPRequestHandler):
 
             match = re.fullmatch(r"/api/jobs/([^/]+)", path)
             if match:
-                job = self.hub.store.job(match.group(1))
-                if not job:
-                    return self._error(404, "no such job")
-                job["artifacts"] = self.hub.store.artifacts(job["id"])
-                return self._json(200, self.hub.with_queue_info([job])[0])
+                return self._job_detail(match.group(1))
 
             match = re.fullmatch(r"/api/jobs/([^/]+)/logs", path)
             if match:
@@ -666,7 +824,111 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "artifact removed")
         return self._stream_file(path, headers={"X-Calltable-SHA256": art["sha256"]})
 
-    # ---- POST -------------------------------------------------------
+    def _job_detail(self, job_id: str):
+        """GET /api/jobs/<id>，支持 ``wait`` / ``until`` 长轮询。"""
+        until = (self.query.get("until") or ["done"])[0] or "done"
+        if until not in ("started", "done"):
+            return self._error(400, "until must be started or done")
+        wait_raw = (self.query.get("wait") or [""])[0]
+        headers: dict[str, str] = {}
+        if str(wait_raw).strip():
+            try:
+                seconds = float(wait_raw)
+            except (TypeError, ValueError):
+                return self._error(400, "wait must be a number of seconds")
+            seconds = max(0.0, min(seconds, self.hub.config.max_wait_seconds))
+            if self.hub.store.job(job_id) is None:
+                return self._error(404, "no such job")
+            if not self.hub.wait_slots.acquire(blocking=False):
+                return self._send(
+                    503, json.dumps({"error": "too many concurrent waits"}),
+                    headers={"Retry-After": "1"})
+            try:
+                job, result = self.hub.wait_for_job(job_id, until, seconds)
+            finally:
+                self.hub.wait_slots.release()
+            if job is None:
+                return self._error(404, "no such job")
+            headers = {"X-Calltable-Wait-Result": result,
+                       "X-Calltable-Wait-Until": until}
+        else:
+            job = self.hub.store.job(job_id)
+            if not job:
+                return self._error(404, "no such job")
+        job["artifacts"] = self.hub.store.artifacts(job["id"])
+        job = self.hub.with_webhook_info(job)
+        return self._json(200, self.hub.with_queue_info([job])[0],
+                          headers=headers or None)
+
+    # ---- SSE --------------------------------------------------------
+    def _sse_write(self, text: str) -> None:
+        self.wfile.write(text.encode("utf-8"))
+        self.wfile.flush()
+
+    def _client_gone(self) -> bool:
+        """非阻塞探测客户端是否已经断开，及时释放流名额（不等下一次写）。"""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            if not readable:
+                return False
+            return not self.connection.recv(1, socket.MSG_PEEK)
+        except OSError:
+            return True
+
+    def _stream_events(self):
+        """GET /api/events：带事件 id 与心跳注释的 SSE 流。"""
+        job_filter = (self.query.get("job") or [""])[0] or None
+        if job_filter and self.hub.store.job(job_filter) is None:
+            return self._error(404, "no such job")
+        raw = (self.headers.get("Last-Event-ID")
+               if self.headers else None) or (self.query.get("after") or [""])[0]
+        try:
+            after = int(str(raw).strip()) if str(raw or "").strip() else 0
+        except ValueError:
+            after = 0
+        if after <= 0:
+            # 不传游标 = 只看从现在开始的新事件，避免重放整个日志。
+            after = self.hub.store.last_event_seq()
+        if not self.hub.event_slots.acquire(blocking=False):
+            return self._send(503, json.dumps(
+                {"error": "too many event streams"}),
+                headers={"Retry-After": "1"})
+        try:
+            self.close_connection = True
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+            self.send_header("Connection", "close")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self._sse_write("retry: 1000\n\n")
+            heartbeat = self.hub.config.event_heartbeat_seconds
+            last_write = time.time()
+            while not self.hub._stop.is_set():
+                if self._client_gone():
+                    break
+                events = self.hub.store.events_after(after, job_filter, limit=200)
+                if events:
+                    for event in events:
+                        frame = (f"id: {event['seq']}\n"
+                                 f"event: {event['type']}\n"
+                                 f"data: {json_dumps(event['data'])}\n\n")
+                        self._sse_write(frame)
+                        after = int(event["seq"])
+                    last_write = time.time()
+                    continue
+                if time.time() - last_write >= heartbeat:
+                    self._sse_write(": keepalive\n\n")
+                    last_write = time.time()
+                seq = self.hub.store.change_seq
+                self.hub.store.wait_change(seq, min(heartbeat, 1.0))
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        except Exception as exc:  # pragma: no cover - 流已开始，不能再写 JSON 错
+            print(f"[hub] event stream: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            self.hub.event_slots.release()
+
     def do_POST(self):
         path = self._route()
         try:
@@ -759,6 +1021,20 @@ class Handler(BaseHTTPRequestHandler):
                 if not job:
                     return self._error(404, "no such job")
                 return self._json(200, job)
+
+            match = re.fullmatch(r"/api/jobs/([^/]+)/heartbeat", path)
+            if match:
+                job = self.hub.store.touch_hold(match.group(1))
+                if not job:
+                    return self._error(404, "no such job")
+                hold = int(job.get("hold_seconds") or 0)
+                last = float(job.get("last_hold") or job.get("created") or now())
+                expires = max(0, int(hold - (now() - last))) if hold else 0
+                ok = job["status"] == QUEUED and hold > 0
+                return self._json(200, {
+                    "ok": ok, "job_id": job["id"],
+                    "status": job["status"], "hold_seconds": hold,
+                    "expires_in": expires})
 
             match = re.fullmatch(r"/api/projects/([^/]+)/have", path)
             if match:
@@ -910,7 +1186,19 @@ class Handler(BaseHTTPRequestHandler):
     # ---- 业务 -------------------------------------------------------
     def _create_job(self):
         try:
-            return self._json(201, self.hub.create_job(self._body_json()))
+            body = self._body_json()
+            key = ""
+            if self.headers:
+                key = (self.headers.get("Idempotency-Key") or "").strip()
+            if key and not body.get("idempotency_key"):
+                body["idempotency_key"] = key
+            job = self.hub.create_job(body)
+            replay = bool(job.get("idempotent_replay"))
+            payload = self.hub.with_queue_info([job])[0]
+            headers = {"X-Calltable-Idempotent-Replay": "true"} if replay else None
+            return self._json(200 if replay else 201, payload, headers=headers)
+        except IdempotencyConflict as exc:
+            return self._error(409, str(exc))
         except ValueError as exc:
             return self._error(400, str(exc))
 
