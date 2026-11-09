@@ -527,11 +527,12 @@ main {
 /* ----------------------------------------------------------------- hosts */
 .hosts {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(310px, 100%), 1fr));
   gap: 14px;
 }
 .hosts.is-empty { display: block; }
 .host {
+  min-width: 0;
   padding: 14px 15px 13px;
   transition: transform .28s var(--ease), box-shadow .28s var(--ease),
     border-color .28s var(--ease);
@@ -675,9 +676,15 @@ main {
   gap: 6px;
   margin-top: 10px;
 }
-.host-running { display: grid; gap: 5px; margin-top: 10px; }
+.host-running {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 5px;
+  margin-top: 10px;
+}
 .host-running:empty { display: none; }
 .run-item {
+  min-width: 0;
   display: flex;
   align-items: flex-start;
   gap: 8px;
@@ -710,7 +717,8 @@ main {
 .run-sub { display: flex; gap: 6px; min-width: 0; color: var(--dim); line-height: 1.4; }
 .run-proj { white-space: nowrap; }
 .run-label {
-  margin-left: auto;
+  flex: 1 1 auto;
+  min-width: 0;
   color: var(--dim-2);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1206,11 +1214,12 @@ pre.log:empty::before { content: "（暂无日志输出）"; color: #5d6b7c; }
   .c-id { white-space: normal; }
   .c-id code {
     display: block;
+    min-width: 9.5em;
     max-width: 120px;
     white-space: normal;
-    overflow-wrap: anywhere;
     line-height: 1.35;
   }
+  .c-id code .nw { white-space: nowrap; }
   .mob-status { display: flex; width: fit-content; margin-top: 5px; }
   td.wrap { white-space: normal; min-width: 0; max-width: none; overflow-wrap: break-word; }
   pre.log { max-height: 320px; }
@@ -1218,7 +1227,7 @@ pre.log:empty::before { content: "（暂无日志输出）"; color: #5d6b7c; }
 @media (max-width: 470px) {
   .brand-sub { display: none; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  #history .c-proj { display: none; }
+  #history .c-proj, #queue .c-proj { display: none; }
   .block-head { flex-wrap: wrap; }
   .hide-xs { display: none; }
 }
@@ -1826,6 +1835,7 @@ function patchRunning(box, jobs) {
     setText(a.querySelector('.run-id'), job.id);
     setText(a.querySelector('.run-proj'), job.project || '');
     setText(a.querySelector('.run-label'), job.label || '');
+    a.title = job.id + (job.label ? ' · ' + job.label : '');
   });
   existing.forEach(function (el) { el.remove(); });
 }
@@ -2009,9 +2019,14 @@ function queueCells(job) {
 /* 窄屏用短 id（去掉 job- 前缀），把位置留给状态与 label */
 function idCell(id) {
   const short = String(id).replace(/^job-/, '');
+  const cut = short.lastIndexOf('-');
+  const shortHtml = cut > 0
+    ? '<span class="nw">' + esc(short.slice(0, cut + 1)) + '</span><span class="nw">' +
+      esc(short.slice(cut + 1)) + '</span>'
+    : esc(short);
   return '<a class="joblink" href="#/job/' + encodeURIComponent(id) + '" title="' + esc(id) + '">' +
     '<code><span class="id-full">' + esc(id) + '</span>' +
-    '<span class="id-short">' + esc(short) + '</span></code></a>';
+    '<span class="id-short">' + shortHtml + '</span></code></a>';
 }
 
 function historyCells(job) {
