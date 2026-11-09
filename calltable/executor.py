@@ -51,6 +51,8 @@ FINISH_BUDGET = 600.0
 FINISH_MAX_DELAY = 30.0
 #: 磁盘/runs 大小的全量扫描至少隔这么久（walk 巨型 node_modules 很贵）。
 DISK_SCAN_INTERVAL = 60.0
+#: 调整任务进程 OOM 权重的 procfs 入口（只在 Linux 上存在）。
+OOM_SCORE_ADJ_PATH = "/proc/self/oom_score_adj"
 
 
 def _artifact_regex(pattern: str) -> re.Pattern[str]:
@@ -708,10 +710,15 @@ class Executor:
         ]
         score = self.config.task_oom_score_adj
         if score:
-            # 让 OOM killer 优先选任务而不是执行器；/proc 不存在时（Windows）
-            # 静默跳过。
-            lines.append(f"echo {int(score)} > /proc/self/oom_score_adj "
-                         "2>/dev/null || true")
+            # 让 OOM killer 优先选任务而不是执行器。只有该文件存在且可写时
+            # 才写：Windows / Git Bash 上没有 procfs，而 `echo > 文件 2>/dev/null`
+            # 挡不住重定向失败本身的报错（bash 从左到右处理重定向，打开目标
+            # 失败时 stderr 还没被重定向），日志里会每任务刷一条
+            # "No such file or directory"。Linux 上该文件对自己永远可写，
+            # 行为不变。
+            lines.append(f"if [ -w {shlex.quote(OOM_SCORE_ADJ_PATH)} ]; then "
+                         f"echo {int(score)} > "
+                         f"{shlex.quote(OOM_SCORE_ADJ_PATH)}; fi")
         for path in env_files:
             quoted = shlex.quote(path)
             lines.append(f'if [ ! -r {quoted} ]; then echo "calltable: env file '

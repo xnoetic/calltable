@@ -312,8 +312,70 @@ class ExecutorTests(unittest.TestCase):
         script = self.exec._write_launcher(
             run_dir, {"cmd": ["true"]}, {}, self.root)
         content = script.read_text(encoding="utf-8")
-        self.assertIn("/proc/self/oom_score_adj", content)
+        self.assertIn(executor_module.OOM_SCORE_ADJ_PATH, content)
         self.assertIn("650", content)
+
+    def test_launcher_guards_the_oom_score_write(self):
+        # 只在 procfs 入口存在且可写时才写：Windows / Git Bash 上没有
+        # /proc，旧写法 `echo ... > /proc/... 2>/dev/null` 仍会把重定向失败
+        # 的报错打进每个任务的日志。
+        self.exec.config.raw["task_oom_score_adj"] = 650
+        run_dir = self.root / "run-oom-guard"
+        run_dir.mkdir()
+        script = self.exec._write_launcher(
+            run_dir, {"cmd": ["true"]}, {}, self.root)
+        content = script.read_text(encoding="utf-8")
+        self.assertIn(f"[ -w {executor_module.OOM_SCORE_ADJ_PATH} ]", content)
+
+    def _run_launcher_with_oom_path(self, name: str, target: str) -> tuple:
+        self.exec.config.raw["task_oom_score_adj"] = 640
+        run_dir = self.root / name
+        run_dir.mkdir()
+        with mock.patch.object(executor_module, "OOM_SCORE_ADJ_PATH", target):
+            script = self.exec._write_launcher(
+                run_dir, {"cmd": ["true"]}, {}, self.root)
+        import subprocess
+        proc = subprocess.run([self.config.shell, str(script)],
+                              cwd=str(self.root), capture_output=True,
+                              text=True, timeout=60)
+        return proc
+
+    def test_launcher_writes_oom_score_when_the_entry_is_writable(self):
+        # 用临时文件冒充 /proc/self/oom_score_adj：Linux 上的调整行为不变。
+        fake = self.root / "oom_score_adj"
+        fake.write_text("0\n", encoding="utf-8")
+        proc = self._run_launcher_with_oom_path("run-oom-writable", str(fake))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(fake.read_text(encoding="utf-8").strip(), "640")
+        self.assertEqual(proc.stderr, "")
+
+    def test_launcher_is_quiet_when_the_oom_entry_is_missing(self):
+        # 非 Linux（或任何没有 procfs 的环境）：不写、也不报错。
+        missing = self.root / "no-such-dir" / "oom_score_adj"
+        proc = self._run_launcher_with_oom_path("run-oom-missing", str(missing))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        self.assertFalse(missing.exists())
+
+    def test_real_oom_score_is_applied_on_linux(self):
+        import os as os_module
+        import sys as sys_module
+        if not sys_module.platform.startswith("linux"):
+            self.skipTest("procfs oom_score_adj is Linux-only")
+        if not os_module.access("/proc/self/oom_score_adj", os_module.W_OK):
+            self.skipTest("/proc/self/oom_score_adj is not writable here")
+        self.exec.config.raw["task_oom_score_adj"] = 620
+        run_dir = self.root / "run-oom-real"
+        run_dir.mkdir()
+        script = self.exec._write_launcher(
+            run_dir, {"cmd": ["cat", "/proc/self/oom_score_adj"]}, {},
+            self.root)
+        import subprocess
+        proc = subprocess.run([self.config.shell, str(script)],
+                              cwd=str(self.root), capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "620")
 
     # ------------------------------------------------------------ 基线 ref
     def test_env_exposes_baseline_contract(self):
