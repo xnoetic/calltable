@@ -96,7 +96,10 @@ def apply() -> None:
         original = getattr(config_module, name)
 
         def guarded(*args, _original=original, **kwargs):
-            return check_path(_original(*args, **kwargs))
+            # 只做检查，不改变返回值（resolved 与否是 config 的既有语义）。
+            path = _original(*args, **kwargs)
+            check_path(path)
+            return path
 
         setattr(config_module, name, guarded)
         _PATCHES.append((config_module, name, original))
