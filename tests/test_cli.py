@@ -443,7 +443,10 @@ class DoctorTests(unittest.TestCase):
     def test_find_tailscale_prefers_path_then_defaults(self):
         with mock.patch("calltable.doctor.shutil.which", return_value="/usr/bin/tailscale"):
             self.assertEqual(doctor.find_tailscale(), "/usr/bin/tailscale")
+        # 钉死 is_wsl：在 WSL 上跑时 WSL interop 路径真实存在，会先于 mock 的
+        # macOS 路径命中，这条用例测的是非 WSL 的默认路径回退顺序。
         with mock.patch("calltable.doctor.shutil.which", return_value=None), \
+                mock.patch("calltable.doctor.is_wsl", return_value=False), \
                 mock.patch("calltable.doctor.WINDOWS_TAILSCALE") as win, \
                 mock.patch("calltable.doctor.MACOS_TAILSCALE") as mac:
             win.exists.return_value = False
