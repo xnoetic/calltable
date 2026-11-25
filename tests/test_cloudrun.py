@@ -5,9 +5,13 @@ from __future__ import annotations
 
 import io
 import contextlib
+import http.client
+import http.server
 import json
 import tempfile
+import threading
 import unittest
+import urllib.parse
 from pathlib import Path
 from unittest import mock
 
@@ -315,6 +319,184 @@ class ReconcileTests(Base):
         self.assertIn("heartbeat lost", self.store.job(job["id"])["error"])
 
 
+class UnrecordedLaunchTests(Base):
+    """hub 在 gcloud execute 期间 / claim 之后退出：execution 名或整条记录缺失。"""
+
+    def reserve(self, *, record=True, launched=None):
+        job = self.submit()
+        self.store.touch_host("cloudrun")
+        claimed = self.store.claim("cloudrun", f"{PENDING_WORKER_PREFIX}abc")
+        self.assertEqual(claimed["id"], job["id"])
+        if record:
+            self.store.cloud_record_launch(
+                job["id"], "cloudrun", cloud_job="ct-demo-light", vcpu=8,
+                memory_gib=32, launched=launched if launched is not None else now())
+        return job
+
+    def restart(self):
+        self.hub.close()
+        self.api = FakeAPI()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.hub = Hub(self.config, cloudrun_api=self.api)
+        self.store = self.hub.store
+        self.provisioner = self.hub.cloudrun
+
+    def test_crash_mid_launch_fails_the_job_and_stops_spend(self):
+        job = self.reserve(launched=now() - 3600)
+        self.restart()
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(3):
+                self.hub.janitor_once()
+        failed = self.store.job(job["id"])
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("never recorded", failed["error"])
+        self.assertEqual(self.store.cloud_executions(active_only=True), [])
+        self.assertIsNotNone(self.store.cloud_executions()[0]["ended"])
+        self.assertEqual(self.api.cancelled, [])  # 没有 execution 名，不调 API
+        current = now()
+        later = current + 600
+        if cloudrun.month_start(later) != cloudrun.month_start(current - 3600):
+            self.skipTest("month boundary")
+        self.assertEqual(self.provisioner.month_spend("cloudrun", current),
+                         self.provisioner.month_spend("cloudrun", later))
+
+    def test_unrecorded_launch_waits_for_the_attach_timeout(self):
+        job = self.reserve()
+        self.provisioner.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "running")
+        self.assertEqual(len(self.store.cloud_executions(active_only=True)), 1)
+
+    def test_unrecorded_launch_with_lost_heartbeat_fails(self):
+        job = self.reserve()
+        self.hub.attach(job["id"], "cloudrun", "w1")
+        self.store.conn.execute(
+            "UPDATE cloud_executions SET attached=?, last_seen=?",
+            (now() - 7200, now() - 7200))
+        self.provisioner.tick()
+        failed = self.store.job(job["id"])
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("heartbeat lost", failed["error"])
+        self.assertEqual(self.store.cloud_executions(active_only=True), [])
+        self.assertEqual(self.api.cancelled, [])
+
+    def test_unrecorded_launch_that_attached_can_still_finish(self):
+        # Cloud Run 其实拉起来了，只是名字没写回：容器 attach 并持续心跳就不能被回收。
+        job = self.reserve(launched=now() - 3600)
+        self.hub.attach(job["id"], "cloudrun", "w1")
+        self.hub.heartbeat("cloudrun", "w1", [job["id"]])
+        self.provisioner.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "running")
+        self.assertEqual(len(self.store.cloud_executions(active_only=True)), 1)
+        self.store.finish(job["id"], status="succeeded", exit_code=0)
+        self.provisioner.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "succeeded")
+        self.assertEqual(self.store.cloud_executions(active_only=True), [])
+        self.assertEqual(self.api.cancelled, [])
+
+    def test_claim_without_a_row_fails_after_the_attach_timeout(self):
+        job = self.reserve(record=False)
+        self.provisioner.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "running")
+        self.store.conn.execute("UPDATE jobs SET started=? WHERE id=?",
+                                (now() - 3600, job["id"]))
+        self.restart()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.hub.janitor_once()
+        failed = self.store.job(job["id"])
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("never recorded", failed["error"])
+
+
+class StaleSnapshotTests(Base):
+    """慢速 gcloud 调用期间执行器上报了成功：provisioner 不能把它改成 error。"""
+
+    def attached(self):
+        job = self.submit()
+        self.provisioner.tick()
+        execution = self.api.runs[-1]["execution"]
+        self.hub.attach(job["id"], "cloudrun", "w1")
+        return job, execution
+
+    def test_success_during_describe_is_kept(self):
+        job, execution = self.attached()
+        original = self.api.describe_execution
+
+        def slow_describe(settings, name):
+            self.store.finish(job["id"], status="succeeded", exit_code=0)
+            self.api.complete(name)
+            return original(settings, name)
+
+        self.api.describe_execution = slow_describe
+        self.provisioner.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "succeeded")
+        self.assertEqual(self.store.cloud_executions(active_only=True), [])
+
+    def test_success_during_cancel_is_kept(self):
+        job, execution = self.attached()
+        self.store.conn.execute(
+            "UPDATE cloud_executions SET attached=?, last_seen=?",
+            (now() - 7200, now() - 7200))
+
+        def slow_cancel(settings, name):
+            self.store.finish(job["id"], status="succeeded", exit_code=0)
+            self.api.cancelled.append(name)
+
+        self.api.cancel_execution = slow_cancel
+        self.provisioner.tick()
+        self.assertEqual(self.api.cancelled, [execution])
+        self.assertEqual(self.store.job(job["id"])["status"], "succeeded")
+
+    def test_finish_if_status_leaves_terminal_jobs_alone(self):
+        job = self.submit()
+        self.store.finish(job["id"], status="succeeded", exit_code=0)
+        self.assertIsNone(self.store.finish_if_status(
+            job["id"], ("running",), status="error", exit_code=None, error="x"))
+        self.assertEqual(self.store.job(job["id"])["status"], "succeeded")
+        self.assertIsNone(self.store.finish_if_status(
+            "nope", ("running",), status="error", exit_code=None))
+
+
+class UnknownProviderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        hosts = {"odd": {"slots": {"light": 1, "heavy": 1},
+                         "provider": "cloud-run"}}
+        self.config = make_config(Path(self.tmp.name), hosts=hosts)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.hub = Hub(self.config)
+        self.addCleanup(self.hub.close)
+        self.warnings = out.getvalue()
+
+    def test_unknown_provider_is_a_static_host(self):
+        self.assertIn("unknown provider 'cloud-run'", self.warnings)
+        self.assertFalse(self.config.hosts["odd"].ephemeral)
+        self.assertIsNone(self.hub.cloudrun)
+        self.assertNotIn("odd", self.hub.ephemeral_hosts())
+        job = self.hub.create_job({"project": "demo", "host": "odd",
+                                   "cmd": ["echo", "hi"],
+                                   "client_version": "9.9.9"})
+        self.hub.heartbeat("odd", "w1", [])
+        payload = self.hub.claim("odd", "w1")
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["id"], job["id"])
+        # 普通心跳对账：换了 worker 立即回收（ephemeral 主机会跳过）。
+        self.hub.heartbeat("odd", "w2", [])
+        self.assertEqual(self.hub.store.job(job["id"])["status"], "error")
+
+    def test_unknown_provider_host_is_reaped_when_stale(self):
+        job = self.hub.create_job({"project": "demo", "host": "odd",
+                                   "cmd": ["echo", "hi"],
+                                   "client_version": "9.9.9"})
+        self.hub.heartbeat("odd", "w1", [])
+        self.assertIsNotNone(self.hub.claim("odd", "w1"))
+        self.hub.store.conn.execute("UPDATE hosts SET last_seen=1 WHERE name='odd'")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.hub.janitor_once()
+        self.assertEqual(self.hub.store.job(job["id"])["status"], "error")
+
+
 class BudgetTests(Base):
     hosts_overrides = {"monthly_budget_usd": 1.0}
 
@@ -490,6 +672,112 @@ class ProxyTests(unittest.TestCase):
                     if h.__class__.__name__ == "ProxyHandler"]
         self.assertEqual(handlers[0].proxies["http"], "http://localhost:1055")
         self.assertIsNone(HubClient("http://x", "t")._opener)
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """假 hub：记录收到的上传。"""
+    received: list = []
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.received.append({"path": self.path, "body": body,
+                              "auth": self.headers.get("Authorization"),
+                              "x": self.headers.get("X-Calltable-Path")})
+        payload = json.dumps({"ok": True, "size": len(body)}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class _ForwardProxy(http.server.BaseHTTPRequestHandler):
+    """最小的正向代理：只接受绝对 URI 请求目标，原样转发到目标主机。"""
+    targets: list = []
+
+    def do_POST(self):
+        self.targets.append(self.path)
+        target = urllib.parse.urlparse(self.path)
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        upstream = http.client.HTTPConnection(target.hostname, target.port, timeout=10)
+        headers = {k: v for k, v in self.headers.items()
+                   if k.lower() not in ("host", "connection", "proxy-connection")}
+        upstream.request("POST", target.path, body=body, headers=headers)
+        response = upstream.getresponse()
+        payload = response.read()
+        upstream.close()
+        self.send_response(response.status)
+        self.send_header("Content-Type", response.getheader("Content-Type", ""))
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+class UploadProxyTests(unittest.TestCase):
+    def serve(self, handler):
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def setUp(self):
+        _Recorder.received = []
+        _ForwardProxy.targets = []
+        self.hub_url = self.serve(_Recorder)
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.data = bytes(range(256)) * 9000  # 多块（block 默认 1 MiB）
+        self.file = Path(tmp.name) / "a.bin"
+        self.file.write_bytes(self.data)
+
+    def check_received(self, result):
+        self.assertEqual(result, {"ok": True, "size": len(self.data)})
+        self.assertEqual(len(_Recorder.received), 1)
+        got = _Recorder.received[0]
+        self.assertEqual(got["path"], "/api/jobs/j1/artifacts")
+        self.assertEqual(got["body"], self.data)
+        self.assertEqual(got["auth"], "Bearer t")
+        self.assertEqual(got["x"], "out%2Fa.bin")
+
+    def test_upload_goes_through_the_hub_proxy(self):
+        proxy = self.serve(_ForwardProxy)
+        client = HubClient(self.hub_url, "t", proxy=proxy)
+        result = client.upload_file("/api/jobs/j1/artifacts", self.file,
+                                    headers={"X-Calltable-Path": "out%2Fa.bin"})
+        self.check_received(result)
+        self.assertEqual(_ForwardProxy.targets,
+                         [self.hub_url + "/api/jobs/j1/artifacts"])
+
+    def test_upload_without_proxy_goes_direct(self):
+        client = HubClient(self.hub_url, "t")
+        result = client.upload_file("/api/jobs/j1/artifacts", self.file,
+                                    headers={"X-Calltable-Path": "out%2Fa.bin"},
+                                    block=4096)
+        self.check_received(result)
+        self.assertEqual(_ForwardProxy.targets, [])
+
+    def test_https_hub_uses_a_connect_tunnel(self):
+        client = HubClient("https://hub.example.ts.net", "t",
+                           proxy="http://localhost:1055")
+        with mock.patch.object(http.client, "HTTPSConnection") as conn_cls:
+            conn = conn_cls.return_value
+            conn.getresponse.return_value = mock.Mock(status=200,
+                                                      read=lambda: b"")
+            client.upload_file("/api/jobs/j1/artifacts", self.file)
+        self.assertEqual(conn_cls.call_args[0][:2], ("localhost", 1055))
+        conn.set_tunnel.assert_called_once_with("hub.example.ts.net", 443)
+        conn.putrequest.assert_called_once_with("POST", "/api/jobs/j1/artifacts")
+        sent = b"".join(call.args[0] for call in conn.send.call_args_list)
+        self.assertEqual(sent, self.data)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@ DEFAULT_HUB_URL = "http://127.0.0.1:8091"
 #: 可选的 tailnet 名；留空表示不做 tailnet 归属检查（纯 HTTP/HTTPS + token 也能用）。
 DEFAULT_OWNER_TAILNET = ""
 DEFAULT_DATA_SUBDIR = ".calltable"
+#: 执行器一次一任务、由 hub 按需拉起的 provider（见 ``calltable/cloudrun.py``）。
+EPHEMERAL_PROVIDERS = ("cloudrun",)
 
 
 class ConfigError(RuntimeError):
@@ -35,8 +37,11 @@ class HostSpec:
 
     @property
     def ephemeral(self) -> bool:
-        """执行器是否一次一任务、用完即走（心跳按 worker 对账）。"""
-        return self.provider != "static"
+        """执行器是否一次一任务、用完即走（心跳按 worker 对账）。
+
+        只有已知的按需 provider 才算；未知的 provider 值（拼错等）hub 会告警，
+        并完全按常驻主机处理。"""
+        return self.provider in EPHEMERAL_PROVIDERS
 
 
 @dataclass

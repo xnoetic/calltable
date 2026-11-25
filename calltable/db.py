@@ -1072,6 +1072,23 @@ class Store:
             self._finish_locked(job_id, status, exit_code, error, cleanup_at)
         return self.job(job_id)
 
+    def finish_if_status(self, job_id: str, expected: tuple[str, ...], *,
+                         status: str, exit_code: int | None, error: str = "",
+                         cleanup_at: float | None = None) -> dict | None:
+        """只有任务当前状态仍在 ``expected`` 里才写终态（检查与更新在同一把锁里）。
+
+        给 provider 对账用：它读到的任务快照可能在慢速云 API 调用期间过期，
+        执行器在此期间上报的终态不能被覆盖。没写（任务不存在或状态已变）
+        返回 None。普通 :meth:`finish` 的语义不变。
+        """
+        with self.lock:
+            row = self.conn.execute(
+                "SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] not in expected:
+                return None
+            self._finish_locked(job_id, status, exit_code, error, cleanup_at)
+        return self.job(job_id)
+
     def _finish_locked(self, job_id: str, status: str, exit_code: int | None,
                        error: str = "", cleanup_at: float | None = None) -> None:
         previous = self.conn.execute(
