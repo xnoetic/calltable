@@ -417,9 +417,10 @@ class Provisioner:
         for job in self.store.jobs(status=QUEUED, limit=10000):
             targets = job.get("targets") or [job.get("host")]
             if targets == [host]:
-                self.store.finish(job["id"], status="error", exit_code=None,
-                                  error=message,
-                                  cleanup_at=now() + self.hub.config.retention_failure)
+                self.store.finish_if_status(
+                    job["id"], (QUEUED,), status="error", exit_code=None,
+                    error=message,
+                    cleanup_at=now() + self.hub.config.retention_failure)
 
     def _launch(self, host: str, settings: CloudRunSettings, job: dict) -> None:
         profile = self.hub.hub_profile(job)
@@ -438,10 +439,7 @@ class Provisioner:
             note = f"cloud run launch failed ({cloud_job}): {exc}"
             self.store.cloud_update(job["id"], state="failed", ended=now(),
                                     note=note[:500])
-            self.store.finish(job["id"], status="error", exit_code=None,
-                              error=note[:1000],
-                              cleanup_at=now() + self.hub.config.retention_failure)
-            print(f"[cloudrun] {job['id']}: {note}", flush=True)
+            self._fail(job["id"], note[:1000])
             return
         self.store.cloud_update(job["id"], execution=execution, state="launched")
         image = project_image(settings, job["project"],
@@ -455,9 +453,9 @@ class Provisioner:
                     >= settings.reconcile_interval)
         if describe:
             self._last_reconcile[host] = current
-        for row in self.store.cloud_executions(active_only=True):
-            if row["host"] != host:
-                continue
+        rows = [row for row in self.store.cloud_executions(active_only=True)
+                if row["host"] == host]
+        for row in rows:
             job = self.store.job(row["job_id"])
             job_done = job is None or job.get("status") in TERMINAL
             execution = row["execution"]
@@ -465,6 +463,23 @@ class Provisioner:
                 if job_done:
                     self.store.cloud_update(row["job_id"], state="ended",
                                             ended=current)
+                    continue
+                # execution 名没记下来（hub 在 gcloud execute 期间或之前退出）：
+                # 无从取消，但 Cloud Run 那边可能已经拉起，容器照样能 attach 并
+                # 跑完；只按同样的 attach / 心跳超时回收，并关掉这条记录止住花费。
+                timeout = self._timed_out(row, settings, current)
+                if timeout:
+                    if timeout == "attach":
+                        reason = (f"no executor attached within "
+                                  f"{settings.attach_timeout}s")
+                    else:
+                        seen = row["last_seen"] or row["attached"]
+                        reason = (f"executor heartbeat lost for "
+                                  f"{int(current - seen)}s")
+                    self.store.cloud_update(row["job_id"], state="failed",
+                                            ended=current, note=reason[:500])
+                    self._fail(row["job_id"], "cloud run execution name was never "
+                                              f"recorded (hub restarted?): {reason}")
                 continue
             finished, detail, ended_at = False, "", None
             if describe or job_done:
@@ -480,26 +495,50 @@ class Provisioner:
                                         ended=ended_at or current,
                                         note=detail[:500])
                 if not job_done and job.get("status") == RUNNING:
-                    self._fail(job, f"cloud run execution {execution} ended "
-                                    f"before the job reported ({detail})")
+                    self._fail(job["id"], f"cloud run execution {execution} ended "
+                                          f"before the job reported ({detail})")
                 continue
             if job_done:
                 finished_at = float(job.get("finished") or current) if job else current
                 if current - finished_at >= settings.timeout_grace:
                     self._cancel(row, settings, "job already finished")
                 continue
-            attached = row["attached"]
-            if not attached and current - row["launched"] >= settings.attach_timeout:
+            timeout = self._timed_out(row, settings, current)
+            if timeout == "attach":
                 self._cancel(row, settings, "no executor attached within "
                              f"{settings.attach_timeout}s")
-                self._fail(job, f"cloud run execution {execution} never attached "
-                                f"within {settings.attach_timeout}s")
-                continue
-            seen = row["last_seen"] or attached
-            if attached and seen and current - seen >= settings.heartbeat_timeout:
+                self._fail(job["id"], f"cloud run execution {execution} never "
+                                      f"attached within {settings.attach_timeout}s")
+            elif timeout == "heartbeat":
+                seen = row["last_seen"] or row["attached"]
                 self._cancel(row, settings, "executor heartbeat lost")
-                self._fail(job, f"cloud run execution {execution}: executor "
-                                f"heartbeat lost for {int(current - seen)}s")
+                self._fail(job["id"], f"cloud run execution {execution}: executor "
+                                      f"heartbeat lost for {int(current - seen)}s")
+        # claim 之后、写 cloud_executions 之前 hub 退出：任务停在 running +
+        # pending: 占位，没有 execution 也不会有人 attach。按 attach_timeout
+        # （从任务开始 running 算）回收，否则它永远占着 slot。
+        tracked = {row["job_id"] for row in rows}
+        for job in self.store.jobs(status=RUNNING, limit=10000):
+            if (job.get("host") != host or job["id"] in tracked
+                    or not (job.get("worker") or "").startswith(PENDING_WORKER_PREFIX)):
+                continue
+            started = float(job.get("started") or current)
+            if current - started >= settings.attach_timeout:
+                self._fail(job["id"], "cloud run launch was never recorded "
+                                      "(hub restarted?): no executor attached "
+                                      f"within {settings.attach_timeout}s")
+
+    @staticmethod
+    def _timed_out(row: dict, settings: CloudRunSettings,
+                   current: float) -> str:
+        """``"attach"`` / ``"heartbeat"``：哪种超时；没超时返回空串。"""
+        attached = row["attached"]
+        if not attached and current - row["launched"] >= settings.attach_timeout:
+            return "attach"
+        seen = row["last_seen"] or attached
+        if attached and seen and current - seen >= settings.heartbeat_timeout:
+            return "heartbeat"
+        return ""
 
     def _cancel(self, row: dict, settings: CloudRunSettings, reason: str) -> None:
         try:
@@ -509,10 +548,11 @@ class Provisioner:
         self.store.cloud_update(row["job_id"], state="cancelled", ended=now(),
                                 note=reason[:500])
 
-    def _fail(self, job: dict | None, message: str) -> None:
-        if not job or job.get("status") in TERMINAL:
-            return
-        self.store.finish(job["id"], status="error", exit_code=None,
-                          error=message,
-                          cleanup_at=now() + self.hub.config.retention_failure)
-        print(f"[cloudrun] {job['id']}: {message}", flush=True)
+    def _fail(self, job_id: str, message: str) -> None:
+        # 「还在 running 吗」与写 error 在 store 的同一把锁里完成：慢速 gcloud
+        # 调用期间执行器上报的终态不会被这里覆盖。
+        failed = self.store.finish_if_status(
+            job_id, (RUNNING,), status="error", exit_code=None, error=message,
+            cleanup_at=now() + self.hub.config.retention_failure)
+        if failed is not None:
+            print(f"[cloudrun] {job_id}: {message}", flush=True)

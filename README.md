@@ -330,7 +330,10 @@ How it works:
   job `error`; an execution that outlives its finished job is cancelled; an
   execution nobody attaches to within `attach_timeout` (15 min) or whose
   executor stops heartbeating for `heartbeat_timeout` (15 min) is cancelled and
-  its job fails. Job definitions use `--max-retries=0`, so Cloud Run never
+  its job fails. A reservation whose launch the hub never finished recording
+  (for example the hub restarted mid-launch) gets the same attach and heartbeat
+  timeouts, without a cancel call, so it cannot hold a slot or accrue estimated
+  spend forever. Job definitions use `--max-retries=0`, so Cloud Run never
   re-runs a job calltable already finished.
 * **Timeouts.** Each execution gets `task timeout = job timeout + timeout_grace`
   (5 min), capped at `max_task_timeout` (default 3 h).

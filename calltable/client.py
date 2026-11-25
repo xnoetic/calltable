@@ -98,11 +98,30 @@ class HubClient:
         """流式上传（I7）：用 http.client 的 send(fileobj) 分块发送，不进内存。"""
         size = os.path.getsize(file_path)
         parsed = urllib.parse.urlparse(self.base + path)
-        conn = http.client.HTTPConnection(parsed.hostname,
-                                          parsed.port or 80,
-                                          timeout=max(self.timeout, 600))
+        timeout = max(self.timeout, 600)
+        target = parsed.path or "/"
+        if self.proxy:
+            # 与 _open 一样走 hub 专用代理（Cloud Run 里只有它能到 hub）：
+            # http 发绝对 URI 给代理转发；https 先 CONNECT 建隧道。
+            proxy = urllib.parse.urlparse(
+                self.proxy if "://" in self.proxy else "http://" + self.proxy)
+            if parsed.scheme == "https":
+                conn = http.client.HTTPSConnection(proxy.hostname,
+                                                   proxy.port or 80,
+                                                   timeout=timeout)
+                conn.set_tunnel(parsed.hostname, parsed.port or 443)
+            else:
+                conn = http.client.HTTPConnection(proxy.hostname,
+                                                  proxy.port or 80,
+                                                  timeout=timeout)
+                target = urllib.parse.urlunparse(
+                    (parsed.scheme or "http", parsed.netloc, target, "", "", ""))
+        else:
+            conn = http.client.HTTPConnection(parsed.hostname,
+                                              parsed.port or 80,
+                                              timeout=timeout)
         try:
-            conn.putrequest("POST", parsed.path or "/")
+            conn.putrequest("POST", target)
             conn.putheader("Authorization", f"Bearer {self.token}")
             conn.putheader("Content-Type", "application/octet-stream")
             conn.putheader("Content-Length", str(size))
