@@ -7,7 +7,7 @@
 # Overridables: CALLTABLE_REPO_URL, CALLTABLE_SRC, CALLTABLE_BIN, PYTHON.
 set -euo pipefail
 
-REPO_URL="${CALLTABLE_REPO_URL:-https://github.com/eanzhao-os/calltable.git}"
+REPO_URL="${CALLTABLE_REPO_URL:-https://github.com/xnoetic/calltable.git}"
 SRC="${CALLTABLE_SRC:-$HOME/.calltable/src}"
 BIN_DIR="${CALLTABLE_BIN:-$HOME/.local/bin}"
 PYTHON_BIN="${PYTHON:-python3}"

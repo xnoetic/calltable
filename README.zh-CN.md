@@ -123,7 +123,7 @@
 
 ```bash
 # 1. 安装客户端（macOS / Linux）：克隆到 ~/.calltable/src，并链接 `ct`
-curl -fsSL https://raw.githubusercontent.com/eanzhao-os/calltable/main/bin/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xnoetic/calltable/main/bin/install.sh | bash
 #    或者在检出目录里：  bash bin/install.sh
 #    Windows（不需要管理员权限）：
 #      powershell -ExecutionPolicy Bypass -File .\bin\install.ps1

@@ -165,7 +165,7 @@ Requirements: **Python 3.12+** and `git`. No third-party Python packages.
 
 ```bash
 # 1. install the client (macOS / Linux): clones into ~/.calltable/src and links `ct`
-curl -fsSL https://raw.githubusercontent.com/eanzhao-os/calltable/main/bin/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xnoetic/calltable/main/bin/install.sh | bash
 #    or, from a checkout:  bash bin/install.sh
 #    Windows (no admin rights needed):
 #      powershell -ExecutionPolicy Bypass -File .\bin\install.ps1

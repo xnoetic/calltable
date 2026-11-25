@@ -19,7 +19,7 @@ Thanks for taking a look at calltable.
 ## Development
 
 ```bash
-git clone https://github.com/eanzhao-os/calltable.git
+git clone https://github.com/xnoetic/calltable.git
 cd calltable
 python -m unittest discover -s tests -t . -v     # full suite, this machine
 python -m calltable --version
