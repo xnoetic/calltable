@@ -1,6 +1,6 @@
 [Unit]
 Description=calltable heavy jobs (CPUWeight 400, MemoryMax 24G; per-job cap 12G)
-Documentation=https://github.com/eanzhao-os/calltable
+Documentation=https://github.com/xnoetic/calltable
 
 [Slice]
 CPUWeight=400

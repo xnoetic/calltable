@@ -10,7 +10,7 @@
 param(
     [string]$Src = (Join-Path $HOME ".calltable\src"),
     [string]$Bin = (Join-Path $HOME "bin"),
-    [string]$RepoUrl = "https://github.com/eanzhao-os/calltable.git",
+    [string]$RepoUrl = "https://github.com/xnoetic/calltable.git",
     [string]$Python = "python"
 )
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=calltable hub (job queue, locks, logs, dashboard)
-Documentation=https://github.com/eanzhao-os/calltable
+Documentation=https://github.com/xnoetic/calltable
 After=network-online.target
 Wants=network-online.target
 
