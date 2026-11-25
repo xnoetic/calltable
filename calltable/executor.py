@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -54,8 +55,13 @@ DISK_SCAN_INTERVAL = 60.0
 #: 调整任务进程 OOM 权重的 procfs 入口（只在 Linux 上存在）。
 OOM_SCORE_ADJ_PATH = "/proc/self/oom_score_adj"
 #: 只给执行器自己用的 hub 凭据：不随环境变量传给任务命令（Cloud Run 上它们
-#: 由 Secret Manager 注入容器环境）。
-HUB_CREDENTIAL_ENV = ("CALLTABLE_TOKEN", "TS_AUTHKEY")
+#: 由 Secret Manager 注入容器环境）。``CALLTABLE_GIT_TOKEN`` 是从远端仓库
+#: （GitHub）取代码用的只读 token。
+HUB_CREDENTIAL_ENV = ("CALLTABLE_TOKEN", "TS_AUTHKEY", "CALLTABLE_GIT_TOKEN")
+#: 从远端仓库取 hub 推过去的临时 ref 的超时上限（秒，另受任务截止时间约束）。
+GIT_RELAY_FETCH_TIMEOUT = 900.0
+#: hub 推送的临时 ref 前缀（``refs/calltable/jobs/<job id>``）。
+_GIT_RELAY_REFS_RE = re.compile(r"^refs/calltable/jobs/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _artifact_regex(pattern: str) -> re.Pattern[str]:
@@ -521,7 +527,14 @@ class Executor:
                 raise RuntimeError("job has no commit sha")
 
             self._checkpoint(job_id, deadline)
-            if job.get("bundle_url"):
+            # Cloud Run + cloudrun.git：先从远端仓库取 hub 推过去的临时 ref；
+            # 提交到手就不再从 hub 下载 bundle（hub 链路慢），否则照旧走 bundle。
+            relayed = False
+            if (os.environ.get("CALLTABLE_GIT_URL")
+                    and os.environ.get("CALLTABLE_GIT_REFS")):
+                relayed = self._fetch_git_relay(job_id, mirror, sha, deadline)
+                self._checkpoint(job_id, deadline, "git relay fetch")
+            if job.get("bundle_url") and not relayed:
                 bundle = run_dir / "upload.bundle"
                 self.client.download(job["bundle_url"], bundle)
                 self._checkpoint(job_id, deadline, "bundle download")
@@ -648,6 +661,59 @@ class Executor:
         if not path.is_relative_to(root):
             raise RuntimeError(f"mirror path escapes mirror_root: {path}")
         return path
+
+    def _fetch_git_relay(self, job_id: str, mirror: Path, sha: str,
+                         deadline: float) -> bool:
+        """``CALLTABLE_GIT_URL`` + ``CALLTABLE_GIT_REFS``：从远端仓库取临时 ref。
+
+        返回任务提交是否已在镜像里。任何失败只记一行日志、返回 False，
+        调用方照旧走 hub bundle。token 只经环境变量形式的 git 配置
+        （``GIT_CONFIG_COUNT``）传给 git：不进 argv、不写镜像配置、不进日志。
+        """
+        url = os.environ.get("CALLTABLE_GIT_URL", "").strip()
+        refs = os.environ.get("CALLTABLE_GIT_REFS", "").strip().rstrip("/")
+        if not url or not refs:
+            return False
+        token = os.environ.get("CALLTABLE_GIT_TOKEN", "").strip()
+        secrets = [token] if token else []
+        try:
+            if not _GIT_RELAY_REFS_RE.fullmatch(refs):
+                raise RuntimeError(f"bad CALLTABLE_GIT_REFS {refs!r}")
+            if url.startswith("-"):
+                raise RuntimeError("bad CALLTABLE_GIT_URL")
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return False
+            env = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
+            if token:
+                basic = base64.b64encode(
+                    f"x-access-token:{token}".encode("utf-8")).decode("ascii")
+                secrets.append(basic)
+                index = int(os.environ.get("GIT_CONFIG_COUNT") or 0)
+                env.update({"GIT_CONFIG_COUNT": str(index + 1),
+                            f"GIT_CONFIG_KEY_{index}": "http.extraheader",
+                            f"GIT_CONFIG_VALUE_{index}":
+                                f"Authorization: Basic {basic}"})
+            gitops.ensure_mirror(mirror)
+            started = time.time()
+            gitops.git(["-C", str(mirror), "fetch", "--no-tags", "--quiet", url,
+                        f"+{refs}/*:refs/calltable/relay/*"],
+                       env=env, input_data="",
+                       timeout=max(1.0, min(remaining, GIT_RELAY_FETCH_TIMEOUT)))
+            if not gitops.has_commit(mirror, sha):
+                print(f"[exec] {job_id}: git relay: commit {sha[:12]} not in "
+                      f"{refs}; falling back to hub bundles", flush=True)
+                return False
+            print(f"[exec] {job_id}: git relay: fetched {refs} from {url} in "
+                  f"{time.time() - started:.1f}s", flush=True)
+            return True
+        except Exception as exc:
+            message = " ".join(str(exc).split())
+            for secret in secrets:
+                message = message.replace(secret, "***")
+            print(f"[exec] {job_id}: git relay fetch failed, falling back to hub "
+                  f"bundles: {type(exc).__name__}: {message[:500]}", flush=True)
+            return False
 
     def _checkpoint(self, job_id: str, deadline: float, stage: str = "") -> None:
         if self._cancel_flags.get(job_id):

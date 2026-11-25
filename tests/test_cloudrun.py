@@ -8,6 +8,9 @@ import contextlib
 import http.client
 import http.server
 import json
+import os
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -106,15 +109,23 @@ class Base(unittest.TestCase):
     hosts_overrides: dict = {}
     api_class = FakeAPI
 
+    def profile_git(self) -> dict | None:
+        """子类返回 profile 的 ``cloudrun.git``；None 表示不配置（功能关闭）。"""
+        return None
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.tmp.name)
         self.config = make_config(self.root, hosts=cloud_hosts(**self.hosts_overrides))
+        profile_cloudrun = {"base_image": "mcr.microsoft.com/dotnet/sdk:10.0",
+                            "install": ["apt-get update && apt-get install -y jq"],
+                            "env": {"DOTNET_NOLOGO": "1"}}
+        git_settings = self.profile_git()
+        if git_settings is not None:
+            profile_cloudrun["git"] = git_settings
         (self.root / "profiles" / "demo@cloudrun.json").write_text(json.dumps({
             "name": "demo@cloudrun", "slot": "light", "timeout": "20m",
-            "cloudrun": {"base_image": "mcr.microsoft.com/dotnet/sdk:10.0",
-                         "install": ["apt-get update && apt-get install -y jq"],
-                         "env": {"DOTNET_NOLOGO": "1"}},
+            "cloudrun": profile_cloudrun,
             "rules": [{"match": "gate", "slot": "heavy", "timeout": "2h"}],
         }), encoding="utf-8")
         self.api = self.api_class()
@@ -934,6 +945,490 @@ class UploadProxyTests(unittest.TestCase):
         conn.putrequest.assert_called_once_with("POST", "/api/jobs/j1/artifacts")
         sent = b"".join(call.args[0] for call in conn.send.call_args_list)
         self.assertEqual(sent, self.data)
+
+
+GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
+
+
+def run_git(cwd, *args) -> str:
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, check=True,
+                          env={**os.environ, **GIT_ENV}).stdout.strip()
+
+
+class GitRelaySettingsTests(unittest.TestCase):
+    def test_feature_is_off_without_a_url(self):
+        self.assertIsNone(cloudrun.GitRelay.from_profile({}))
+        self.assertIsNone(cloudrun.GitRelay.from_profile(None))
+        self.assertIsNone(cloudrun.GitRelay.from_profile({"git": {"branch": "x"}}))
+
+    def test_defaults(self):
+        relay = cloudrun.GitRelay.from_profile(
+            {"git": {"url": "https://github.com/o/r.git"}})
+        self.assertEqual(relay.push_url, "https://github.com/o/r.git")
+        self.assertEqual(relay.branch, "main")
+        self.assertEqual(relay.token_secret, "")
+
+    def test_unsafe_values_are_rejected(self):
+        bad = [
+            {"url": "https://github.com/o/r.git x"},
+            {"url": "https://github.com/o/r.git\nimages: [evil]"},
+            {"url": "https://github.com/o/r.git;rm"},
+            {"url": "https://github.com/o/'r'.git"},
+            {"url": "--upload-pack=evil"},
+            {"url": "https://github.com/o/r.git,X=1"},
+            {"url": "https://user:secret@github.com/o/r.git"},
+            {"url": "https://github.com/o/r.git", "push_url": "$(evil)"},
+            {"url": "https://github.com/o/r.git", "branch": "a b"},
+            {"url": "https://github.com/o/r.git", "branch": "a..b"},
+            {"url": "https://github.com/o/r.git", "branch": "-x"},
+            {"url": "https://github.com/o/r.git", "token_secret": "a:b"},
+            {"url": "https://github.com/o/r.git", "token_secret": "a\nb"},
+        ]
+        for git_settings in bad:
+            with self.subTest(git_settings=git_settings):
+                with self.assertRaises(ValueError):
+                    cloudrun.GitRelay.from_profile({"git": git_settings})
+        cloudrun.GitRelay.from_profile({"git": {
+            "url": "https://github.com/o/r.git",
+            "push_url": "git@github.com:o/r.git",
+            "branch": "release/1.2", "token_secret": "calltable-git_x"}})
+        with self.assertRaises(ValueError):
+            CloudRunSettings.from_host("c", {"project": "p",
+                                             "git_token_secret": "bad name"})
+
+    def test_token_secret_resolution(self):
+        url = "https://github.com/o/r.git"
+        resolve = cloudrun.GitRelay.from_profile
+        # profile 的值优先
+        self.assertEqual(resolve({"git": {"url": url, "token_secret": "mine"}},
+                                 "shared").token_secret, "mine")
+        # 没有这个键：用主机默认
+        self.assertEqual(resolve({"git": {"url": url}}, "shared").token_secret,
+                         "shared")
+        # 显式空串 / null：不用 token
+        self.assertEqual(resolve({"git": {"url": url, "token_secret": ""}},
+                                 "shared").token_secret, "")
+        self.assertEqual(resolve({"git": {"url": url, "token_secret": None}},
+                                 "shared").token_secret, "")
+        settings = CloudRunSettings.from_host(
+            "c", {"project": "p", "git_token_secret": "shared"})
+        self.assertEqual(settings.git_token_secret, "shared")
+        self.assertEqual(CloudRunSettings.from_host("c", {"project": "p"})
+                         .git_token_secret, "")
+
+
+class GitRelayBase(Base):
+    """hub 镜像里有两个提交；「GitHub」是本地裸仓库。"""
+
+    def profile_git(self):
+        self.remote = Path(self.tmp.name) / "remote.git"
+        return {"url": str(self.remote), "push_url": str(self.remote)}
+
+    def setUp(self):
+        super().setUp()
+        run_git(self.root, "init", "-q", "--bare", str(self.remote))
+        src = self.root / "src"
+        src.mkdir()
+        run_git(src, "init", "-q", "-b", "main")
+        (src / "a.txt").write_text("one\n", encoding="utf-8")
+        run_git(src, "add", "-A")
+        run_git(src, "commit", "-qm", "one")
+        self.base_sha = run_git(src, "rev-parse", "HEAD")
+        (src / "a.txt").write_text("two\n", encoding="utf-8")
+        run_git(src, "commit", "-qam", "two")
+        self.sha = run_git(src, "rev-parse", "HEAD")
+        mirror = self.hub.mirror_for("demo")
+        run_git(mirror, "fetch", "-q", str(src), "+refs/heads/*:refs/heads/*")
+
+    def submit_git(self):
+        return self.submit(sha=self.sha, base_ref="origin/main",
+                           base_ref_sha=self.base_sha)
+
+    def remote_refs(self) -> dict:
+        out = run_git(self.root, "ls-remote", str(self.remote))
+        return {line.split()[1]: line.split()[0] for line in out.splitlines()}
+
+    def launch(self):
+        job = self.submit_git()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.provisioner.tick()
+        return job, out.getvalue()
+
+    def close(self, job):
+        execution = self.api.runs[-1]["execution"]
+        self.hub.attach(job["id"], "cloudrun", "w1")
+        self.store.finish(job["id"], status="succeeded", exit_code=0)
+        self.api.complete(execution)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.provisioner.tick()
+        return out.getvalue()
+
+
+class GitRelayHubTests(GitRelayBase):
+    def test_hub_pushes_both_refs_and_passes_the_variables(self):
+        job, out = self.launch()
+        prefix = f"refs/calltable/jobs/{job['id']}"
+        env = self.api.runs[0]["env"]
+        self.assertEqual(env["CALLTABLE_GIT_URL"], str(self.remote))
+        self.assertEqual(env["CALLTABLE_GIT_REFS"], prefix)
+        self.assertEqual(self.remote_refs(), {f"{prefix}/head": self.sha,
+                                              f"{prefix}/base": self.base_sha})
+        row = self.store.cloud_executions()[0]
+        self.assertEqual(json.loads(row["git_refs"])["refs"],
+                         [f"{prefix}/base", f"{prefix}/head"])
+        self.assertNotIn("failed", out)
+
+    def test_push_failure_falls_back_and_still_launches(self):
+        shutil.rmtree(self.remote)
+        job, out = self.launch()
+        self.assertEqual(len(self.api.runs), 1)
+        env = self.api.runs[0]["env"]
+        self.assertNotIn("CALLTABLE_GIT_URL", env)
+        self.assertNotIn("CALLTABLE_GIT_REFS", env)
+        self.assertEqual(self.store.job(job["id"])["status"], "running")
+        warnings = [line for line in out.splitlines() if "git push" in line]
+        self.assertEqual(len(warnings), 1, out)
+        self.assertTrue(warnings[0].startswith(f"[cloudrun] {job['id']}: "))
+        self.assertIn("falling back to hub bundles", warnings[0])
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_missing_base_pushes_head_only(self):
+        job = self.submit(sha=self.sha, base_ref="origin/main",
+                          base_ref_sha="f" * 40)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(list(self.remote_refs()),
+                         [f"refs/calltable/jobs/{job['id']}/head"])
+        self.assertIn("CALLTABLE_GIT_REFS", self.api.runs[0]["env"])
+
+    def test_refs_are_deleted_after_the_row_closes(self):
+        job, _ = self.launch()
+        # execution 还在跑：ref 不能删
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(len(self.remote_refs()), 2)
+        self.close(job)
+        self.assertEqual(self.store.cloud_executions(active_only=True), [])
+        self.assertEqual(self.remote_refs(), {})
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_failed_deletion_is_retried_later(self):
+        job, _ = self.launch()
+        moved = self.root / "remote-away.git"
+        self.remote.rename(moved)
+        out = self.close(job)
+        self.assertIn("deleting git refs", out)
+        self.assertIn("will retry", out)
+        self.assertNotEqual(self.store.cloud_executions()[0]["git_refs"], "")
+        moved.rename(self.remote)
+        # 退避期内不重试
+        with mock.patch.object(cloudrun, "run_git") as git_call:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.provisioner.tick()
+        git_call.assert_not_called()
+        self.assertEqual(len(self.remote_refs()), 2)
+        self.provisioner._git_retry_at.clear()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(self.remote_refs(), {})
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_partially_deleted_refs_count_as_cleaned(self):
+        job, _ = self.launch()
+        run_git(self.root, "--git-dir", str(self.remote), "update-ref", "-d",
+                f"refs/calltable/jobs/{job['id']}/base")
+        out = self.close(job)
+        self.assertEqual(self.remote_refs(), {})
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+        self.assertNotIn("will retry", out)
+
+    def test_launch_failure_still_cleans_up_the_refs(self):
+        self.api.fail_run = True
+        job, _ = self.launch()
+        self.assertEqual(self.store.job(job["id"])["status"], "error")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(self.remote_refs(), {})
+
+    def test_closing_hub_skips_the_push(self):
+        job = self.submit_git()
+        with mock.patch.object(self.provisioner, "_closing", return_value=True):
+            env = self.provisioner._push_git_refs(self.store.job(job["id"]))
+        self.assertEqual(env, {})
+        self.assertEqual(self.remote_refs(), {})
+
+
+class GitRelayOffTests(GitRelayBase):
+    def profile_git(self):
+        self.remote = Path(self.tmp.name) / "remote.git"
+        return None
+
+    def test_without_cloudrun_git_nothing_changes(self):
+        with mock.patch.object(cloudrun, "run_git") as git_call:
+            job, out = self.launch()
+            self.close(job)
+        git_call.assert_not_called()
+        env = self.api.runs[0]["env"]
+        self.assertEqual(sorted(env), ["CALLTABLE_EXEC_HOST", "CALLTABLE_HUB_URL",
+                                       "CALLTABLE_JOB_ID"])
+        self.assertEqual(out.splitlines(), [
+            f"[cloudrun] {job['id']} -> ct-demo-light execution "
+            f"{self.api.runs[0]['execution']}"])
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+        self.assertEqual(self.remote_refs(), {})
+
+
+class GitRelayMigrationTests(unittest.TestCase):
+    def test_old_database_gains_the_git_refs_column(self):
+        import sqlite3
+        from calltable.db import Store
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            path = Path(tmp) / "old.db"
+            conn = sqlite3.connect(path)
+            conn.execute("""CREATE TABLE cloud_executions (
+                job_id TEXT PRIMARY KEY, host TEXT NOT NULL,
+                cloud_job TEXT NOT NULL DEFAULT '', execution TEXT NOT NULL DEFAULT '',
+                vcpu REAL NOT NULL DEFAULT 0, memory_gib REAL NOT NULL DEFAULT 0,
+                launched REAL NOT NULL, attached REAL, last_seen REAL, ended REAL,
+                state TEXT NOT NULL DEFAULT 'launching', note TEXT NOT NULL DEFAULT '')""")
+            conn.execute("INSERT INTO cloud_executions(job_id, host, launched, ended) "
+                         "VALUES('j1', 'cloudrun', 1, 2)")
+            conn.commit()
+            conn.close()
+            store = Store(path)
+            try:
+                self.assertEqual(store.cloud_executions()[0]["git_refs"], "")
+                self.assertEqual(store.cloud_git_pending("cloudrun"), [])
+                store.cloud_update("j1", git_refs="{}")
+                self.assertEqual(len(store.cloud_git_pending("cloudrun")), 1)
+            finally:
+                store.close()
+
+
+class GitRelayCliTests(Base):
+    def profile_git(self):
+        return {"url": "https://github.com/o/demo.git",
+                "push_url": "git@github.com:o/demo.git",
+                "branch": "trunk", "token_secret": "calltable-git-demo"}
+
+    run_cli = CliTests.run_cli
+
+    def test_jobs_mount_the_git_token_secret(self):
+        code, out = self.run_cli("jobs", "--project", "demo")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.count(
+            "CALLTABLE_GIT_TOKEN=calltable-git-demo:latest"), 2)
+
+    def test_job_commands_secrets(self):
+        settings = self.provisioner.settings["cloudrun"]
+        url = "https://github.com/o/demo.git"
+
+        def secrets(cloudrun_profile, host_default=""):
+            settings.git_token_secret = host_default
+            cmd = cloudrun_cli.job_commands(settings, "demo", "img", ["light"],
+                                            cloudrun_profile)[0]
+            return next(a for a in cmd if a.startswith("--set-secrets="))
+
+        plain = secrets(None)
+        self.assertNotIn("CALLTABLE_GIT_TOKEN", plain)
+        self.assertEqual(secrets({"base_image": "x"}), plain)
+        self.assertEqual(secrets({"git": {"url": url}}), plain)
+        self.assertIn("CALLTABLE_GIT_TOKEN=shared:latest",
+                      secrets({"git": {"url": url}}, "shared"))
+        self.assertIn("CALLTABLE_GIT_TOKEN=mine:latest",
+                      secrets({"git": {"url": url, "token_secret": "mine"}},
+                              "shared"))
+        self.assertEqual(secrets({"git": {"url": url, "token_secret": ""}},
+                                 "shared"), plain)
+        # 原命令（不带 profile 参数）不变
+        self.assertEqual(
+            cloudrun_cli.job_commands(settings, "demo", "img", ["light"]),
+            cloudrun_cli.job_commands(settings, "demo", "img", ["light"], {}))
+
+    def test_image_with_cloudbuild_bakes_the_mirror(self):
+        context = self.root / "ctx"
+        with mock.patch.object(cloudrun_cli.subprocess, "call") as call:
+            code, out = self.run_cli("image", "--project", "demo",
+                                     "--context", str(context), "--tag", "v1")
+        self.assertEqual(code, 0)
+        call.assert_not_called()
+        self.assertIn("will bake branch trunk of https://github.com/o/demo.git",
+                      out)
+        self.assertIn(f"gcloud builds submit {context} "
+                      f"--config={context / 'cloudbuild.yaml'} "
+                      "--project=demo-project --region=us-central1 "
+                      "--substitutions=_IMAGE=us-central1-docker.pkg.dev/"
+                      "demo-project/calltable/demo:v1", out)
+        self.assertNotIn("--tag=", out)
+        self.assertIn("dry run", out)
+        dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
+        plain = cloudrun_cli.render_dockerfile(
+            {k: v for k, v in self.profile_cloudrun().items() if k != "git"})
+        self.assertEqual(dockerfile.replace(
+            "COPY mirrors/ /opt/calltable/mirrors/\n", "", 1), plain)
+        self.assertIn("COPY calltable /opt/calltable/calltable\n"
+                      "COPY mirrors/ /opt/calltable/mirrors/\n", dockerfile)
+        yaml = (context / "cloudbuild.yaml").read_text(encoding="utf-8")
+        steps = yaml.index("- id: bake-mirror"), yaml.index("- id: build")
+        self.assertLess(*steps)
+        self.assertIn("git clone --bare --single-branch --no-tags --branch 'trunk' "
+                      "'https://github.com/o/demo.git' 'mirrors/demo.git'", yaml)
+        self.assertIn("secretEnv:\n  - GIT_TOKEN", yaml)
+        self.assertIn("versionName: projects/demo-project/secrets/"
+                      "calltable-git-demo/versions/latest", yaml)
+        self.assertIn("GIT_CONFIG_KEY_0=http.extraheader", yaml)
+        self.assertIn("- $_IMAGE", yaml)
+        # Cloud Build 会替换 $NAME：shell 变量必须是 $$，唯一的单 $ 是 $_IMAGE。
+        import re
+        singles = re.findall(r"(?<!\$)\$(?!\$)[{(A-Za-z_]+", yaml)
+        self.assertEqual(set(singles), {"$_IMAGE"}, singles)
+
+    def test_docker_builder_does_not_bake(self):
+        context = self.root / "ctx-docker"
+        code, out = self.run_cli("image", "--project", "demo", "--context",
+                                 str(context), "--builder", "docker")
+        self.assertEqual(code, 0)
+        self.assertEqual(sum("needs --builder cloudbuild" in line
+                             for line in out.splitlines()), 1)
+        self.assertIn("docker build --platform=linux/amd64", out)
+        self.assertFalse((context / "cloudbuild.yaml").exists())
+        self.assertNotIn("mirrors", (context / "Dockerfile").read_text())
+
+    def test_invalid_git_settings_are_a_usage_error(self):
+        path = self.root / "profiles" / "demo@cloudrun.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["cloudrun"]["git"]["branch"] = "x; rm"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code, _ = self.run_cli("image", "--project", "demo", "--context",
+                                   str(self.root / "ctx-bad"))
+        self.assertEqual(code, 2)
+        self.assertIn("cloudrun.git.branch", err.getvalue())
+
+    def profile_cloudrun(self):
+        path = self.root / "profiles" / "demo@cloudrun.json"
+        return json.loads(path.read_text(encoding="utf-8"))["cloudrun"]
+
+
+class GitRelayImageTests(unittest.TestCase):
+    """没有 cloudrun.git 时 Dockerfile / 命令与以前逐字节相同；预置脚本能真跑。"""
+
+    def setUp(self):
+        self.settings = CloudRunSettings.from_host("cr", {"project": "p"})
+
+    def test_plain_image_is_unchanged(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            context = Path(tmp)
+            (context / "cloudbuild.yaml").write_text("stale", encoding="utf-8")
+            cloudrun_cli.write_build_context({"base_image": "b"}, context)
+            self.assertFalse((context / "cloudbuild.yaml").exists())
+            dockerfile = (context / "Dockerfile").read_text(encoding="utf-8")
+        template = (cloudrun_cli.ASSETS / "Dockerfile.template").read_text(
+            encoding="utf-8")
+        expected = (template.replace("ARG BASE_IMAGE=python:3.12-slim",
+                                     "ARG BASE_IMAGE=b", 1)
+                    .replace("# @@INSTALL@@", "# (no profile install steps)", 1)
+                    .replace("# @@ENV@@", "# (no profile image env)", 1))
+        self.assertEqual(dockerfile, expected)
+        self.assertEqual(
+            cloudrun_cli.image_commands(self.settings, "img", Path("/ctx"),
+                                        "cloudbuild"),
+            [["gcloud", "builds", "submit", "/ctx", "--project=p",
+              "--region=us-central1", "--tag=img"]])
+
+    def test_no_token_means_no_secret_section(self):
+        relay = cloudrun.GitRelay.from_profile(
+            {"git": {"url": "https://github.com/o/r.git"}})
+        yaml = cloudrun_cli.render_cloudbuild(self.settings, "demo", relay)
+        self.assertNotIn("availableSecrets", yaml)
+        self.assertNotIn("secretEnv", yaml)
+        self.assertIn("--branch 'main'", yaml)
+        with self.assertRaises(cloudrun_cli.UsageError):
+            cloudrun_cli.render_cloudbuild(self.settings, "../x", relay)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"),
+                     "the bake step is a bash script")
+    def test_bake_script_clones_a_clean_bare_mirror(self):
+        token = "ghp-bake-token-never-in-config"
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            run_git(src, "init", "-q", "-b", "trunk")
+            (src / "f").write_text("x\n", encoding="utf-8")
+            run_git(src, "add", "-A")
+            run_git(src, "commit", "-qm", "x")
+            run_git(src, "branch", "other")
+            remote = root / "remote.git"
+            run_git(root, "clone", "-q", "--bare", str(src), str(remote))
+            relay = cloudrun.GitRelay.from_profile({"git": {
+                "url": str(remote), "branch": "trunk", "token_secret": "t"}})
+            script = "\n".join(cloudrun_cli._bake_script("demo", relay))
+            # Cloud Build 把 $$ 还原成 $ 再交给 bash。
+            script = script.replace("$$", "$")
+            workspace = root / "workspace"
+            workspace.mkdir()
+            proc = subprocess.run(["bash", "-c", script], cwd=str(workspace),
+                                  capture_output=True, text=True,
+                                  env={**os.environ, "GIT_TOKEN": token})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            mirror = workspace / "mirrors" / "demo.git"
+            self.assertEqual(run_git(mirror, "rev-parse", "--is-bare-repository"),
+                             "true")
+            heads = run_git(mirror, "for-each-ref", "--format=%(refname)")
+            self.assertEqual(heads.split(), ["refs/heads/trunk"])
+            config = (mirror / "config").read_text(encoding="utf-8")
+            self.assertNotIn(token, config)
+            self.assertNotIn("extraheader", config)
+            self.assertNotIn("remote", config)
+            self.assertNotIn(token, proc.stdout + proc.stderr)
+
+
+@unittest.skipIf(os.name == "nt" or not shutil.which("sh"),
+                 "the Cloud Run entrypoint is a POSIX shell script")
+class EntrypointMirrorTests(unittest.TestCase):
+    def run_entrypoint(self, mirror_root: Path) -> dict:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            out = root / "config-seen.json"
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            fake = bin_dir / "python3"
+            # entrypoint: exec python3 -m calltable exec --config <path> ...
+            fake.write_text(f'#!/bin/sh\ncp "$5" "{out}"\n', encoding="utf-8")
+            fake.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k != "TS_AUTHKEY"}
+            env.update({"PATH": f"{bin_dir}{os.pathsep}{env.get('PATH', '')}",
+                        "CALLTABLE_JOB_ID": "job-1",
+                        "CALLTABLE_HUB_URL": "http://127.0.0.1:1",
+                        "CALLTABLE_TOKEN": "t",
+                        "CALLTABLE_WORK_DIR": str(root / "work"),
+                        "CALLTABLE_MIRROR_ROOT": str(mirror_root)})
+            entry = cloudrun_cli.ASSETS / "entrypoint.sh"
+            proc = subprocess.run(["sh", str(entry)], env=env,
+                                  capture_output=True, text=True, timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            data = json.loads(out.read_text(encoding="utf-8"))
+            data["_work"] = str(root / "work")
+            return data
+
+    def test_baked_mirror_directory_is_used_when_present(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            baked = Path(tmp) / "mirrors"
+            baked.mkdir()
+            config = self.run_entrypoint(baked)
+        self.assertEqual(config["mirror_root"], str(baked))
+
+    def test_work_dir_mirrors_without_a_baked_directory(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            config = self.run_entrypoint(Path(tmp) / "absent")
+        self.assertEqual(config["mirror_root"],
+                         config["_work"] + "/calltable/mirrors")
 
 
 if __name__ == "__main__":

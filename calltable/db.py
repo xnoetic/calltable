@@ -216,6 +216,8 @@ MIGRATIONS = [
     ("jobs", "hold_seconds", "INTEGER NOT NULL DEFAULT 0"),
     ("jobs", "last_hold", "REAL"),
     ("jobs", "idempotency_key", "TEXT NOT NULL DEFAULT ''"),
+    # Cloud Run 经 git 中转：hub 推到远端仓库、待任务结束后删除的临时 ref（JSON）。
+    ("cloud_executions", "git_refs", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 #: provider 预留任务时写进 ``jobs.worker`` 的占位前缀；执行器 attach 后替换。
@@ -1002,7 +1004,8 @@ class Store:
                  launched if launched is not None else now()))
 
     def cloud_update(self, job_id: str, **fields) -> None:
-        allowed = {"execution", "state", "ended", "note", "attached", "last_seen"}
+        allowed = {"execution", "state", "ended", "note", "attached", "last_seen",
+                   "git_refs"}
         sets = {k: v for k, v in fields.items() if k in allowed}
         if not sets:
             return
@@ -1025,6 +1028,14 @@ class Store:
         query += " ORDER BY launched"
         with self.lock:
             rows = self.conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def cloud_git_pending(self, host: str) -> list[dict]:
+        """已关闭、但推到远端仓库的临时 ref 还没删掉的 execution 记录。"""
+        with self.lock:
+            rows = self.conn.execute(
+                "SELECT * FROM cloud_executions WHERE host=? AND ended IS NOT NULL "
+                "AND git_refs != '' ORDER BY launched", (host,)).fetchall()
         return [dict(row) for row in rows]
 
     def touch_hold(self, job_id: str) -> dict | None:

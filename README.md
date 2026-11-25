@@ -353,7 +353,8 @@ How it works:
   on the hub machine (ADC/user login or a service account such as
   `calltable-hub@…` with `roles/run.developer` and `iam.serviceAccountUser` on
   the executor service account). Containers run as `service_account` and
-  only read two Secret Manager secrets: the hub token and a Tailscale auth key.
+  only read two Secret Manager secrets: the hub token and a Tailscale auth key
+  (plus an optional git read token, see `cloudrun.git` below).
 
 ### Per-project images
 
@@ -381,6 +382,60 @@ ct cloudrun status
 Every `image`/`jobs`/`bootstrap` command only prints what it would run unless
 you pass `--apply`. The generated image is `base_image` + git + Python 3.12+
 (installed if missing) + the profile `install` steps + calltable + Tailscale.
+
+### Fetching code through GitHub (`cloudrun.git`)
+
+Every execution starts with an empty container, so by default it downloads the
+project's full history from the hub as a git bundle. When the hub sits behind a
+slow link, relay the code through a git host that is fast from Google Cloud
+instead. Opt in per project in the profile:
+
+```json
+"cloudrun": {
+  "base_image": "...",
+  "git": {
+    "url": "https://github.com/OWNER/REPO.git",
+    "push_url": "git@github.com:OWNER/REPO.git",
+    "branch": "main",
+    "token_secret": "calltable-git-myproject"
+  }
+}
+```
+
+* `url` enables the feature; the container and the image build fetch from it.
+* `push_url` (default `url`) is where the hub pushes, using the hub process's
+  own git credentials (ssh key or credential helper); git runs
+  non-interactively with a timeout.
+* `branch` (default `main`) is the branch baked into the image.
+* `token_secret` names a Secret Manager secret holding an HTTPS token with read
+  access. If the key is absent, the host-level default
+  `hosts.<name>.cloudrun.git_token_secret` is used (handy when several
+  projects share one token); an explicit `""` or `null` means no token (public
+  repository or ssh URL). Grant `roles/secretmanager.secretAccessor` on it to
+  the executor service account (run time; `ct cloudrun jobs` adds
+  `CALLTABLE_GIT_TOKEN` to `--set-secrets`) and to the Cloud Build service
+  account (image build).
+
+Flow:
+
+1. `ct cloudrun image` (Cloud Build builder only) generates a `cloudbuild.yaml`
+   whose first step clones a bare, single-branch mirror of `branch` into the
+   image at `/opt/calltable/mirrors/<project>.git`; the token is passed as an
+   HTTP header through environment config and is not left in the mirror. The
+   `docker` builder does not bake and says so. Rebuild the image now and then
+   so the baked history stays recent.
+2. Before launching an execution the hub pushes the job's commit (and its
+   baseline, when present) from its own mirror to the hidden refs
+   `refs/calltable/jobs/<job id>/head` and `.../base` and passes
+   `CALLTABLE_GIT_URL` and `CALLTABLE_GIT_REFS` to the execution. Snapshots,
+   **including uncommitted work**, therefore land in that repository as
+   temporary refs (not branches); they are deleted once the execution is
+   closed, and a failed deletion is retried on later reconcile passes.
+3. The container fetches those refs into the baked mirror (only the recent
+   delta travels) and skips the hub bundle when the commit arrived.
+
+Any failure (push, fetch, missing commit) falls back to hub bundles; it never
+fails the job.
 
 ### Reaching the hub: userspace Tailscale
 
