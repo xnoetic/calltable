@@ -21,8 +21,9 @@ Thanks for taking a look at calltable.
 ```bash
 git clone https://github.com/eanzhao-os/calltable.git
 cd calltable
-python -m unittest discover -s tests -t . -v     # full suite
+python -m unittest discover -s tests -t . -v     # full suite, this machine
 python -m calltable --version
+python bin/ci-local                              # full suite on devpc + yiqipc
 ```
 
 There is nothing to install: run the package from the checkout, or link the
@@ -46,8 +47,10 @@ against a real deployment from a test.
 2. Add or update tests for every behaviour change.
 3. Update `README.md` when user-facing commands, config keys or profile fields
    change.
-4. Make sure the suite is green on your platform; CI runs Linux, Windows and
-   macOS.
+4. Make sure the suite is green on your platform. There is no GitHub Actions
+   workflow in this repository: run `python bin/ci-local` to execute the suite
+   through calltable on the real executors, `devpc` (Linux) and `yiqipc`
+   (Windows); it exits non-zero unless both pass.
 
 ## Code layout
 

@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+"""Run the test suite through calltable on the real executors.
+
+This repository does not use GitHub Actions.  A green run means the suite
+passed where it actually has to pass: on the machines registered as calltable
+executors.  By default that is ``devpc`` (Linux) and ``yiqipc`` (Windows).
+
+Each host runs, inside the job checkout::
+
+    <python> --version
+    <python> -m unittest discover -s tests -t . -v
+    <python> -m calltable --version
+
+Usage::
+
+    python bin/ci-local                       # devpc + yiqipc
+    python bin/ci-local --hosts devpc         # only one host
+    python bin/ci-local --hosts "devpc=python3,yiqipc=python"
+
+Every host gets its own job; the submissions run in parallel.  The complete
+log of each job is written under ``.ci-local/<stamp>-<sha>/<host>.log`` and the
+summary at the end lists the host, job id, number of tests, result, elapsed
+time and log path.  The exit code is 0 only when every host passed.
+
+Test fixtures start real git repositories, so the executors need a git identity
+and ``init.defaultBranch=main`` (both hosts already have it).  The job runs in
+the ``heavy`` slot with the profile locks dropped and a 30 minute timeout; use
+``--slot``, ``--timeout`` and ``--project`` to change that.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: host=python pairs; the python command is the one used ON that executor.
+DEFAULT_HOSTS = "devpc=python3,yiqipc=python"
+#: python command used when a host is named without ``=...``.
+DEFAULT_PYTHON = {"devpc": "python3", "yiqipc": "python"}
+UNKNOWN_HOST_PYTHON = "python3"
+
+DEFAULT_PROJECT = "calltable"
+DEFAULT_SLOT = "heavy"
+DEFAULT_TIMEOUT = "30m"
+
+#: `ct run --wait` gives up 120 s after the job timeout; kill the child later.
+LOCAL_GRACE_SECONDS = 300
+
+#: Printed by the remote command after every step succeeded, so a log that
+#: stops early can never be mistaken for a pass.
+OK_MARKER = "calltable-local-ci: ok"
+
+_DURATION_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$", re.IGNORECASE)
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600}
+TEST_COUNT_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
+#: `ct run` prints "queued <job-id>" once; progress lines ("queued 2m41s,
+#: 3 ahead") never match because of the trailing spaces.
+JOB_ID_RE = re.compile(r"^(?:already )?queued (\S+)$", re.MULTILINE)
+
+_PRINT_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class Host:
+    """One executor and the python command to use on it."""
+
+    name: str
+    python: str
+
+
+@dataclass
+class HostResult:
+    host: str
+    log_path: Path
+    command: list[str] = field(default_factory=list)
+    job_id: str = "-"
+    tests: int | None = None
+    ok: bool = False
+    note: str = ""
+    exit_code: int | None = None
+    elapsed: float = 0.0
+
+
+# --------------------------------------------------------------- 参数与命令
+def parse_duration(text: str) -> int:
+    """``30m`` / ``1h`` / ``90s`` / ``3600`` -> seconds."""
+    match = _DURATION_RE.match(text or "")
+    if not match:
+        raise ValueError(f"invalid duration {text!r} (use e.g. 90s, 30m, 1h)")
+    return int(float(match.group(1)) * _DURATION_UNITS[match.group(2).lower()])
+
+
+def default_python(host: str) -> str:
+    return DEFAULT_PYTHON.get(host, UNKNOWN_HOST_PYTHON)
+
+
+def parse_hosts(spec: str) -> list[Host]:
+    """Parse ``host[,host=python...]`` into hosts, rejecting duplicates."""
+    hosts: list[Host] = []
+    seen: set[str] = set()
+    for raw in (spec or "").split(","):
+        item = raw.strip()
+        if not item:
+            continue
+        name, sep, python = item.partition("=")
+        name = name.strip()
+        python = python.strip() if sep else default_python(name)
+        if not name:
+            raise ValueError(f"invalid host entry {item!r}: empty host name")
+        if not python:
+            raise ValueError(f"invalid host entry {item!r}: empty python command")
+        if any(ch.isspace() for ch in name):
+            raise ValueError(f"invalid host name {name!r}")
+        if name in seen:
+            raise ValueError(f"duplicate host {name!r}")
+        seen.add(name)
+        hosts.append(Host(name=name, python=python))
+    if not hosts:
+        raise ValueError("no hosts given")
+    return hosts
+
+
+def remote_script(python: str) -> str:
+    """The bash script each executor runs (no single quotes, no ``$`` tricks)."""
+    quoted = shlex.quote(python)
+    return "\n".join([
+        "set -e",
+        f"PY={quoted}",
+        'echo "== python =="',
+        '"$PY" --version',
+        'echo "== unittest =="',
+        '"$PY" -m unittest discover -s tests -t . -v',
+        'echo "== calltable --version =="',
+        '"$PY" -m calltable --version',
+        f'echo "{OK_MARKER}"',
+    ])
+
+
+def ct_command(host: Host, *, project: str, slot: str, timeout: str,
+               label: str, python_executable: str | None = None) -> list[str]:
+    """The local ``ct run`` invocation for one host."""
+    executable = python_executable or sys.executable
+    return [
+        executable, "-m", "calltable", "cli", "run",
+        "--project", project,
+        "--host", host.name,
+        "--slot", slot,
+        "--no-lock",
+        "--yes",
+        "--wait",
+        "--timeout", timeout,
+        "--label", label,
+        "--", "bash", "-c", remote_script(host.python),
+    ]
+
+
+# ------------------------------------------------------------------ git 信息
+def _git(root: Path, *args: str) -> str:
+    proc = subprocess.run(["git", "--no-optional-locks", *args],
+                          cwd=str(root), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    if proc.returncode != 0:
+        raise OSError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
+    return proc.stdout
+
+
+def repository_state(root: Path = REPO_ROOT) -> tuple[str, bool]:
+    """(short HEAD sha, worktree dirty) — what the job label advertises."""
+    sha = _git(root, "rev-parse", "--short", "HEAD").strip()
+    dirty = bool(_git(root, "status", "--porcelain").strip())
+    return sha, dirty
+
+
+def build_label(sha: str, dirty: bool, host: str) -> str:
+    return f"ci-local {sha}{'+dirty' if dirty else ''} {host}"
+
+
+# --------------------------------------------------------------- 日志与结果
+def parse_job_id(log_text: str) -> str | None:
+    match = JOB_ID_RE.search(log_text)
+    return match.group(1) if match else None
+
+
+def parse_test_count(log_text: str) -> int | None:
+    matches = TEST_COUNT_RE.findall(log_text)
+    return int(matches[-1]) if matches else None
+
+
+def evaluate(log_text: str, exit_code: int) -> tuple[bool, int | None, str]:
+    """(ok, tests, note) for one finished job."""
+    tests = parse_test_count(log_text)
+    if exit_code == 75:  # calltable: local wait timed out, job may still run
+        return False, tests, "local wait timed out; the job may still be running"
+    if exit_code == 124:
+        return False, tests, "job hit its timeout"
+    if exit_code == 130:
+        return False, tests, "job was cancelled"
+    if exit_code != 0:
+        return False, tests, f"command exited {exit_code}"
+    if OK_MARKER not in log_text:
+        return False, tests, "completion marker missing (output truncated?)"
+    if tests is None:
+        return False, None, 'no "Ran N tests" line in the log'
+    if tests == 0:
+        return False, 0, "no tests ran"
+    return True, tests, ""
+
+
+def format_elapsed(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def display_path(path: Path, root: Path = REPO_ROOT) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def format_summary(results: list[HostResult],
+                   root: Path = REPO_ROOT) -> str:
+    headers = ("host", "job id", "tests", "result", "time", "log")
+    rows = [
+        (
+            result.host,
+            result.job_id,
+            "-" if result.tests is None else str(result.tests),
+            "ok" if result.ok else "FAIL",
+            format_elapsed(result.elapsed),
+            display_path(result.log_path, root),
+        )
+        for result in results
+    ]
+    widths = [max([len(head)] + [len(row[i]) for row in rows])
+              for i, head in enumerate(headers)]
+
+    def table_line(cells: tuple[str, ...]) -> str:
+        return "  ".join(
+            f"{cell:>{widths[i]}}" if i == 2 else f"{cell:<{widths[i]}}"
+            for i, cell in enumerate(cells)
+        ).rstrip()
+
+    lines = [table_line(headers),
+             table_line(tuple("-" * width for width in widths))]
+    lines.extend(table_line(row) for row in rows)
+
+    failed = [result for result in results if not result.ok]
+    if failed:
+        lines.append("")
+        for result in failed:
+            lines.append(f"{result.host}: {result.note}")
+    lines.append("")
+    if failed:
+        lines.append("FAILED: " + ", ".join(result.host for result in failed))
+    else:
+        lines.append("all hosts passed")
+    return "\n".join(lines)
+
+
+# -------------------------------------------------------------------- 执行
+def ct_environment() -> dict[str, str]:
+    """Environment for the local ``ct`` process (same import path as bin/ct)."""
+    env = os.environ.copy()
+    root = str(REPO_ROOT)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = root + (os.pathsep + existing if existing else "")
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _pump(stream, log, result: HostResult, announce) -> None:
+    """Copy the job output into the log file and report the job id once."""
+    try:
+        for line in stream:
+            log.write(line)
+            log.flush()
+            if result.job_id == "-":
+                match = JOB_ID_RE.match(line)
+                if match:
+                    result.job_id = match.group(1)
+                    if announce is not None:
+                        announce(result.host, f"queued {result.job_id}")
+            elif announce is not None and line.startswith("queued ") \
+                    and " ahead" in line:
+                # ct 只在排队进度变化时打这一行；转出去，等队列时能看见。
+                announce(result.host, line.strip())
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def run_one(host: Host, *, run_dir: Path, project: str, slot: str,
+            timeout: str, label: str, deadline_seconds: int,
+            announce=None) -> HostResult:
+    """Submit one job, stream it into ``run_dir/<host>.log``, evaluate it."""
+    command = ct_command(host, project=project, slot=slot, timeout=timeout,
+                         label=label)
+    log_path = run_dir / f"{host.name}.log"
+    result = HostResult(host=host.name, log_path=log_path, command=command)
+    started = time.monotonic()
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        log.write("$ " + shlex.join(command) + "\n\n")
+        log.flush()
+        proc = subprocess.Popen(
+            command, cwd=str(REPO_ROOT), env=ct_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", bufsize=1)
+        pump = threading.Thread(target=_pump, args=(proc.stdout, log, result,
+                                                    announce),
+                                name=f"pump-{host.name}", daemon=True)
+        pump.start()
+        timed_out = False
+        try:
+            exit_code = proc.wait(timeout=deadline_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            proc.kill()
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                pass
+            exit_code = None
+        pump.join(timeout=30)
+        if pump.is_alive() and proc.stdout is not None:
+            try:
+                proc.stdout.close()
+            except OSError:
+                pass
+            pump.join(timeout=5)
+    result.elapsed = time.monotonic() - started
+
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    if timed_out:
+        result.tests = parse_test_count(log_text)
+        result.note = (f"timed out locally after "
+                       f"{format_elapsed(deadline_seconds)}")
+        result.ok = False
+        return result
+    result.exit_code = exit_code
+    result.ok, result.tests, result.note = evaluate(log_text, exit_code)
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="ci-local",
+        description="Run the test suite through calltable on the real "
+                    "executors (devpc and yiqipc by default). "
+                    "GitHub Actions is not used.")
+    parser.add_argument(
+        "--hosts", default=DEFAULT_HOSTS, metavar="HOST[,HOST=PYTHON]",
+        help=f"target hosts; HOST uses the default python command, "
+             f"HOST=PYTHON overrides it (default: {DEFAULT_HOSTS})")
+    parser.add_argument("--project", default=DEFAULT_PROJECT,
+                        help=f"calltable project (default: {DEFAULT_PROJECT})")
+    parser.add_argument("--slot", default=DEFAULT_SLOT,
+                        help=f"hub slot (default: {DEFAULT_SLOT})")
+    parser.add_argument("--timeout", default=DEFAULT_TIMEOUT,
+                        help="job timeout passed to ct run "
+                             f"(default: {DEFAULT_TIMEOUT})")
+    parser.add_argument("--log-dir", default=str(REPO_ROOT / ".ci-local"),
+                        help="where per-host logs are written "
+                             "(default: .ci-local/)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print every host's command and exit")
+    return parser
+
+
+def _indent(text: str, prefix: str) -> str:
+    return "\n".join(prefix + line for line in text.splitlines())
+
+
+def main(argv: list[str] | None = None) -> int:
+    try:
+        # 管道/重定向时也别把开头那段说明攒到最后才吐出来。
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):
+        pass
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        hosts = parse_hosts(args.hosts)
+        job_timeout = parse_duration(args.timeout)
+    except ValueError as exc:
+        parser.error(str(exc))
+        raise AssertionError("unreachable")
+
+    try:
+        sha, dirty = repository_state(REPO_ROOT)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"error: cannot read git state in {REPO_ROOT}: {exc}",
+              file=sys.stderr)
+        return 2
+
+    if args.dry_run:
+        for host in hosts:
+            label = build_label(sha, dirty, host.name)
+            command = ct_command(host, project=args.project, slot=args.slot,
+                                 timeout=args.timeout, label=label)
+            print(f"[{host.name}] python={host.python} label={label!r}")
+            print(_indent(shlex.join(command[:-1]) + " '<script below>'", "  "))
+            print(_indent(remote_script(host.python), "  | "))
+            print()
+        return 0
+
+    run_dir = (Path(args.log_dir).expanduser()
+               / f"{datetime.now():%Y%m%d-%H%M%S}-{sha}")
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"error: cannot create {run_dir}: {exc}", file=sys.stderr)
+        return 2
+
+    base_label = f"ci-local {sha}{'+dirty' if dirty else ''}"
+    print(f"calltable local CI: {len(hosts)} host(s), label {base_label!r}")
+    for host in hosts:
+        print(f"  {host.name}: python={host.python}")
+    print(f"logs: {display_path(run_dir)}")
+    print()
+
+    deadline = job_timeout + LOCAL_GRACE_SECONDS
+
+    def announce(host_name: str, message: str) -> None:
+        with _PRINT_LOCK:
+            print(f"[{host_name}] {message}", flush=True)
+
+    results: list[HostResult | None] = [None] * len(hosts)
+
+    def worker(index: int, host: Host) -> None:
+        try:
+            results[index] = run_one(
+                host, run_dir=run_dir, project=args.project, slot=args.slot,
+                timeout=args.timeout,
+                label=build_label(sha, dirty, host.name),
+                deadline_seconds=deadline, announce=announce)
+        except Exception as exc:  # never lose a host from the summary
+            results[index] = HostResult(
+                host=host.name, log_path=run_dir / f"{host.name}.log",
+                note=f"runner failed: {exc}")
+
+    threads = [threading.Thread(target=worker, args=(index, host),
+                                name=f"ci-{host.name}")
+               for index, host in enumerate(hosts)]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    except KeyboardInterrupt:
+        print("\ninterrupted; submitted jobs keep running on the hub "
+              "(see `ct ls --queued`)", file=sys.stderr)
+        return 130
+
+    final: list[HostResult] = []
+    for index, host in enumerate(hosts):
+        result = results[index]
+        if result is None:
+            result = HostResult(host=host.name,
+                                log_path=run_dir / f"{host.name}.log",
+                                note="no result recorded")
+        final.append(result)
+
+    with _PRINT_LOCK:
+        print()
+        print(format_summary(final))
+    return 0 if all(result.ok for result in final) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

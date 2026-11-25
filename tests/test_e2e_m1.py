@@ -441,10 +441,22 @@ class EndToEndM1Tests(unittest.TestCase):
         for index in range(3):
             result = self._submit("--wait", label=f"history-{index}")
             self.assertEqual(result.returncode, 0, result.stderr)
+        # testhost 只有 2 个 light 槽：先全部占住，探针才会稳定留在队列里。
+        # 否则执行器可能在取号回执和详情请求之间就把它认领掉，而 queue 段
+        # 只对 queued 任务填充——Windows 执行机上偶发 KeyError 就是这个竞态。
+        for index in range(2):
+            result = self._submit(
+                "--detach", label=f"eta-blocker-{index}",
+                command=[sys.executable.replace("\\", "/"), "-c",
+                         "import time; time.sleep(8)"])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self._wait_status(job_id_from(result.stdout), ("running",),
+                              timeout=30)
         receipt = self._submit("--detach", label="eta-probe")
         self.assertEqual(receipt.returncode, 0, receipt.stderr)
         job_id = job_id_from(receipt.stdout)
         job = self._api(f"/api/jobs/{job_id}")
+        self.assertEqual(job["status"], "queued", job)
         self.assertIsNotNone(job["queue"]["runtime_seconds"],
                              f"queue={job['queue']}")
         self.assertGreaterEqual(job["queue"]["runtime_samples"], 3)

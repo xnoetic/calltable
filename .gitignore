@@ -24,6 +24,7 @@ pending/
 
 # Local scratch
 .smoke/
+.ci-local/
 *.log
 .DS_Store
 Thumbs.db

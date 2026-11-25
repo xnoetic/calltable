@@ -296,7 +296,8 @@ header. See `SECURITY.md`.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -t . -v
+python -m unittest discover -s tests -t . -v     # this machine
+python bin/ci-local                              # the real executors
 ```
 
 The suite covers scheduling and locks, heartbeat reconciliation, git snapshots
@@ -305,8 +306,20 @@ termination and sampling, the hub HTTP API, the executor, the CLI/doctor/setup,
 end-to-end runs and crash recovery. 0.3 adds coverage for queue position and
 ETA, long polling, the SSE event log and its resume path, webhook signing,
 retries and persistence, idempotency, queue-hold reaping, schema migration from
-a 0.2 database, and 0.2-compatibility fallbacks. CI runs it on Ubuntu, Windows
-and macOS (Python 3.12 and 3.13).
+a 0.2 database, and 0.2-compatibility fallbacks.
+
+This repository does not use GitHub Actions. The full suite is verified through
+calltable itself: `python bin/ci-local` snapshots the worktree and submits the
+same checks CI would run — `python --version`, `unittest discover -s tests -t .`
+and `python -m calltable --version` — to `devpc` (Linux, Python 3.12) and
+`yiqipc` (Windows, Python 3.13) in parallel. Each job's log is written under
+`.ci-local/`, the summary prints the host, job id, number of tests, result,
+elapsed time and log path, and the command exits non-zero unless every host
+passed. `--hosts devpc=python3,yiqipc=python` overrides the targets and the
+python command used on each, `--slot` / `--timeout` change the hub slot and the
+job budget, and `--dry-run` prints the commands without submitting anything.
+Test fixtures start real git repositories, so an executor needs a git identity
+and `init.defaultBranch=main`; both default hosts already have them.
 
 ## License
 
