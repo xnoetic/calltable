@@ -44,7 +44,7 @@
         "region": "us-central1",
         "service_account": "calltable-exec@my-gcp-project.iam.gserviceaccount.com",
         "hub_url": "http://100.64.0.10:8091",
-        "monthly_budget_usd": 60,
+        "monthly_budget_usd": 120,
         "on_budget_exceeded": "queue",
         "max_task_timeout": "3h",
         "resources": {
