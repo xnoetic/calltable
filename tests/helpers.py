@@ -2,15 +2,37 @@
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
 from calltable.config import Config
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+#: 命令前缀：在非特权 user + PID namespace 里跑，后面的命令就是 PID 1，而且
+#: 没有 init（和 Cloud Run 容器一样）。``--mount-proc`` 让 /proc 与新 namespace
+#: 对得上。
+UNSHARE_PID1 = ["unshare", "--user", "--map-root-user", "--pid", "--fork",
+                "--mount-proc"]
+
+
+@functools.lru_cache(maxsize=None)
+def can_unshare_pid1() -> bool:
+    """这台主机允许非特权 user + PID namespace 吗（容器里通常不允许）。"""
+    if not sys.platform.startswith("linux") or not shutil.which("unshare"):
+        return False
+    try:
+        probe = subprocess.run([*UNSHARE_PID1, "true"], capture_output=True,
+                               timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
 
 
 def bash_path() -> str:

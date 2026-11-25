@@ -31,7 +31,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from . import __version__, disk, gitops, proc
+from . import __version__, disk, gitops, proc, proc_init
 from .client import HubClient, HubError
 from .config import Config
 from .util import now, parse_size, valid_project_name
@@ -1030,6 +1030,10 @@ class LogPump:
 
 def serve(config: Config, *, once: bool = False,
           job_id: str | None = None) -> int:
+    # 容器里没有 init 时执行器就是 PID 1（Cloud Run 镜像）：先拆出一个只管
+    # 回收孤儿进程的 init，否则任务留下的后台进程会变成僵尸越积越多。
+    # 必须在起任何线程之前做；不是 PID 1 时什么都不发生。
+    proc_init.split_if_pid1()
     executor = Executor(config, once=once, job_id=job_id)
     try:
         executor.run()

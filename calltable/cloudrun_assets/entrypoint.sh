@@ -65,5 +65,8 @@ cat >"$STATE/config.json" <<JSON
 JSON
 [ -x /bin/bash ] || sed -i 's#"/bin/bash"#"/bin/sh"#' "$STATE/config.json"
 
+# The executor becomes PID 1 here. It notices that and forks a minimal init
+# (calltable/proc_init.py) that reaps the processes a job orphans, so the image
+# needs no tini / --init.
 exec python3 -m calltable exec --config "$STATE/config.json" \
   --once --job-id "$CALLTABLE_JOB_ID"

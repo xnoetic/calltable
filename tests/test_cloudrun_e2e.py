@@ -18,6 +18,7 @@ import time
 import unittest
 from pathlib import Path
 
+from tests.helpers import UNSHARE_PID1, can_unshare_pid1
 from tests.test_e2e import free_port, git, job_id_from, tail
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -57,8 +58,12 @@ if args[:3] == ["run", "jobs", "execute"]:
     count = len(list(state.glob("*.pid"))) + 1
     name = f"{job}-fake{count}"
     log = open(state / f"{name}.log", "w")
-    proc = subprocess.Popen(["sh", os.environ["FAKE_ENTRYPOINT"]], env=env,
-                            stdout=log, stderr=subprocess.STDOUT,
+    # Optional command prefix (e.g. `unshare ...` to make the entrypoint PID 1).
+    prefix = []
+    if (state / "launch-prefix.json").exists():
+        prefix = json.loads((state / "launch-prefix.json").read_text())
+    proc = subprocess.Popen([*prefix, "sh", os.environ["FAKE_ENTRYPOINT"]],
+                            env=env, stdout=log, stderr=subprocess.STDOUT,
                             start_new_session=True)
     (state / f"{name}.pid").write_text(str(proc.pid))
     print(json.dumps({"metadata": {"name": name}}))
@@ -81,6 +86,23 @@ if args[:4] == ["run", "jobs", "executions", "cancel"]:
     sys.exit(0)
 print("unsupported fake gcloud call: " + " ".join(args), file=sys.stderr)
 sys.exit(2)
+'''
+
+#: 任务脚本：造一个孤儿（子 shell 立刻退出，sleep 被过继给 PID 1），杀掉它，
+#: 再看 PID 1 有没有回收它。僵尸在 /proc 里还占着条目，回收后条目消失。
+ORPHAN_JOB = r'''
+( sleep 300 >/dev/null 2>&1 & echo $! > orphan.pid )
+pid=$(cat orphan.pid)
+read -r _ _ _ ppid _ < /proc/$pid/stat
+echo "pid 1 is: $(tr '\0' ' ' < /proc/1/cmdline)"
+echo "orphan adopted by pid $ppid"
+kill -9 "$pid"
+for _ in $(seq 100); do
+  if [ ! -e /proc/$pid ]; then echo "orphan reaped"; exit 0; fi
+  sleep 0.1
+done
+echo "orphan $pid was never reaped: $(cat /proc/$pid/stat)"
+exit 9
 '''
 
 
@@ -246,6 +268,38 @@ class CloudRunEndToEndTests(unittest.TestCase):
         self.assertEqual(summary["active_executions"], 0, self._diagnostics())
         self.assertGreater(summary["month_spend_usd"], 0)
         self.assertFalse(summary["over_budget"])
+
+    def test_orphans_are_reaped_when_the_executor_is_pid1(self):
+        """容器里没有 init，执行器就是 PID 1：任务留下的孤儿必须有人回收。
+
+        用非特权 user + PID namespace 让 entrypoint 真的以 PID 1 起来。回归：
+        执行器从不 wait 过继来的子进程，它们退出后一直是僵尸，攒到 execution
+        结束（calltable 自己的测试套件跑一遍就留下一百多个）。
+        """
+        if not can_unshare_pid1():
+            self.skipTest("unprivileged user + PID namespaces are not "
+                          "available on this host")
+        self.state.mkdir(parents=True, exist_ok=True)
+        prefix = self.state / "launch-prefix.json"
+        prefix.write_text(json.dumps(UNSHARE_PID1), encoding="utf-8")
+        self.addCleanup(prefix.unlink, missing_ok=True)
+
+        cli = subprocess.run(
+            [sys.executable, "-m", "calltable", "cli", "run",
+             "--config", str(self.config_path), "--host", "cloudrun",
+             "--project", "demo", "--repo", str(self.repo), "--wait",
+             "--timeout", "3m", "--", "bash", "-c", ORPHAN_JOB],
+            cwd=str(REPO_ROOT), env=self.env, capture_output=True, text=True,
+            timeout=240)
+        detail = cli.stdout + cli.stderr + self._diagnostics()
+        # 场景确实成立：PID 1 是 calltable 执行器的进程映像，孤儿过继给了它。
+        self.assertRegex(cli.stdout, r"pid 1 is: .*-m calltable exec ", detail)
+        self.assertIn("orphan adopted by pid 1", cli.stdout, detail)
+        self.assertIn("orphan reaped", cli.stdout, detail)
+        self.assertEqual(cli.returncode, 0, detail)
+        job = self._api(f"/api/jobs/{job_id_from(cli.stdout)}")
+        self.assertEqual(job["status"], "succeeded", detail)
+        self._wait_executions_gone()
 
     def _run_readme_job(self):
         return subprocess.run(
