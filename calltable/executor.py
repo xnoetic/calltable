@@ -525,6 +525,10 @@ class Executor:
                 try:
                     gitops.ingest_bundle(mirror, bundle)
                 except gitops.GitError:
+                    # 增量包的前置提交不在本机镜像里（新执行器、Cloud Run 的全新
+                    # 容器）：改取整包。先删掉增量包——download 见到同名文件会带
+                    # Range 续传，把整包的后半段追加到增量包后面，文件头仍是增量包。
+                    bundle.unlink(missing_ok=True)
                     self.client.download(job["bundle_url"] + "?full=1", bundle)
                     gitops.ingest_bundle(mirror, bundle)
                 bundle.unlink(missing_ok=True)

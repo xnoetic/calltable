@@ -243,6 +243,48 @@ class CloudRunEndToEndTests(unittest.TestCase):
         self.assertGreater(summary["month_spend_usd"], 0)
         self.assertFalse(summary["over_budget"])
 
+    def _run_readme_job(self):
+        return subprocess.run(
+            [sys.executable, "-m", "calltable", "cli", "run",
+             "--config", str(self.config_path), "--host", "cloudrun",
+             "--project", "demo", "--repo", str(self.repo), "--wait",
+             "--timeout", "3m", "--",
+             sys.executable, "-c", "print(open('README.md').read().strip())"],
+            cwd=str(REPO_ROOT), env=self.env, capture_output=True, text=True,
+            timeout=240)
+
+    def _wait_executions_gone(self):
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if self._api("/api/cloudrun")["hosts"]["cloudrun"]["active_executions"] == 0:
+                return
+            time.sleep(0.5)
+        self.fail("executions still active\n" + self._diagnostics())
+
+    def test_second_job_in_a_fresh_container_gets_the_full_bundle(self):
+        """每次 execution 都是全新容器：镜像是空的。
+
+        hub 已有项目历史后，客户端只上传增量 bundle；空镜像吃不下它，执行器
+        必须改取整包。回归：整包曾被当成「续传」追加到增量包后面，任务报
+        ``Repository lacks these prerequisite commits``。
+        """
+        first = self._run_readme_job()
+        self.assertEqual(first.returncode, 0,
+                         first.stdout + first.stderr + self._diagnostics())
+        self._wait_executions_gone()
+
+        (self.repo / "README.md").write_text("demo second\n", encoding="utf-8")
+        git(self.repo, "commit", "-qam", "second")
+        # 真实的 Cloud Run 容器不保留上一次的镜像与 runs。
+        shutil.rmtree(Path(self.env["CALLTABLE_WORK_DIR"]), ignore_errors=True)
+
+        second = self._run_readme_job()
+        self.assertEqual(second.returncode, 0,
+                         second.stdout + second.stderr + self._diagnostics())
+        self.assertIn("demo second", second.stdout)
+        job = self._api(f"/api/jobs/{job_id_from(second.stdout)}")
+        self.assertEqual(job["status"], "succeeded", self._diagnostics())
+
 
 if __name__ == "__main__":
     unittest.main()
