@@ -251,7 +251,15 @@ class IdempotencyConflict(ValueError):
 
 
 class Store:
-    """每个进程一个连接；hub 是 ThreadingHTTPServer，用一个锁串行化写事务。"""
+    """每个进程一个连接；hub 是 ThreadingHTTPServer，用一个锁串行化对连接的访问。
+
+    约定：``self.conn`` 上的每条语句（读、写、PRAGMA 都算）都要在 ``self.lock``
+    里执行，并且在放锁前把结果取完（``fetchone`` / ``fetchall``）。连接是整个
+    进程共用的，事务状态、「进行中的语句」和错误信息都挂在连接上：一个线程没走完
+    的写语句会让另一个线程的 COMMIT 报 ``cannot commit transaction - SQL
+    statements in progress``，报错文本也可能被别的线程覆盖。名字以 ``_locked``
+    结尾的方法由调用方持锁。
+    """
 
     def __init__(self, db_path: str | Path, log_cap: int = DEFAULT_LOG_CAP,
                  estimate_window: int = ESTIMATE_WINDOW,
@@ -1408,10 +1416,20 @@ class Store:
         return files
 
     def checkpoint(self) -> None:
-        try:
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
+        """把 WAL 合并回主库并截断（janitor 每轮调用一次）；失败不算错，下一轮再来。
+
+        必须持锁，并且在锁里把结果行取完。``PRAGMA wal_checkpoint`` 是一条会返回
+        一行结果的写语句：从它返回到游标被释放之间一直算「进行中」，这期间同一
+        连接上的 COMMIT 会报 ``cannot commit transaction - SQL statements in
+        progress``。以前这里不持锁，janitor 线程拿到结果后只要晚一点被调度（机器
+        负载高时），请求线程的事务就会撞上；反过来别的线程事务没结束时这条 PRAGMA
+        也只会报 ``database table is locked``，白跑一轮。
+        """
+        with self.lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            except sqlite3.Error:
+                pass
 
     def stats(self) -> dict:
         with self.lock:
