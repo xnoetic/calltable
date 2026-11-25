@@ -284,7 +284,7 @@ ct cloudrun status     # 本月至今的估算花费、预算、活跃的 execut
 流程：
 
 1. `ct cloudrun image`（仅 Cloud Build 构建器）生成 `cloudbuild.yaml`，第一步把 `branch` clone 成裸的单分支镜像，打进镜像的 `/opt/calltable/mirrors/<project>.git`；token 以 HTTP header 的形式经环境配置传入，不会留在镜像里。`docker` 构建器不预置，并会明确提示。隔一段时间重建一次镜像，预置的历史才不会太旧。
-2. 拉起 execution 之前，hub 把任务的提交（有基线时连同基线）从自己的镜像推到隐藏 ref `refs/calltable/jobs/<job id>/head` 和 `.../base`，并把 `CALLTABLE_GIT_URL`、`CALLTABLE_GIT_REFS` 传给 execution。所以快照（**包括未提交的改动**）会以临时 ref（不是分支）的形式进入那个仓库；execution 记录关闭后删除，删除失败会在之后的对账里重试。
+2. 拉起 execution 之前，hub 把任务的提交（有基线时连同基线）从自己的镜像推到隐藏 ref `refs/calltable/jobs/<job id>/head` 和 `.../base`，并把 `CALLTABLE_GIT_URL`、`CALLTABLE_GIT_REFS` 传给 execution。所以快照（**包括未提交的改动**）会以临时 ref（不是分支）的形式进入那个仓库；execution 记录关闭后删除，删除失败会在之后的对账里重试；超过 24 小时仍删不掉就放弃，把可能残留的 ref 打进日志并写进该 execution 记录的 note，留待人工清理。
 3. 容器把这些 ref 取进预置的镜像（只传最近的增量），提交到手就不再向 hub 要 bundle。
 
 任何一步失败（推送、取代码、缺提交）都会回退到 hub bundle，不会让任务失败。

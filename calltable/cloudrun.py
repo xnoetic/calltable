@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -220,6 +221,9 @@ GIT_DELETE_TIMEOUT = 60.0
 GIT_LS_REMOTE_TIMEOUT = 30.0
 #: 某个 push_url 删除失败后，至少隔这么久再碰这个远端（秒）。
 GIT_CLEANUP_RETRY = 60.0
+#: execution 记录关闭超过这么久（秒）还删不掉远端 ref，就放弃重试：在日志和
+#: 记录的 note 里留下可能残留的 ref，然后清掉 git_refs。
+GIT_CLEANUP_MAX_AGE = 24 * 3600.0
 #: 一轮对账最多处理多少条待删记录，避免清理长时间占住 provisioner 线程。
 GIT_CLEANUP_BATCH = 10
 #: 容器里预置镜像的目录（``ct cloudrun image`` 在 Cloud Build 里 clone 进去）。
@@ -286,10 +290,31 @@ class GitRelay:
                              "a valid Secret Manager secret name")
 
 
+#: ssh / scp 形式里允许的用户名：常规的短账号名（如 ``git``），不可能是 token。
+_SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
 def redact_url(url: str) -> str:
-    """报错里引用 URL 时打码凭据：http(s) 的整个 userinfo，其余形式的口令。"""
+    """报错里引用 URL 时打码凭据：http(s) 的整个 userinfo；其余形式的口令，
+    以及不像常规账号名的用户名（可能是贴进来的 token）。"""
     url = re.sub(r"^(https?://)[^/@]*@", r"\1***@", url, flags=re.IGNORECASE)
-    return re.sub(r"(^|://)([^/@:]*):[^/@]*@", r"\1\2:***@", url)
+
+    def mask(match: re.Match) -> str:
+        user, password = match.group(2), match.group(3)
+        if password is None and _SSH_USER_RE.fullmatch(user):
+            return match.group(0)
+        return match.group(1) + "***@"
+
+    return re.sub(r"(^|://)([^/@:]*)(:[^/@]*)?@", mask, url)
+
+
+def _check_ssh_user(user: str | None, name: str) -> None:
+    if user is not None and not _SSH_USER_RE.fullmatch(user):
+        # 不回显用户名：它可能就是一个 token。
+        raise ValueError(f"cloudrun.git.{name}: the user name in an ssh or scp-like "
+                         "address must be a short account name such as 'git' "
+                         "(lower-case letters, digits, '_' or '-', at most 32 "
+                         "characters); credentials do not belong in the URL")
 
 
 def url_kind(url: str, name: str = "url") -> str:
@@ -309,13 +334,16 @@ def url_kind(url: str, name: str = "url") -> str:
             raise ValueError(f"cloudrun.git.{name} {redact_url(url)!r} is not a "
                              "valid ssh URL "
                              "(a password in the URL is not allowed)")
+        _check_ssh_user(match.group(1), name)
         return "ssh"
     # Windows 盘符路径（C:/...）只在 Windows 上算本地路径；别处 git 把它当 scp 地址。
     if (_FILE_URL_RE.match(url) or url.startswith("/")
             or (os.name == "nt" and re.match(r"^[A-Za-z]:/", url))):
         return "local"
     if "://" not in url:
-        if _SCP_URL_RE.match(url):
+        match = _SCP_URL_RE.match(url)
+        if match:
+            _check_ssh_user(match.group(1), name)
             return "ssh"
         raise ValueError(f"cloudrun.git.{name} {redact_url(url)!r} is not a "
                          "valid scp-like "
@@ -370,6 +398,37 @@ def job_git_prefix(job_id: str) -> str:
     return f"refs/calltable/jobs/{job_id}"
 
 
+def run_bounded(argv: list[str], *, cwd: str | Path, env: dict[str, str],
+                timeout: float) -> subprocess.CompletedProcess:
+    """在独立会话里跑命令，超时则杀掉**整个进程组**再回收，然后重新抛出
+    ``subprocess.TimeoutExpired``。
+
+    git 会再拉起 ``git-remote-https`` / ``ssh`` 这样的子进程；只杀 git 本身的话，
+    它们可能在清理之后才把推送做完。Windows 上没有进程组，只杀直接子进程。
+    """
+    posix = os.name != "nt"
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", start_new_session=posix)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if posix:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        proc.kill()
+        proc.communicate()
+        raise
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
 def run_git(args: list[str], *, cwd: str | Path, timeout: float
             ) -> subprocess.CompletedProcess:
     """hub 侧跑 git：不交互、不分页、没有控制终端，超时有界。
@@ -381,11 +440,8 @@ def run_git(args: list[str], *, cwd: str | Path, timeout: float
     env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat",
                 "GCM_INTERACTIVE": "never"})
     try:
-        proc = subprocess.run(
-            ["git", "-c", "core.pager=cat", *args], cwd=str(cwd), env=env,
-            stdin=subprocess.DEVNULL, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
-            start_new_session=(os.name != "nt"))
+        proc = run_bounded(["git", "-c", "core.pager=cat", *args], cwd=cwd,
+                           env=env, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         raise CloudRunError(f"git {args[0]} timed out after {int(timeout)}s") from exc
     except OSError as exc:
@@ -448,13 +504,11 @@ def anonymous_ls_remote(url: str, timeout: float = VISIBILITY_TIMEOUT
             "GCM_INTERACTIVE": "never",
             "GIT_PAGER": "cat",
         })
-        return subprocess.run(
+        return run_bounded(
             ["git", "-c", "credential.helper=", "-c", "http.extraheader=",
              "-c", "core.askPass=false", "-c", "core.pager=cat",
              "ls-remote", url, "HEAD"],
-            cwd=home, env=env, stdin=subprocess.DEVNULL, capture_output=True,
-            text=True, encoding="utf-8", errors="replace", timeout=timeout,
-            start_new_session=(os.name != "nt"))
+            cwd=home, env=env, timeout=timeout)
 
 
 def repo_visibility(url: str) -> tuple[str, str]:
@@ -858,11 +912,30 @@ class Provisioner:
                 self._delete_remote_refs(project, push_url, refs)
             except Exception as exc:
                 self._git_retry_at[push_url] = now() + GIT_CLEANUP_RETRY
+                ended = float(row["ended"] or now())
+                if now() - ended >= GIT_CLEANUP_MAX_AGE:
+                    self._give_up_git_refs(row, push_url, refs, exc)
+                    continue
                 print(f"[cloudrun] {job_id}: deleting git refs on {push_url} "
                       f"failed (will retry): {_one_line(exc)}", flush=True)
                 continue
             self._git_retry_at.pop(push_url, None)
             self.store.cloud_update(job_id, git_refs="")
+
+    def _give_up_git_refs(self, row: dict, push_url: str, refs: list[str],
+                          exc: BaseException) -> None:
+        """删了一天都删不掉（远端没了、hub 没有凭据……）：不再重试，但把可能
+        残留的 ref 写进日志和 note，供人工处理。"""
+        job_id = row["job_id"]
+        listed = " ".join(refs)
+        print(f"[cloudrun] {job_id}: giving up deleting git refs on {push_url} "
+              f"after {int(GIT_CLEANUP_MAX_AGE // 3600)}h; these refs may still "
+              f"exist there and need manual removal: {listed} "
+              f"(last error: {_one_line(exc)[:200]})", flush=True)
+        note = f"git refs possibly left on {push_url}: {listed}"
+        if row.get("note"):
+            note = f"{note}; {row['note']}"
+        self.store.cloud_update(job_id, git_refs="", note=note[:1000])
 
     def _delete_remote_refs(self, project: str, push_url: str,
                             refs: list[str]) -> None:

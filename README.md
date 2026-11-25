@@ -406,7 +406,9 @@ Flow:
    `CALLTABLE_GIT_URL` and `CALLTABLE_GIT_REFS` to the execution. Snapshots,
    **including uncommitted work**, therefore land in that repository as
    temporary refs (not branches); they are deleted once the execution is
-   closed, and a failed deletion is retried on later reconcile passes.
+   closed, and a failed deletion is retried on later reconcile passes. After
+   24 hours the hub gives up, logs the refs that may remain and records them in
+   the execution row's note for manual removal.
 3. The container fetches those refs into the baked mirror (only the recent
    delta travels) and skips the hub bundle when the commit arrived.
 

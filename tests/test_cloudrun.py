@@ -1331,7 +1331,7 @@ class AnonymousLsRemoteTests(unittest.TestCase):
                     "CALLTABLE_GIT_TOKEN": "tok", "XDG_CONFIG_HOME": "/home/x/.config"}
         result = subprocess.CompletedProcess(["git"], 0, "", "")
         with mock.patch.dict(os.environ, polluted), \
-                mock.patch.object(cloudrun.subprocess, "run",
+                mock.patch.object(cloudrun, "run_bounded",
                                   return_value=result) as run:
             cloudrun.anonymous_ls_remote("https://git.example.invalid/o/r.git")
         argv = run.call_args.args[0]
@@ -1355,7 +1355,6 @@ class AnonymousLsRemoteTests(unittest.TestCase):
         # HOME 是临时空目录（不读 ~/.netrc / ~/.gitconfig），也不在仓库里跑。
         self.assertNotEqual(env["HOME"], os.path.expanduser("~"))
         self.assertEqual(kwargs["cwd"], env["HOME"])
-        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(kwargs["timeout"], cloudrun.VISIBILITY_TIMEOUT)
 
     def test_really_ignores_global_config(self):
@@ -1626,6 +1625,163 @@ class GitRelayCleanupSafetyTests(GitRelayBase):
             self.provisioner._cleanup_git_refs("cloudrun")
             self.assertEqual(delete.call_count, cloudrun.GIT_CLEANUP_BATCH * 2)
         self.assertEqual(len(self.store.cloud_git_pending("cloudrun")), 3)
+
+class GitRelayFollowUpTests(unittest.TestCase):
+    """复审跟进 2：ssh / scp 形式的用户名只能是常规短账号名。"""
+
+    TOKEN_USER = "ghp_AbCdEf0123456789abcdefABCDEF012345"
+
+    def relay(self, push_url):
+        return cloudrun.GitRelay.from_profile({"git": {
+            "url": "https://github.com/o/r.git", "push_url": push_url}})
+
+    def test_token_shaped_ssh_user_is_rejected(self):
+        for push_url in (f"{self.TOKEN_USER}@github.com:o/r.git",
+                         f"ssh://{self.TOKEN_USER}@github.com/o/r.git",
+                         "tok@github.com:o/r.git".replace("tok", "Tok"),
+                         "x" * 33 + "@github.com:o/r.git",
+                         "1git@github.com:o/r.git"):
+            with self.subTest(push_url=push_url):
+                with self.assertRaises(ValueError) as ctx:
+                    self.relay(push_url)
+                message = str(ctx.exception)
+                self.assertIn("short account name", message)
+                self.assertNotIn(push_url.split("@")[0].split("//")[-1], message)
+        self.assertNotIn(self.TOKEN_USER,
+                         cloudrun.redact_url(f"{self.TOKEN_USER}@github.com:o/r"))
+
+    def test_conventional_users_still_work(self):
+        for push_url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r.git",
+                         "deploy_bot-2@github.com:o/r.git", "github.com:o/r.git"):
+            with self.subTest(push_url=push_url):
+                self.assertEqual(self.relay(push_url).push_url, push_url)
+
+
+@unittest.skipIf(os.name == "nt", "process groups are POSIX only")
+class ProcessGroupTimeoutTests(unittest.TestCase):
+    """复审跟进 3：超时后整个进程组都被杀掉（git 拉起的传输子进程不会留下）。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.pidfile = self.root / "child.pid"
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        # 假 git：像 git-remote-https 一样拉起一个子进程，然后一起卡住。
+        # 超时给 5 秒：新写出的脚本第一次启动可能要一秒多（macOS 会先扫描）。
+        fake = bin_dir / "git"
+        fake.write_text("#!/bin/sh\n"
+                        f"sleep 300 &\necho $! > '{self.pidfile}'\nwait\n",
+                        encoding="utf-8")
+        fake.chmod(0o755)
+        self.path = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    def child_pid(self) -> int:
+        wait_until(lambda: self.pidfile.exists()
+                   and self.pidfile.read_text().strip(), timeout=10)
+        return int(self.pidfile.read_text().strip())
+
+    def assert_gone(self, pid: int) -> None:
+        def gone():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
+            try:  # Linux：已退出、等待被 init 回收的僵尸也算没了
+                with open(f"/proc/{pid}/stat") as handle:
+                    return handle.read().split()[2] == "Z"
+            except OSError:
+                return False
+        wait_until(gone, timeout=10)
+
+    def test_run_git_timeout_kills_the_transport_child(self):
+        started = time.time()
+        with mock.patch.dict(os.environ, {"PATH": self.path}):
+            with self.assertRaises(cloudrun.CloudRunError) as ctx:
+                cloudrun.run_git(["push", "x"], cwd=self.root, timeout=5)
+        self.assertIn("timed out", str(ctx.exception))
+        self.assertLess(time.time() - started, 20)
+        self.assert_gone(self.child_pid())
+
+    def test_visibility_timeout_kills_the_transport_child(self):
+        with mock.patch.dict(os.environ, {"PATH": self.path}), \
+                mock.patch.object(cloudrun, "VISIBILITY_TIMEOUT", 5):
+            verdict, detail = cloudrun.repo_visibility("https://git.example.invalid/r")
+        self.assertEqual(verdict, cloudrun.UNKNOWN)
+        self.assertIn("timed out", detail)
+        self.assert_gone(self.child_pid())
+
+    def test_stdin_is_the_null_device(self):
+        proc = cloudrun.run_bounded(["sh", "-c", "cat; echo done"], cwd=self.root,
+                                    env=dict(os.environ), timeout=10)
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, "done"))
+
+
+class GitRelayGiveUpTests(GitRelayBase):
+    """复审跟进 1：execution 记录关闭超过 24 小时仍删不掉，就放弃重试。"""
+
+    def pending_row(self, job_id, push_url, ended):
+        self.store.cloud_record_launch(job_id, "cloudrun", cloud_job="ct-demo-light",
+                                       vcpu=1, memory_gib=1, launched=ended - 60)
+        self.store.cloud_update(job_id, ended=ended, state="ended",
+                                note="succeeded=1",
+                                git_refs=json.dumps({
+                                    "project": "demo", "push_url": push_url,
+                                    "refs": [f"refs/calltable/jobs/{job_id}/head"]}))
+
+    def row(self, job_id):
+        return next(r for r in self.store.cloud_executions() if r["job_id"] == job_id)
+
+    def test_unreachable_remote_is_given_up_after_a_day(self):
+        ended = 1_000_000.0
+        dead_old = str(self.root / "gone-old.git")
+        dead_young = str(self.root / "gone-young.git")
+        self.pending_row("job-old", dead_old, ended)
+        self.pending_row("job-young", dead_young,
+                         ended + cloudrun.GIT_CLEANUP_MAX_AGE - 3600)
+        clock = [ended + cloudrun.GIT_CLEANUP_MAX_AGE + 1]
+        out = io.StringIO()
+        with mock.patch.object(cloudrun, "now", lambda: clock[0]), \
+                contextlib.redirect_stdout(out):
+            self.provisioner._cleanup_git_refs("cloudrun")
+        text = out.getvalue()
+        give_up = [line for line in text.splitlines() if "giving up" in line]
+        self.assertEqual(len(give_up), 1, text)
+        self.assertTrue(give_up[0].startswith("[cloudrun] job-old: "))
+        self.assertIn(dead_old, give_up[0])
+        self.assertIn("refs/calltable/jobs/job-old/head", give_up[0])
+        old = self.row("job-old")
+        self.assertEqual(old["git_refs"], "")
+        self.assertIn("refs/calltable/jobs/job-old/head", old["note"])
+        self.assertIn(dead_old, old["note"])
+        self.assertIn("succeeded=1", old["note"])
+        # 还没满 24 小时的照旧重试
+        young = self.row("job-young")
+        self.assertNotEqual(young["git_refs"], "")
+        self.assertIn("job-young: deleting git refs", text)
+        self.assertIn("will retry", text)
+        self.assertEqual({r["job_id"] for r in self.store.cloud_git_pending("cloudrun")},
+                         {"job-young"})
+        # 放弃之后不再碰它
+        clock[0] += cloudrun.GIT_CLEANUP_RETRY + 1
+        with mock.patch.object(cloudrun, "now", lambda: clock[0]), \
+                mock.patch.object(self.provisioner, "_delete_remote_refs",
+                                  side_effect=cloudrun.CloudRunError("down")) as delete, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner._cleanup_git_refs("cloudrun")
+        self.assertEqual([c.args[1] for c in delete.call_args_list], [dead_young])
+
+    def test_reachable_old_row_is_still_deleted_normally(self):
+        ended = 1_000_000.0
+        self.pending_row("job-ok", str(self.remote), ended)
+        with mock.patch.object(cloudrun, "now",
+                               lambda: ended + cloudrun.GIT_CLEANUP_MAX_AGE * 3), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.provisioner._cleanup_git_refs("cloudrun")
+        self.assertEqual(self.row("job-ok")["git_refs"], "")
+        self.assertNotIn("giving up", out.getvalue())
+        self.assertEqual(self.row("job-ok")["note"], "succeeded=1")
 
 class GitRelayOffTests(GitRelayBase):
     def profile_git(self):
