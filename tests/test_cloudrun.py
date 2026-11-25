@@ -10,6 +10,7 @@ import http.server
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -22,7 +23,7 @@ from calltable.cloudrun import CloudRunSettings, Provisioner
 from calltable.db import PENDING_WORKER_PREFIX
 from calltable.hub import Hub
 from calltable.util import now
-from tests.helpers import make_config
+from tests.helpers import make_config, wait_until
 
 CLOUDRUN = {
     "project": "demo-project",
@@ -75,8 +76,35 @@ class FakeAPI(cloudrun.CloudRunAPI):
             "failedCount": 1 if failed else 0}}
 
 
+class BlockingAPI(FakeAPI):
+    """describe 卡住不返回，直到测试放行：模拟变慢 / 挂死的 gcloud。"""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.active = 0
+        self.max_active = 0
+        self.describes = 0
+        self._guard = threading.Lock()
+
+    def describe_execution(self, settings, execution):
+        with self._guard:
+            self.active += 1
+            self.describes += 1
+            self.max_active = max(self.max_active, self.active)
+        self.entered.set()
+        try:
+            self.release.wait(60)
+            return super().describe_execution(settings, execution)
+        finally:
+            with self._guard:
+                self.active -= 1
+
+
 class Base(unittest.TestCase):
     hosts_overrides: dict = {}
+    api_class = FakeAPI
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -89,7 +117,7 @@ class Base(unittest.TestCase):
                          "env": {"DOTNET_NOLOGO": "1"}},
             "rules": [{"match": "gate", "slot": "heavy", "timeout": "2h"}],
         }), encoding="utf-8")
-        self.api = FakeAPI()
+        self.api = self.api_class()
         self.hub = Hub(self.config, cloudrun_api=self.api)
         self.store = self.hub.store
         self.provisioner = self.hub.cloudrun
@@ -181,6 +209,20 @@ class ProvisionTests(Base):
         rows = self.store.cloud_executions(active_only=True)
         self.assertEqual(rows[0]["execution"], run["execution"])
         self.assertEqual((rows[0]["vcpu"], rows[0]["memory_gib"]), (2.0, 8.0))
+
+    def test_launch_log_does_not_name_an_image(self):
+        # 实际镜像由 Cloud Run 的 job 定义决定（试跑时是 :pre），hub 只能从
+        # profile 推出 <registry>/<project>:latest，不能把它说成正在跑的镜像。
+        job = self.submit()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.provisioner.tick()
+        execution = self.api.runs[0]["execution"]
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [f"[cloudrun] {job['id']} -> ct-demo-light execution {execution}"])
+        self.assertNotIn("image", out.getvalue())
+        self.assertNotIn(":latest", out.getvalue())
 
     def test_heavy_rule_uses_the_heavy_job(self):
         self.submit(cmd=("bash", "gate.sh"))
@@ -319,6 +361,120 @@ class ReconcileTests(Base):
         self.assertIn("heartbeat lost", self.store.job(job["id"])["error"])
 
 
+class JanitorIsolationTests(Base):
+    """gcloud 变慢 / 卡住时不能拖住 janitor 的其他工作。"""
+
+    api_class = BlockingAPI
+
+    def tearDown(self):
+        self.api.release.set()
+        super().tearDown()
+
+    def stale_static_job(self):
+        self.store.heartbeat("h1", "w", [])
+        job = self.submit(host="h1")
+        self.assertEqual(self.store.claim("h1", "w")["id"], job["id"])
+        self.store.conn.execute("UPDATE hosts SET last_seen=1 WHERE name='h1'")
+        return job
+
+    def stop_threads(self):
+        self.api.release.set()
+        self.hub.close()
+        for thread in (self.hub._cloudrun_thread, self.hub._janitor):
+            thread.join(20)
+            self.assertFalse(thread.is_alive(), thread.name)
+
+    def test_janitor_once_does_not_run_the_provisioner(self):
+        job = self.stale_static_job()
+        with mock.patch.object(self.provisioner, "tick") as tick, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.hub.janitor_once()
+        tick.assert_not_called()
+        self.assertEqual(self.store.job(job["id"])["status"], "error")
+
+    def test_hung_gcloud_does_not_delay_reaping_static_hosts(self):
+        self.config.raw["janitor_interval"] = 0.05
+        cloud = self.submit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()  # 拉起；下一轮对账的 describe 会卡住
+            static = self.stale_static_job()
+            self.hub.start_janitor()
+            self.assertTrue(self.api.entered.wait(20))
+            wait_until(lambda: self.store.job(static["id"])["status"] == "error")
+            # 回收发生时 provisioner 还卡在 gcloud 里。
+            self.assertEqual(self.api.active, 1)
+            self.assertFalse(self.api.release.is_set())
+            self.assertEqual(self.store.job(cloud["id"])["status"], "running")
+            self.stop_threads()
+
+    def test_close_stops_the_provisioner_thread(self):
+        self.config.raw["janitor_interval"] = 0.05
+        self.submit()
+        self.submit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+            self.hub.start_janitor()
+            self.assertTrue(self.api.entered.wait(20))
+            self.hub.close()
+            self.stop_threads()
+        # 关闭时正卡着的那次 describe 返回后，这一轮不再查剩下的 execution。
+        self.assertEqual(self.api.describes, 1)
+        self.assertEqual(self.api.cancelled, [])
+
+    def test_ticks_never_overlap(self):
+        self.submit()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        first = threading.Thread(target=self.provisioner.tick)
+        second = threading.Thread(target=self.hub.cloudrun_once)
+        first.start()
+        self.assertTrue(self.api.entered.wait(20))
+        second.start()
+        time.sleep(0.3)  # 没有单飞锁的话，第二轮此时已经进了 describe
+        self.assertEqual(self.api.active, 1)
+        self.api.release.set()
+        first.join(20)
+        second.join(20)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(self.api.max_active, 1)
+        self.assertEqual(self.api.describes, 2)
+
+    def test_closing_hub_stops_launching(self):
+        # 关闭检查在 claim 之前：第二个任务留在排队里，而不是带着 pending:
+        # 占位却没人拉起。
+        for _ in range(2):
+            self.submit()
+        launch = self.api.run_job
+
+        def launch_then_close(*args, **kwargs):
+            name = launch(*args, **kwargs)
+            self.hub.close()
+            return name
+
+        with mock.patch.object(self.api, "run_job", launch_then_close), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(len(self.api.runs), 1)
+        self.assertEqual(sorted(job["status"] for job in self.store.jobs()),
+                         ["queued", "running"])
+
+
+class StaticHubThreadTests(unittest.TestCase):
+    def test_hub_without_cloudrun_hosts_starts_no_provisioner_thread(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            config = make_config(Path(tmp), hosts={"h1": {"slots": {"light": 1}}})
+            hub = Hub(config)
+            try:
+                hub.start_janitor()
+                self.assertIsNone(hub.cloudrun)
+                self.assertIsNone(hub._cloudrun_thread)
+                hub.cloudrun_once()  # 没有 provider 主机时是空操作
+            finally:
+                hub.close()
+                hub._janitor.join(20)
+                hub.store.close()
+
+
 class UnrecordedLaunchTests(Base):
     """hub 在 gcloud execute 期间 / claim 之后退出：execution 名或整条记录缺失。"""
 
@@ -346,7 +502,7 @@ class UnrecordedLaunchTests(Base):
         self.restart()
         with contextlib.redirect_stdout(io.StringIO()):
             for _ in range(3):
-                self.hub.janitor_once()
+                self.hub.cloudrun_once()
         failed = self.store.job(job["id"])
         self.assertEqual(failed["status"], "error")
         self.assertIn("never recorded", failed["error"])
@@ -401,7 +557,7 @@ class UnrecordedLaunchTests(Base):
                                 (now() - 3600, job["id"]))
         self.restart()
         with contextlib.redirect_stdout(io.StringIO()):
-            self.hub.janitor_once()
+            self.hub.cloudrun_once()
         failed = self.store.job(job["id"])
         self.assertEqual(failed["status"], "error")
         self.assertIn("never recorded", failed["error"])

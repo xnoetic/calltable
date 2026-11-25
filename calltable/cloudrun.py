@@ -362,9 +362,15 @@ class Provisioner:
         return result
 
     # ---- 主循环
+    def _closing(self) -> bool:
+        """hub 正在关闭：这一轮不再发起新的 gcloud 调用，剩下的留给下次启动。"""
+        return self.hub._stop.is_set()
+
     def tick(self) -> None:
         with self._lock:
             for host, settings in self.settings.items():
+                if self._closing():
+                    return
                 try:
                     self._reconcile(host, settings)
                 except Exception as exc:  # pragma: no cover - 兜底
@@ -386,6 +392,10 @@ class Provisioner:
             self._over_budget(host, settings, spend)
             return
         while True:
+            # 关闭检查必须在 claim 之前：claim 之后不拉起，任务会带着 pending:
+            # 占位一直等到 attach 超时。
+            if self._closing():
+                return
             # 让 hub 的 claim 认为这台主机「在线」；调度规则（slot、锁、drain）
             # 与常驻主机完全相同。
             self.store.touch_host(host)
@@ -423,7 +433,6 @@ class Provisioner:
                     cleanup_at=now() + self.hub.config.retention_failure)
 
     def _launch(self, host: str, settings: CloudRunSettings, job: dict) -> None:
-        profile = self.hub.hub_profile(job)
         cloud_job = settings.job_name(job["project"], job["slot"])
         vcpu, mem = settings.slot_resources(job["slot"])
         self.store.cloud_record_launch(job["id"], host, cloud_job=cloud_job,
@@ -442,10 +451,10 @@ class Provisioner:
             self._fail(job["id"], note[:1000])
             return
         self.store.cloud_update(job["id"], execution=execution, state="launched")
-        image = project_image(settings, job["project"],
-                              profile.cloudrun if profile else {})
-        print(f"[cloudrun] {job['id']} -> {cloud_job} execution {execution} "
-              f"(image {image})", flush=True)
+        # 不打印镜像：实际跑哪个镜像由 Cloud Run 上的 job 定义决定，hub 这边
+        # 只能从 profile 推一个名字，未必是真正在跑的那个 tag。
+        print(f"[cloudrun] {job['id']} -> {cloud_job} execution {execution}",
+              flush=True)
 
     def _reconcile(self, host: str, settings: CloudRunSettings) -> None:
         current = now()
@@ -456,6 +465,8 @@ class Provisioner:
         rows = [row for row in self.store.cloud_executions(active_only=True)
                 if row["host"] == host]
         for row in rows:
+            if self._closing():
+                return
             job = self.store.job(row["job_id"])
             job_done = job is None or job.get("status") in TERMINAL
             execution = row["execution"]

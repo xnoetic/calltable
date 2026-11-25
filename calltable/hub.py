@@ -81,6 +81,7 @@ class Hub:
         self._thick_guard = threading.Lock()
         self._stop = threading.Event()
         self._janitor: threading.Thread | None = None
+        self._cloudrun_thread: threading.Thread | None = None
         self._webhooks: WebhookDispatcher | None = None
         self._warned: set[str] = set()
         self.keep_ref_seconds = int(config.raw.get("keep_ref_days", 14) * 86400)
@@ -114,7 +115,22 @@ class Hub:
             self._janitor = threading.Thread(target=self._janitor_loop,
                                              daemon=True, name="hub-janitor")
             self._janitor.start()
+        self.start_cloudrun()
         self.start_webhooks()
+
+    def start_cloudrun(self) -> None:
+        """Cloud Run 的拉起 / 对账单独一个线程，不放在 janitor 里。
+
+        每次 gcloud 调用最长等 120s，而且是串行的（每个活跃 execution 一次
+        describe、每个排队任务一次 execute）。gcloud 变慢或卡住时只拖住这个
+        线程，常驻主机的失联回收、排队超时和保留期清理照常按 janitor 的节奏跑。
+        没有 cloudrun 主机就不起线程。
+        """
+        if self.cloudrun is None or self._cloudrun_thread is not None:
+            return
+        self._cloudrun_thread = threading.Thread(
+            target=self._cloudrun_loop, daemon=True, name="hub-cloudrun")
+        self._cloudrun_thread.start()
 
     def start_webhooks(self) -> None:
         """后台投递线程：不阻塞调度；单独抽出来方便测试直接调 run_once。"""
@@ -176,16 +192,26 @@ class Hub:
             except Exception as exc:  # pragma: no cover - 常驻兜底
                 print(f"[hub] janitor: {type(exc).__name__}: {exc}", flush=True)
 
+    def _cloudrun_loop(self) -> None:
+        # 节奏与 janitor 相同；tick 自己有单飞锁，两轮不会重叠。
+        while not self._stop.wait(self.config.janitor_interval):
+            self.cloudrun_once()
+
+    def cloudrun_once(self) -> None:
+        """跑一轮 Cloud Run 对账 + 拉起（测试可直接调用）。"""
+        if self.cloudrun is None:
+            return
+        try:
+            self.cloudrun.tick()
+        except Exception as exc:  # pragma: no cover - 兜底
+            print(f"[hub] cloudrun: {type(exc).__name__}: {exc}", flush=True)
+
     def ephemeral_hosts(self) -> list[str]:
         return [name for name, spec in self.config.hosts.items()
                 if spec.provider == "cloudrun"]
 
     def janitor_once(self) -> None:
-        if self.cloudrun is not None:
-            try:
-                self.cloudrun.tick()
-            except Exception as exc:  # pragma: no cover - 兜底
-                print(f"[hub] cloudrun: {type(exc).__name__}: {exc}", flush=True)
+        # 不在这里调 gcloud：Cloud Run 的 tick 在自己的线程里（start_cloudrun）。
         for job in self.store.reap_stale_hosts(skip_hosts=self.ephemeral_hosts()):
             print(f"[hub] reaped {job['id']}: {job.get('error', '')}", flush=True)
         for job in self.store.reap_queue_holds():
