@@ -410,6 +410,13 @@ fails the job.
 > uncommitted and untracked work. Pushed to a public repository, anyone could
 > fetch it while the job runs, and a commit can stay retrievable by its id
 > for a while after its ref is deleted.
+> As a guard, before each push the hub runs an anonymous `git ls-remote`
+> against an `http(s)` `url` with every credential source disabled (result
+> cached for 10 minutes): if it succeeds the repository is public and nothing
+> is pushed; if visibility cannot be confirmed (timeout, network error,
+> unrecognised reply) it also does not push (fail closed). Either way the job
+> uses hub bundles instead. ssh, `git@host:path` and filesystem URLs are not
+> checked.
 
 ### Reaching the hub: userspace Tailscale
 

@@ -1162,6 +1162,203 @@ class GitRelayHubTests(GitRelayBase):
         self.assertEqual(self.remote_refs(), {})
 
 
+class GitRelayVisibilityTests(GitRelayBase):
+    """推送前匿名 ls-remote：公开 / 无法确认都不推；私有照推；结论按 URL 缓存。"""
+
+    URL = "https://git.example.invalid/o/demo.git"
+
+    def profile_git(self):
+        self.remote = Path(self.tmp.name) / "remote.git"
+        return {"url": self.URL, "push_url": str(self.remote)}
+
+    def fake_ls_remote(self, code=0, stderr="", exc=None):
+        calls = []
+
+        def run(url, timeout=cloudrun.VISIBILITY_TIMEOUT):
+            calls.append((url, timeout))
+            if exc is not None:
+                raise exc
+            return subprocess.CompletedProcess(["git"], code, "", stderr)
+
+        return calls, mock.patch.object(cloudrun, "anonymous_ls_remote",
+                                        side_effect=run)
+
+    def test_public_repository_is_never_pushed_to(self):
+        calls, patch = self.fake_ls_remote(code=0)
+        with patch, mock.patch.object(cloudrun, "run_git") as git_call:
+            job, out = self.launch()
+        self.assertEqual(calls, [(self.URL, cloudrun.VISIBILITY_TIMEOUT)])
+        git_call.assert_not_called()
+        env = self.api.runs[0]["env"]
+        self.assertNotIn("CALLTABLE_GIT_URL", env)
+        self.assertNotIn("CALLTABLE_GIT_REFS", env)
+        self.assertEqual(self.store.job(job["id"])["status"], "running")
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+        self.assertEqual(self.remote_refs(), {})
+        warnings = [line for line in out.splitlines() if "publicly readable" in line]
+        self.assertEqual(len(warnings), 1, out)
+        self.assertTrue(warnings[0].startswith(f"[cloudrun] {job['id']}: refusing"))
+
+    def test_http_403_is_not_proof_of_a_private_repository(self):
+        """挡在公开仓库前面的代理 / 防火墙也会回 403：按无法确认处理，不推送。"""
+        _, patch = self.fake_ls_remote(
+            128, "fatal: unable to access '...': The requested URL "
+                 "returned error: 403")
+        with patch:
+            verdict, _ = cloudrun.repo_visibility(self.URL)
+        self.assertEqual(verdict, cloudrun.UNKNOWN)
+
+    def test_private_repository_is_pushed_as_before(self):
+        for stderr in ("fatal: could not read Username for 'https://git.example."
+                       "invalid': terminal prompts disabled",
+                       "remote: Repository not found.\nfatal: repository "
+                       "'https://git.example.invalid/o/demo.git/' not found",
+                       "fatal: unable to access '...': The requested URL "
+                       "returned error: 401",
+                       "fatal: Authentication failed for 'https://x/'"):
+            with self.subTest(stderr=stderr):
+                _, patch = self.fake_ls_remote(128, stderr)
+                with patch:
+                    verdict, _ = cloudrun.repo_visibility(self.URL)
+                self.assertEqual(verdict, cloudrun.PRIVATE)
+        calls, patch = self.fake_ls_remote(
+            code=128, stderr="fatal: could not read Username: terminal prompts "
+                             "disabled")
+        with patch:
+            job, out = self.launch()
+        self.assertEqual(len(calls), 1)
+        prefix = f"refs/calltable/jobs/{job['id']}"
+        self.assertEqual(self.api.runs[0]["env"]["CALLTABLE_GIT_URL"], self.URL)
+        self.assertEqual(self.api.runs[0]["env"]["CALLTABLE_GIT_REFS"], prefix)
+        self.assertEqual(set(self.remote_refs()), {f"{prefix}/head", f"{prefix}/base"})
+        self.assertNotEqual(self.store.cloud_executions()[0]["git_refs"], "")
+        self.assertNotIn("publicly", out)
+
+    def test_unknown_visibility_fails_closed(self):
+        for kwargs in ({"exc": subprocess.TimeoutExpired(["git"], 20)},
+                       {"exc": OSError("no git")},
+                       {"code": 128, "stderr": "fatal: unable to access: Could "
+                                               "not resolve host: git.example.invalid"}):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                self.provisioner._visibility.clear()
+                calls, patch = self.fake_ls_remote(**kwargs)
+                with patch, mock.patch.object(cloudrun, "run_git") as git_call:
+                    out = io.StringIO()
+                    with contextlib.redirect_stdout(out):
+                        env = self.provisioner._push_git_refs(
+                            self.store.job(self.submit_git()["id"]))
+                self.assertEqual(env, {})
+                git_call.assert_not_called()
+                self.assertEqual(len(calls), 1)
+                lines = out.getvalue().splitlines()
+                self.assertEqual(len(lines), 1, lines)
+                self.assertIn("could not verify that the repository is private",
+                              lines[0])
+
+    def test_verdict_is_cached_per_url(self):
+        job = self.store.job(self.submit_git()["id"])
+        calls, patch = self.fake_ls_remote(code=0)
+        clock = [1000.0]
+        with patch, mock.patch.object(cloudrun, "now", lambda: clock[0]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner._push_git_refs(job)
+            clock[0] += cloudrun.VISIBILITY_TTL - 1
+            self.provisioner._push_git_refs(job)
+            self.assertEqual(len(calls), 1)
+            clock[0] += 2
+            self.provisioner._push_git_refs(job)
+            self.assertEqual(len(calls), 2)
+
+    def test_unknown_verdict_is_rechecked_sooner(self):
+        job = self.store.job(self.submit_git()["id"])
+        calls, patch = self.fake_ls_remote(exc=subprocess.TimeoutExpired(["git"], 20))
+        clock = [1000.0]
+        with patch, mock.patch.object(cloudrun, "now", lambda: clock[0]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner._push_git_refs(job)
+            clock[0] += cloudrun.VISIBILITY_UNKNOWN_TTL - 1
+            self.provisioner._push_git_refs(job)
+            self.assertEqual(len(calls), 1)
+            clock[0] += 2
+            self.provisioner._push_git_refs(job)
+            self.assertEqual(len(calls), 2)
+        self.assertLess(cloudrun.VISIBILITY_UNKNOWN_TTL, cloudrun.VISIBILITY_TTL)
+
+    def test_non_http_urls_skip_the_check(self):
+        for url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r.git",
+                    "/srv/git/r.git", "file:///srv/git/r.git"):
+            with self.subTest(url=url):
+                with mock.patch.object(cloudrun, "anonymous_ls_remote") as check:
+                    self.assertEqual(cloudrun.repo_visibility(url)[0],
+                                     cloudrun.UNCHECKED)
+                check.assert_not_called()
+
+    def test_local_push_url_does_not_bypass_the_check(self):
+        # 检查的是容器取代码的 url，不是 push_url。
+        calls, patch = self.fake_ls_remote(code=0)
+        with patch, contextlib.redirect_stdout(io.StringIO()):
+            env = self.provisioner._push_git_refs(self.store.job(self.submit_git()["id"]))
+        self.assertEqual(env, {})
+        self.assertEqual(calls[0][0], self.URL)
+
+
+class AnonymousLsRemoteTests(unittest.TestCase):
+    def test_runs_without_any_credential_source(self):
+        polluted = {"GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "http.extraheader",
+                    "GIT_CONFIG_VALUE_0": "Authorization: Basic c2VjcmV0",
+                    "GIT_CONFIG_PARAMETERS": "'credential.helper'='store'",
+                    "GIT_ASKPASS": "/usr/bin/echo-password",
+                    "CALLTABLE_GIT_TOKEN": "tok", "XDG_CONFIG_HOME": "/home/x/.config"}
+        result = subprocess.CompletedProcess(["git"], 0, "", "")
+        with mock.patch.dict(os.environ, polluted), \
+                mock.patch.object(cloudrun.subprocess, "run",
+                                  return_value=result) as run:
+            cloudrun.anonymous_ls_remote("https://git.example.invalid/o/r.git")
+        argv = run.call_args.args[0]
+        kwargs = run.call_args.kwargs
+        env = kwargs["env"]
+        self.assertEqual(argv[0], "git")
+        self.assertIn("ls-remote", argv)
+        self.assertIn("https://git.example.invalid/o/r.git", argv)
+        for option in ("credential.helper=", "http.extraheader="):
+            self.assertEqual(argv[argv.index(option) - 1], "-c")
+        self.assertEqual(env["GIT_CONFIG_GLOBAL"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_SYSTEM"], os.devnull)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(env["GIT_ASKPASS"], "false")
+        for name in ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0",
+                     "GIT_CONFIG_PARAMETERS", "CALLTABLE_GIT_TOKEN",
+                     "XDG_CONFIG_HOME"):
+            self.assertNotIn(name, env)
+        self.assertNotIn("c2VjcmV0", " ".join(env.values()))
+        # HOME 是临时空目录（不读 ~/.netrc / ~/.gitconfig），也不在仓库里跑。
+        self.assertNotEqual(env["HOME"], os.path.expanduser("~"))
+        self.assertEqual(kwargs["cwd"], env["HOME"])
+        self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["timeout"], cloudrun.VISIBILITY_TIMEOUT)
+
+    def test_really_ignores_global_config(self):
+        # 真跑 git（不联网）：全局配置里的 insteadOf 若生效，会把一个不存在的
+        # 本地路径改写到存在的仓库并成功；被忽略时必然失败。
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            real = root / "real.git"
+            run_git(root, "init", "-q", "--bare", str(real))
+            alias = (root / "alias.git").as_posix()
+            gitconfig = root / "gitconfig"
+            gitconfig.write_text(f'[url "{real.as_posix()}"]\n'
+                                 f'\tinsteadOf = {alias}\n', encoding="utf-8")
+            sanity = subprocess.run(
+                ["git", "ls-remote", alias],
+                env={**os.environ, "GIT_CONFIG_GLOBAL": str(gitconfig)},
+                capture_output=True, text=True, stdin=subprocess.DEVNULL)
+            self.assertEqual(sanity.returncode, 0, sanity.stderr)
+            with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(gitconfig)}):
+                proc = cloudrun.anonymous_ls_remote(alias, timeout=20)
+            self.assertNotEqual(proc.returncode, 0)
+
 class GitRelayOffTests(GitRelayBase):
     def profile_git(self):
         self.remote = Path(self.tmp.name) / "remote.git"

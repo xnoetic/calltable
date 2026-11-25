@@ -31,6 +31,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -302,6 +303,85 @@ def run_git(args: list[str], *, cwd: str | Path, timeout: float
     return proc
 
 
+# ------------------------------------------------------------------ 仓库可见性
+#: 匿名 ``ls-remote`` 的超时（秒）。
+VISIBILITY_TIMEOUT = 20.0
+#: 「公开 / 私有」结论的缓存时长；「无法确认」更快重试。
+VISIBILITY_TTL = 600.0
+VISIBILITY_UNKNOWN_TTL = 60.0
+PUBLIC, PRIVATE, UNKNOWN, UNCHECKED = "public", "private", "unknown", "unchecked"
+#: 匿名访问失败、且明确表示「要认证 / 匿名看不到」的报错（小写匹配）。
+#: 403 不算：挡在公开仓库前面的代理 / 防火墙也会回 403，认成「私有」就会把
+#: 快照推到公开仓库；它按「无法确认」处理（不推送）。
+_PRIVATE_PATTERNS = re.compile(
+    r"authentication failed|could not read (username|password)"
+    r"|terminal prompts disabled|repository not found"
+    r"|repository '[^']*' not found|returned error: (401|404)"
+    r"|\bhttp (401|404)\b|http basic: access denied"
+    r"|invalid username or password|requested url returned error: 40[14]")
+#: 匿名检查时去掉的环境变量：任何可能带凭据或额外配置的来源。
+_CREDENTIAL_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_CREDENTIAL_ENV = ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG",
+                   "GIT_ASKPASS", "SSH_ASKPASS", "CALLTABLE_GIT_TOKEN",
+                   "CALLTABLE_TOKEN", "GIT_DIR", "GIT_COMMON_DIR",
+                   "XDG_CONFIG_HOME")
+
+
+def is_http_url(url: str) -> bool:
+    return url.lower().startswith(("http://", "https://"))
+
+
+def anonymous_ls_remote(url: str, timeout: float = VISIBILITY_TIMEOUT
+                        ) -> subprocess.CompletedProcess:
+    """不带任何凭据地 ``git ls-remote <url> HEAD``（判断仓库是否匿名可读）。
+
+    关掉所有凭据来源：全局 / 系统 git 配置指向空设备、``credential.helper``
+    清空、``http.extraheader`` 清空、askpass 是一个必定失败的命令、不许终端
+    提示，HOME 换成临时空目录（不读 ~/.netrc），也不在任何仓库里运行。
+    超时 / 启动失败按原样抛出（调用方视为「无法确认」）。
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in _CREDENTIAL_ENV
+           and not key.startswith(_CREDENTIAL_ENV_PREFIXES)}
+    with tempfile.TemporaryDirectory(prefix="ct-visibility-") as home:
+        env.update({
+            "HOME": home,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "false",
+            "SSH_ASKPASS": "false",
+            "GCM_INTERACTIVE": "never",
+            "GIT_PAGER": "cat",
+        })
+        return subprocess.run(
+            ["git", "-c", "credential.helper=", "-c", "http.extraheader=",
+             "-c", "core.askPass=false", "-c", "core.pager=cat",
+             "ls-remote", url, "HEAD"],
+            cwd=home, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+            start_new_session=(os.name != "nt"))
+
+
+def repo_visibility(url: str) -> tuple[str, str]:
+    """``(结论, 说明)``：public / private / unknown；非 http(s) URL 为 unchecked。"""
+    if not is_http_url(url):
+        return UNCHECKED, "not an http(s) URL"
+    try:
+        proc = anonymous_ls_remote(url, timeout=VISIBILITY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return UNKNOWN, f"anonymous ls-remote timed out after {int(VISIBILITY_TIMEOUT)}s"
+    except OSError as exc:
+        return UNKNOWN, f"git failed to start: {exc}"
+    if proc.returncode == 0:
+        return PUBLIC, "anonymous ls-remote succeeded"
+    detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+    if _PRIVATE_PATTERNS.search(detail.lower()):
+        return PRIVATE, detail
+    return UNKNOWN, detail or f"git ls-remote exited {proc.returncode}"
+
+
 def _one_line(exc: BaseException) -> str:
     return " ".join(str(exc).split())[:500]
 
@@ -429,6 +509,8 @@ class Provisioner:
         self._lock = threading.Lock()
         self._last_reconcile: dict[str, float] = {}
         self._budget_warned: dict[str, float] = {}
+        #: URL → (可见性结论, 过期时间)：避免每个任务都多一次网络调用。
+        self._visibility: dict[str, tuple[str, str, float]] = {}
         #: job id → 删除远端临时 ref 失败后，下一次允许重试的时间。
         self._git_retry_at: dict[str, float] = {}
         self.settings: dict[str, CloudRunSettings] = {}
@@ -594,6 +676,21 @@ class Provisioner:
         # hub 正在关闭：不再发起慢速推送，照旧拉起（容器走 hub bundle）。
         if relay is None or self._closing():
             return {}
+        # 快照含未提交的改动：仓库匿名可读（例如被改成了公开）就绝不推送；
+        # 确认不了也不推（fail closed）。容器照旧走 hub bundle。
+        verdict, detail = self._repo_visibility(relay.url)
+        if verdict == PUBLIC:
+            print(f"[cloudrun] {job['id']}: refusing to push to {relay.url}: the "
+                  "repository is publicly readable; falling back to hub bundles",
+                  flush=True)
+            return {}
+        if verdict == UNKNOWN:
+            print(f"[cloudrun] {job['id']}: not pushing to {relay.url}: could not "
+                  f"verify that the repository is private ({' '.join(detail.split())[:300]}); "
+                  "falling back to hub bundles", flush=True)
+            return {}
+        if self._closing():
+            return {}
         try:
             prefix = job_git_prefix(job["id"])
             sha = str(job.get("sha") or "")
@@ -618,6 +715,18 @@ class Provisioner:
             "project": job["project"], "push_url": relay.push_url,
             "refs": sorted(refs)}))
         return {"CALLTABLE_GIT_URL": relay.url, "CALLTABLE_GIT_REFS": prefix}
+
+    def _repo_visibility(self, url: str) -> tuple[str, str]:
+        """带缓存的 :func:`repo_visibility`（公开 / 私有 10 分钟，无法确认 1 分钟）。"""
+        cached = self._visibility.get(url)
+        current = now()
+        if cached is not None and current < cached[2]:
+            return cached[0], cached[1]
+        verdict, detail = repo_visibility(url)
+        if verdict != UNCHECKED:
+            ttl = VISIBILITY_UNKNOWN_TTL if verdict == UNKNOWN else VISIBILITY_TTL
+            self._visibility[url] = (verdict, detail, current + ttl)
+        return verdict, detail
 
     def _cleanup_git_refs(self, host: str) -> None:
         """execution 记录关闭后删掉推过的临时 ref；失败的留到以后的对账再试。"""
