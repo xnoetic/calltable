@@ -347,9 +347,86 @@ Tailscale.
   on the hub machine (ADC/user login or a service account such as
   `calltable-hub@…` with `roles/run.developer` and `iam.serviceAccountUser` on
   the executor service account). Containers run as `service_account` and
-  only read two Secret Manager secrets: the hub token and a Tailscale auth key.
-  The executor removes both (`CALLTABLE_TOKEN`, `TS_AUTHKEY`) from the
-  environment it gives the job command.
+  only read two Secret Manager secrets: the hub token and a Tailscale auth key
+  (plus an optional git read token, see `cloudrun.git` below). The executor
+  removes them (`CALLTABLE_TOKEN`, `TS_AUTHKEY`, `CALLTABLE_GIT_TOKEN`) from
+  the environment it gives the job command.
+
+### Fetching code through GitHub (`cloudrun.git`)
+
+Every execution starts with an empty container, so by default it downloads the
+project's full history from the hub as a git bundle. When the hub sits behind a
+slow link, relay the code through a git host that is fast from Google Cloud
+instead. Opt in per project in the profile:
+
+```json
+"cloudrun": {
+  "base_image": "...",
+  "git": {
+    "url": "https://github.com/OWNER/REPO.git",
+    "push_url": "git@github.com:OWNER/REPO.git",
+    "branch": "main",
+    "token_secret": "calltable-git-myproject"
+  }
+}
+```
+
+* `url` enables the feature; the container and the image build fetch from it.
+  It must be an `http://` or `https://` URL (a local path or `file://` URL is
+  also accepted, for tests and local setups); ssh and `git@host:path` forms
+  are rejected.
+* `push_url` (default `url`) is where the hub pushes, using the hub process's
+  own git credentials (ssh key or credential helper); git runs
+  non-interactively with a timeout. It may use ssh or `git@host:path`, but it
+  must name the same repository as `url` (same host and path, ignoring the
+  scheme, port, user name, case of the host and a `.git` suffix).
+* Neither URL may contain credentials: no user name or token in http(s) URLs,
+  no password in ssh URLs (a bare `git@` user is fine).
+* `branch` (default `main`) is the branch baked into the image.
+* `token_secret` names a Secret Manager secret holding an HTTPS token with read
+  access. If the key is absent, the host-level default
+  `hosts.<name>.cloudrun.git_token_secret` is used (handy when several
+  projects share one token); an explicit `""` or `null` means no token is
+  injected. Grant `roles/secretmanager.secretAccessor` on it to
+  the executor service account (run time; `ct cloudrun jobs` adds
+  `CALLTABLE_GIT_TOKEN` to `--set-secrets`) and to the Cloud Build service
+  account (image build).
+
+Flow:
+
+1. `ct cloudrun image` (Cloud Build builder only) generates a `cloudbuild.yaml`
+   whose first step clones a bare, single-branch mirror of `branch` into the
+   image at `/opt/calltable/mirrors/<project>.git`; the token is passed as an
+   HTTP header through environment config and is not left in the mirror. The
+   `docker` builder does not bake and says so. Rebuild the image now and then
+   so the baked history stays recent.
+2. Before launching an execution the hub pushes the job's commit (and its
+   baseline, when present) from its own mirror to the hidden refs
+   `refs/calltable/jobs/<job id>/head` and `.../base` and passes
+   `CALLTABLE_GIT_URL` and `CALLTABLE_GIT_REFS` to the execution. Snapshots,
+   **including uncommitted work**, therefore land in that repository as
+   temporary refs (not branches); they are deleted once the execution is
+   closed, and a failed deletion is retried on later reconcile passes. After
+   24 hours the hub gives up, logs the refs that may remain and records them in
+   the execution row's note for manual removal.
+3. The container fetches those refs into the baked mirror (only the recent
+   delta travels) and skips the hub bundle when the commit arrived.
+
+Any failure (push, fetch, missing commit) falls back to hub bundles; it never
+fails the job.
+
+> **Only enable this for private repositories.** A job's snapshot contains
+> uncommitted and untracked work. Pushed to a public repository, anyone could
+> fetch it while the job runs, and a commit can stay retrievable by its id
+> for a while after its ref is deleted.
+> As a guard, before each push the hub runs an anonymous `git ls-remote`
+> against an `http(s)` `url` with every credential source disabled (result
+> cached for 10 minutes): if it succeeds the repository is public and nothing
+> is pushed; if visibility cannot be confirmed (timeout, network error,
+> unrecognised reply, HTTP 403) it also does not push (fail closed). Either way
+> the job uses hub bundles instead. Because only http(s) can be checked, `url`
+> must be http(s); local paths are not checked (they cannot be a public network
+> repository).
 
 ### Reaching the hub: userspace Tailscale
 
@@ -386,6 +463,7 @@ All keys live under `hosts.<name>.cloudrun`. Only `project` is required.
 | `job_prefix` | `ct` | job definitions are named `<prefix>-<project>-<slot>` |
 | `repository`, `registry` | `calltable`, `<region>-docker.pkg.dev/<project>/<repository>` | where project images are pushed |
 | `hub_token_secret`, `tailscale_authkey_secret` | `calltable-hub-token`, `calltable-tailscale-authkey` | Secret Manager secret names |
+| `git_token_secret` | none | default Secret Manager secret for `cloudrun.git` when a profile has no `token_secret` key |
 | `enabled` | `true` | `false` stops launching new executions |
 | `gcloud` | found on `PATH` | path of the `gcloud` binary on the hub machine |
 

@@ -257,7 +257,40 @@ ct cloudrun status     # 本月至今的估算花费、预算、活跃的 execut
 * **对账。** execution 在任务上报结果前就结束了，任务记为 `error`；任务已经结束而 execution 还在跑，就取消 execution；execution 在 `attach_timeout`（15 分钟）内没人接管，或者执行器停止心跳超过 `heartbeat_timeout`（15 分钟），就取消它，任务记为失败。如果某次预留的拉起 hub 没来得及记下（比如拉起到一半 hub 重启了），这条预留同样受接管超时和心跳超时约束，只是不发取消调用，这样它不会一直占着槽位，也不会无休止地累计估算花费。job 定义用 `--max-retries=0`，calltable 已经结束的任务，Cloud Run 不会再跑一遍。
 * **超时。** 每次 execution 的 `task timeout = job timeout + timeout_grace`（5 分钟），上限是 `max_task_timeout`（默认 3 小时）。
 * **月度花费封顶。** hub 估算本月（UTC）的花费：每个 execution 的存活时间 ×（vCPU 单价 × vCPU + 内存单价 × GiB），按 Cloud Run 最少计 1 分钟，价格用 us-central1 的公开价（`cpu_price` 0.000018 USD/vCPU-s，`memory_price` 0.000002 USD/GiB-s，其他区域自行覆盖）。估算不扣免费额度和赠金，所以会偏高。估算达到 `monthly_budget_usd` 后不再拉起新的 execution：任务继续排队（`on_budget_exceeded: "queue"`）或直接失败（`"fail"`）。已经在跑的 execution 不受影响。`ct cloudrun status`（或 `GET /api/cloudrun`）显示本月至今的估算。GCP 里的真实预算提醒也要设：这个封顶只是估算，不是账单。
-* **身份。** hub 调用 Cloud Run 时，用的是 hub 机器上 `gcloud` 当前登录的身份（ADC/用户登录，或者 `calltable-hub@…` 这样的服务账号，需要 `roles/run.developer`，以及在执行器服务账号上的 `iam.serviceAccountUser`）。容器以 `service_account` 运行，只读取两个 Secret Manager secret：hub token 和 Tailscale auth key。执行器交给任务命令的环境里，这两个变量（`CALLTABLE_TOKEN`、`TS_AUTHKEY`）都会去掉。
+* **身份。** hub 调用 Cloud Run 时，用的是 hub 机器上 `gcloud` 当前登录的身份（ADC/用户登录，或者 `calltable-hub@…` 这样的服务账号，需要 `roles/run.developer`，以及在执行器服务账号上的 `iam.serviceAccountUser`）。容器以 `service_account` 运行，只读取两个 Secret Manager secret：hub token 和 Tailscale auth key（另有一个可选的 git 只读 token，见下面的 `cloudrun.git`）。执行器交给任务命令的环境里，这些变量（`CALLTABLE_TOKEN`、`TS_AUTHKEY`、`CALLTABLE_GIT_TOKEN`）都会去掉。
+
+### 代码经 GitHub 中转（`cloudrun.git`）
+
+每次 execution 都从空容器开始，默认要从 hub 以 git bundle 的形式下载项目的完整历史。hub 的链路很慢时，可以改走一个从 Google Cloud 访问很快的 git 托管。按项目在 profile 里开启：
+
+```json
+"cloudrun": {
+  "base_image": "...",
+  "git": {
+    "url": "https://github.com/OWNER/REPO.git",
+    "push_url": "git@github.com:OWNER/REPO.git",
+    "branch": "main",
+    "token_secret": "calltable-git-myproject"
+  }
+}
+```
+
+* `url`：写了就开启；容器和镜像构建都从它取代码。必须是 `http://` 或 `https://` URL（本地路径或 `file://` URL 也可以，用于测试和本机环境）；ssh 和 `git@host:path` 形式会被拒绝。
+* `push_url`（默认同 `url`）：hub 往这里推，用的是 hub 进程自己的 git 凭据（ssh key 或 credential helper）；git 以非交互方式运行并带超时。可以用 ssh 或 `git@host:path`，但必须和 `url` 指向同一个仓库（主机和路径相同；不看协议、端口、用户名、主机大小写和 `.git` 后缀）。
+* 两个 URL 里都不能带凭据：http(s) URL 不能带用户名或 token，ssh URL 不能带口令（只写 `git@` 这样的用户名可以）。
+* `branch`（默认 `main`）：打进镜像的分支。
+* `token_secret`：Secret Manager 里的 secret 名称，内容是一个有读权限的 HTTPS token。没写这个键时用主机级默认值 `hosts.<name>.cloudrun.git_token_secret`（多个项目共用一个 token 时方便）；显式写 `""` 或 `null` 表示不注入 token。要把 `roles/secretmanager.secretAccessor` 授给执行器服务账号（运行时用；`ct cloudrun jobs` 会把 `CALLTABLE_GIT_TOKEN` 加进 `--set-secrets`）和 Cloud Build 的服务账号（构建镜像时用）。
+
+流程：
+
+1. `ct cloudrun image`（仅 Cloud Build 构建器）生成 `cloudbuild.yaml`，第一步把 `branch` clone 成裸的单分支镜像，打进镜像的 `/opt/calltable/mirrors/<project>.git`；token 以 HTTP header 的形式经环境配置传入，不会留在镜像里。`docker` 构建器不预置，并会明确提示。隔一段时间重建一次镜像，预置的历史才不会太旧。
+2. 拉起 execution 之前，hub 把任务的提交（有基线时连同基线）从自己的镜像推到隐藏 ref `refs/calltable/jobs/<job id>/head` 和 `.../base`，并把 `CALLTABLE_GIT_URL`、`CALLTABLE_GIT_REFS` 传给 execution。所以快照（**包括未提交的改动**）会以临时 ref（不是分支）的形式进入那个仓库；execution 记录关闭后删除，删除失败会在之后的对账里重试；超过 24 小时仍删不掉就放弃，把可能残留的 ref 打进日志并写进该 execution 记录的 note，留待人工清理。
+3. 容器把这些 ref 取进预置的镜像（只传最近的增量），提交到手就不再向 hub 要 bundle。
+
+任何一步失败（推送、取代码、缺提交）都会回退到 hub bundle，不会让任务失败。
+
+> **只对私有仓库开启。** 任务快照里有未提交、未跟踪的改动。推到公开仓库的话，任务运行期间任何人都能取到；ref 删除后的一段时间里，提交仍可能凭 id 被取到。
+> 作为保护，每次推送前 hub 会在关闭所有凭据来源的情况下，对 `http(s)` 的 `url` 匿名执行 `git ls-remote`（结果缓存 10 分钟）：成功说明仓库公开，不推送；无法确认可见性（超时、网络错误、无法识别的报错、HTTP 403）时同样不推送（fail closed）。两种情况任务都改用 hub bundle。因为只有 http(s) 能检查，`url` 必须是 http(s)；本地路径不检查（它不可能是公网仓库）。
 
 ### 通过 userspace Tailscale 访问 hub
 
@@ -285,6 +318,7 @@ Cloud Run 的文件系统在内存里：检出的代码会占用内存配额。�
 | `job_prefix` | `ct` | job 定义命名为 `<prefix>-<project>-<slot>` |
 | `repository`、`registry` | `calltable`、`<region>-docker.pkg.dev/<project>/<repository>` | 项目镜像推送到哪里 |
 | `hub_token_secret`、`tailscale_authkey_secret` | `calltable-hub-token`、`calltable-tailscale-authkey` | Secret Manager 里的 secret 名称 |
+| `git_token_secret` | 无 | profile 没写 `token_secret` 键时，`cloudrun.git` 默认使用的 Secret Manager secret |
 | `enabled` | `true` | 设为 `false` 后不再拉起新的 execution |
 | `gcloud` | 从 `PATH` 中查找 | hub 机器上 `gcloud` 可执行文件的路径 |
 

@@ -27,14 +27,19 @@ ADC / 服务账号身份），测试里替换成假的 :class:`CloudRunAPI`。
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
+import tempfile
 import threading
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
+from . import gitops
 from .db import PENDING_WORKER_PREFIX, QUEUED, RUNNING, TERMINAL
 from .util import now, parse_duration
 
@@ -127,6 +132,9 @@ class CloudRunSettings:
     reconcile_interval: int = 60
     hub_token_secret: str = "calltable-hub-token"
     tailscale_authkey_secret: str = "calltable-tailscale-authkey"
+    #: profile ``cloudrun.git`` 没写 ``token_secret`` 键时用的默认 secret 名
+    #: （多个项目共用一个只读 token）。
+    git_token_secret: str = ""
     enabled: bool = True
     #: hub 机器上的 gcloud 可执行文件（默认在 PATH 里找）。
     gcloud: str = ""
@@ -145,6 +153,10 @@ class CloudRunSettings:
         action = str(data.get("on_budget_exceeded") or "queue").lower()
         if action not in ("queue", "fail"):
             raise ValueError(f"host {host}: on_budget_exceeded must be queue or fail")
+        git_token_secret = str(data.get("git_token_secret") or "").strip()
+        if git_token_secret and not _SECRET_NAME_RE.fullmatch(git_token_secret):
+            raise ValueError(f"host {host}: git_token_secret {git_token_secret!r} "
+                             "is not a valid Secret Manager secret name")
         repository = str(data.get("repository") or DEFAULTS["repository"])
         registry = str(data.get("registry") or
                        f"{region}-docker.pkg.dev/{project}/{repository}")
@@ -166,6 +178,7 @@ class CloudRunSettings:
             reconcile_interval=parse_duration(data.get("reconcile_interval")),
             hub_token_secret=str(data.get("hub_token_secret")),
             tailscale_authkey_secret=str(data.get("tailscale_authkey_secret")),
+            git_token_secret=git_token_secret,
             enabled=bool(data.get("enabled", True)),
             gcloud=str(data.get("gcloud") or ""),
         )
@@ -185,6 +198,339 @@ class CloudRunSettings:
     def cost(self, seconds: float, vcpu: float, mem_gib: float) -> float:
         billed = max(float(MIN_BILLED_SECONDS), float(seconds))
         return billed * (vcpu * self.cpu_price + mem_gib * self.memory_price)
+
+
+# ------------------------------------------------------------------ git 中转
+#: 远端仓库 URL / 推送 URL：会进 argv、``--update-env-vars``（逗号分隔）、
+#: cloudbuild.yaml 和 bash 单引号里，只放行不需要转义的字符。
+_GIT_URL_RE = re.compile(r"^[A-Za-z0-9/][A-Za-z0-9._~:/@%+-]*$")
+#: 支持的 URL 形式（都不允许带口令；http(s) 连用户名都不允许）。
+_HTTP_URL_RE = re.compile(r"^(https?)://([^/]*)(/.*)?$", re.IGNORECASE)
+_SSH_URL_RE = re.compile(r"^ssh://(?:([^/@:]+)@)?([^/@:]+)(?::(\d+))?(/.*)$",
+                         re.IGNORECASE)
+_SCP_URL_RE = re.compile(r"^(?:([A-Za-z0-9._-]+)@)?([A-Za-z0-9.-]+):([^:@]+)$")
+_FILE_URL_RE = re.compile(r"^file://(/.*)$", re.IGNORECASE)
+_GIT_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
+_SECRET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,255}$")
+_JOB_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+#: hub 推送临时 ref 的超时（秒）。provisioner 线程是串行的，必须有界；它发生在
+#: execution 拉起之前，也算进 attach 超时里，所以要短。
+GIT_PUSH_TIMEOUT = 120.0
+#: 删除临时 ref / 删除失败后 ls-remote 核对的超时（秒）。
+GIT_DELETE_TIMEOUT = 60.0
+GIT_LS_REMOTE_TIMEOUT = 30.0
+#: 某个 push_url 删除失败后，至少隔这么久再碰这个远端（秒）。
+GIT_CLEANUP_RETRY = 60.0
+#: execution 记录关闭超过这么久（秒）还删不掉远端 ref，就放弃重试：在日志和
+#: 记录的 note 里留下可能残留的 ref，然后清掉 git_refs。
+GIT_CLEANUP_MAX_AGE = 24 * 3600.0
+#: 一轮对账最多处理多少条待删记录，避免清理长时间占住 provisioner 线程。
+GIT_CLEANUP_BATCH = 10
+#: 容器里预置镜像的目录（``ct cloudrun image`` 在 Cloud Build 里 clone 进去）。
+BAKED_MIRROR_ROOT = "/opt/calltable/mirrors"
+
+
+@dataclass
+class GitRelay:
+    """profile ``cloudrun.git``：经远端仓库（GitHub）给容器中转代码。"""
+
+    url: str
+    push_url: str
+    branch: str = "main"
+    token_secret: str = ""
+
+    @classmethod
+    def from_profile(cls, profile_cloudrun: dict | None,
+                     default_token_secret: str = "") -> "GitRelay | None":
+        """没有 ``cloudrun.git.url`` 返回 None（功能关闭）；配置不合法抛 ValueError。
+
+        ``token_secret``：profile 里有这个键就用它（空串 / null 表示不注入
+        token）；没有这个键才用主机级默认 ``git_token_secret``。
+        """
+        raw = (profile_cloudrun or {}).get("git")
+        if not raw:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError("cloudrun.git must be an object")
+        url = str(raw.get("url") or "").strip()
+        if not url:
+            return None
+        relay = cls(url=url,
+                    push_url=str(raw.get("push_url") or "").strip() or url,
+                    branch=str(raw.get("branch") or "main").strip(),
+                    token_secret=(str(raw.get("token_secret") or "").strip()
+                                  if "token_secret" in raw
+                                  else str(default_token_secret or "").strip()))
+        relay.validate()
+        return relay
+
+    def validate(self) -> None:
+        for name, value in (("url", self.url), ("push_url", self.push_url)):
+            if not _GIT_URL_RE.fullmatch(value):
+                raise ValueError(
+                    f"cloudrun.git.{name} {redact_url(value)!r} contains characters "
+                    "that are "
+                    "not allowed (whitespace, quotes, shell or YAML metacharacters, "
+                    "commas) or starts with '-'")
+        # 容器只能用 token 走 https 取代码，而可见性检查也只对 http(s) 有效：
+        # url 必须是 http(s)；本地路径只用于测试和本机环境（不可能是公网仓库）。
+        if url_kind(self.url, "url") not in ("http", "local"):
+            raise ValueError(f"cloudrun.git.url {self.url!r} must be an http(s):// "
+                             "URL (or a local path / file:// URL)")
+        # 只有 url 做可见性检查：push_url 必须指向同一个仓库。
+        if repo_identity(self.url, "url") != repo_identity(self.push_url, "push_url"):
+            raise ValueError(f"cloudrun.git.push_url {self.push_url!r} does not name "
+                             f"the same repository as cloudrun.git.url {self.url!r}")
+        if (not _GIT_BRANCH_RE.fullmatch(self.branch) or ".." in self.branch
+                or self.branch.endswith((".lock", "/", "."))):
+            raise ValueError(f"cloudrun.git.branch {self.branch!r} is not a valid "
+                             "branch name")
+        if self.token_secret and not _SECRET_NAME_RE.fullmatch(self.token_secret):
+            raise ValueError(f"cloudrun.git.token_secret {self.token_secret!r} is not "
+                             "a valid Secret Manager secret name")
+
+
+#: ssh / scp 形式里允许的用户名：常规的短账号名（如 ``git``），不可能是 token。
+_SSH_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def redact_url(url: str) -> str:
+    """报错里引用 URL 时打码凭据：http(s) 的整个 userinfo；其余形式的口令，
+    以及不像常规账号名的用户名（可能是贴进来的 token）。"""
+    url = re.sub(r"^(https?://)[^/@]*@", r"\1***@", url, flags=re.IGNORECASE)
+
+    def mask(match: re.Match) -> str:
+        user, password = match.group(2), match.group(3)
+        if password is None and _SSH_USER_RE.fullmatch(user):
+            return match.group(0)
+        return match.group(1) + "***@"
+
+    return re.sub(r"(^|://)([^/@:]*)(:[^/@]*)?@", mask, url)
+
+
+def _check_ssh_user(user: str | None, name: str) -> None:
+    if user is not None and not _SSH_USER_RE.fullmatch(user):
+        # 不回显用户名：它可能就是一个 token。
+        raise ValueError(f"cloudrun.git.{name}: the user name in an ssh or scp-like "
+                         "address must be a short account name such as 'git' "
+                         "(lower-case letters, digits, '_' or '-', at most 32 "
+                         "characters); credentials do not belong in the URL")
+
+
+def url_kind(url: str, name: str = "url") -> str:
+    """``http`` / ``ssh`` / ``local``；不支持或带凭据的 URL 抛 ValueError。"""
+    match = _HTTP_URL_RE.match(url)
+    if match:
+        if "@" in match.group(2):
+            raise ValueError(f"cloudrun.git.{name} must not contain credentials or a "
+                             "user name; use token_secret (container) or the hub's "
+                             "own git credentials (push)")
+        if not match.group(2):
+            raise ValueError(f"cloudrun.git.{name} {redact_url(url)!r} has no host")
+        return "http"
+    if url.lower().startswith("ssh://"):
+        match = _SSH_URL_RE.match(url)
+        if not match:
+            raise ValueError(f"cloudrun.git.{name} {redact_url(url)!r} is not a "
+                             "valid ssh URL "
+                             "(a password in the URL is not allowed)")
+        _check_ssh_user(match.group(1), name)
+        return "ssh"
+    # Windows 盘符路径（C:/...）只在 Windows 上算本地路径；别处 git 把它当 scp 地址。
+    if (_FILE_URL_RE.match(url) or url.startswith("/")
+            or (os.name == "nt" and re.match(r"^[A-Za-z]:/", url))):
+        return "local"
+    if "://" not in url:
+        match = _SCP_URL_RE.match(url)
+        if match:
+            _check_ssh_user(match.group(1), name)
+            return "ssh"
+        raise ValueError(f"cloudrun.git.{name} {redact_url(url)!r} is not a "
+                         "valid scp-like "
+                         "address (user@host:path; a password is not allowed)")
+    raise ValueError(f"cloudrun.git.{name} {redact_url(url)!r}: unsupported URL "
+                     "scheme")
+
+
+def _repo_path(path: str) -> str:
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4].rstrip("/")
+    return path
+
+
+def repo_identity(url: str, name: str = "url") -> tuple[str, str]:
+    """把各种写法归一成 ``(主机, 路径)``，用来判断两个 URL 是不是同一个仓库。
+
+    主机小写、去掉端口和用户名；路径去掉首尾斜杠和 ``.git``。本地路径主机为空，
+    路径经 ``normpath`` 规范化。
+    """
+    kind = url_kind(url, name)
+    if kind == "http":
+        match = _HTTP_URL_RE.match(url)
+        host = match.group(2).lower().split(":", 1)[0]  # 去掉端口
+        return host, _repo_path(match.group(3) or "")
+    if kind == "ssh":
+        match = _SSH_URL_RE.match(url)
+        if match:
+            return match.group(2).lower(), _repo_path(match.group(4))
+        match = _SCP_URL_RE.match(url)
+        return match.group(2).lower(), _repo_path(match.group(3))
+    match = _FILE_URL_RE.match(url)
+    path = match.group(1) if match else url
+    path = os.path.normpath(path).replace("\\", "/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return "", path.rstrip("/") or "/"
+
+
+def is_local_url(url: str) -> bool:
+    try:
+        return url_kind(url) == "local"
+    except ValueError:
+        return False
+
+
+def job_git_prefix(job_id: str) -> str:
+    """任务在远端仓库里的临时 ref 前缀（不是分支，GitHub 页面上看不到）。"""
+    if not _JOB_ID_RE.fullmatch(job_id or ""):
+        raise ValueError(f"job id {job_id!r} cannot be used in a git ref")
+    return f"refs/calltable/jobs/{job_id}"
+
+
+def run_bounded(argv: list[str], *, cwd: str | Path, env: dict[str, str],
+                timeout: float) -> subprocess.CompletedProcess:
+    """在独立会话里跑命令，超时则杀掉**整个进程组**再回收，然后重新抛出
+    ``subprocess.TimeoutExpired``。
+
+    git 会再拉起 ``git-remote-https`` / ``ssh`` 这样的子进程；只杀 git 本身的话，
+    它们可能在清理之后才把推送做完。Windows 上没有进程组，只杀直接子进程。
+    """
+    posix = os.name != "nt"
+    proc = subprocess.Popen(
+        argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        encoding="utf-8", errors="replace", start_new_session=posix)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if posix:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        proc.kill()
+        proc.communicate()
+        raise
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def run_git(args: list[str], *, cwd: str | Path, timeout: float
+            ) -> subprocess.CompletedProcess:
+    """hub 侧跑 git：不交互、不分页、没有控制终端，超时有界。
+
+    hub 用自己进程的 git 凭据（ssh key、credential helper）。``start_new_session``
+    让 ssh 打不开 /dev/tty，要密码 / 确认 host key 时直接失败而不是卡住。
+    """
+    env = os.environ.copy()
+    env.update({"GIT_TERMINAL_PROMPT": "0", "GIT_PAGER": "cat",
+                "GCM_INTERACTIVE": "never"})
+    try:
+        proc = run_bounded(["git", "-c", "core.pager=cat", *args], cwd=cwd,
+                           env=env, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise CloudRunError(f"git {args[0]} timed out after {int(timeout)}s") from exc
+    except OSError as exc:
+        raise CloudRunError(f"git failed to start: {exc}") from exc
+    if proc.returncode != 0:
+        raise CloudRunError(f"git {args[0]} exited {proc.returncode}: "
+                            f"{(proc.stderr or proc.stdout).strip()[-500:]}")
+    return proc
+
+
+# ------------------------------------------------------------------ 仓库可见性
+#: 匿名 ``ls-remote`` 的超时（秒）。
+VISIBILITY_TIMEOUT = 20.0
+#: 「公开 / 私有」结论的缓存时长；「无法确认」更快重试。
+VISIBILITY_TTL = 600.0
+VISIBILITY_UNKNOWN_TTL = 60.0
+PUBLIC, PRIVATE, UNKNOWN, UNCHECKED = "public", "private", "unknown", "unchecked"
+#: 匿名访问失败、且明确表示「要认证 / 匿名看不到」的报错（小写匹配）。
+#: 403 不算：挡在公开仓库前面的代理 / 防火墙也会回 403，认成「私有」就会把
+#: 快照推到公开仓库；它按「无法确认」处理（不推送）。
+_PRIVATE_PATTERNS = re.compile(
+    r"authentication failed|could not read (username|password)"
+    r"|terminal prompts disabled|repository not found"
+    r"|repository '[^']*' not found|returned error: (401|404)"
+    r"|\bhttp (401|404)\b|http basic: access denied"
+    r"|invalid username or password|requested url returned error: 40[14]")
+#: 匿名检查时去掉的环境变量：任何可能带凭据或额外配置的来源。
+_CREDENTIAL_ENV_PREFIXES = ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+_CREDENTIAL_ENV = ("GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG",
+                   "GIT_ASKPASS", "SSH_ASKPASS", "CALLTABLE_GIT_TOKEN",
+                   "CALLTABLE_TOKEN", "GIT_DIR", "GIT_COMMON_DIR",
+                   "XDG_CONFIG_HOME")
+
+
+def is_http_url(url: str) -> bool:
+    return url.lower().startswith(("http://", "https://"))
+
+
+def anonymous_ls_remote(url: str, timeout: float = VISIBILITY_TIMEOUT
+                        ) -> subprocess.CompletedProcess:
+    """不带任何凭据地 ``git ls-remote <url> HEAD``（判断仓库是否匿名可读）。
+
+    关掉所有凭据来源：全局 / 系统 git 配置指向空设备、``credential.helper``
+    清空、``http.extraheader`` 清空、askpass 是一个必定失败的命令、不许终端
+    提示，HOME 换成临时空目录（不读 ~/.netrc），也不在任何仓库里运行。
+    超时 / 启动失败按原样抛出（调用方视为「无法确认」）。
+    """
+    env = {key: value for key, value in os.environ.items()
+           if key not in _CREDENTIAL_ENV
+           and not key.startswith(_CREDENTIAL_ENV_PREFIXES)}
+    with tempfile.TemporaryDirectory(prefix="ct-visibility-") as home:
+        env.update({
+            "HOME": home,
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "false",
+            "SSH_ASKPASS": "false",
+            "GCM_INTERACTIVE": "never",
+            "GIT_PAGER": "cat",
+        })
+        return run_bounded(
+            ["git", "-c", "credential.helper=", "-c", "http.extraheader=",
+             "-c", "core.askPass=false", "-c", "core.pager=cat",
+             "ls-remote", url, "HEAD"],
+            cwd=home, env=env, timeout=timeout)
+
+
+def repo_visibility(url: str) -> tuple[str, str]:
+    """``(结论, 说明)``：public / private / unknown；非 http(s) URL 为 unchecked。"""
+    if not is_http_url(url):
+        return UNCHECKED, "not an http(s) URL"
+    try:
+        proc = anonymous_ls_remote(url, timeout=VISIBILITY_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        return UNKNOWN, f"anonymous ls-remote timed out after {int(VISIBILITY_TIMEOUT)}s"
+    except OSError as exc:
+        return UNKNOWN, f"git failed to start: {exc}"
+    if proc.returncode == 0:
+        return PUBLIC, "anonymous ls-remote succeeded"
+    detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
+    if _PRIVATE_PATTERNS.search(detail.lower()):
+        return PRIVATE, detail
+    return UNKNOWN, detail or f"git ls-remote exited {proc.returncode}"
+
+
+def _one_line(exc: BaseException) -> str:
+    return " ".join(str(exc).split())[:500]
 
 
 def project_image(settings: CloudRunSettings, project: str,
@@ -310,6 +656,10 @@ class Provisioner:
         self._lock = threading.Lock()
         self._last_reconcile: dict[str, float] = {}
         self._budget_warned: dict[str, float] = {}
+        #: URL → (可见性结论, 过期时间)：避免每个任务都多一次网络调用。
+        self._visibility: dict[str, tuple[str, str, float]] = {}
+        #: push_url → 删除远端临时 ref 失败后，下一次允许碰这个远端的时间。
+        self._git_retry_at: dict[str, float] = {}
         self.settings: dict[str, CloudRunSettings] = {}
         for name, spec in hub.config.hosts.items():
             if spec.provider != PROVIDER:
@@ -440,6 +790,7 @@ class Provisioner:
         env = {"CALLTABLE_JOB_ID": job["id"], "CALLTABLE_EXEC_HOST": host}
         if settings.hub_url:
             env["CALLTABLE_HUB_URL"] = settings.hub_url
+        env.update(self._push_git_refs(job))
         try:
             execution = self.api.run_job(
                 settings, cloud_job, env=env,
@@ -456,7 +807,170 @@ class Provisioner:
         print(f"[cloudrun] {job['id']} -> {cloud_job} execution {execution}",
               flush=True)
 
+    # ---- git 中转
+    def _push_git_refs(self, job: dict) -> dict[str, str]:
+        """profile 配了 ``cloudrun.git``：把任务提交（和基线）推成远端临时 ref。
+
+        成功返回要传给 execution 的环境变量；任何失败只打一行警告并返回空，
+        容器照旧从 hub 取 bundle——推送失败绝不能让任务失败。
+        """
+        try:
+            profile = self.hub.hub_profile(job)
+            relay = GitRelay.from_profile(profile.cloudrun if profile else None)
+        except Exception as exc:
+            print(f"[cloudrun] {job['id']}: cloudrun.git ignored: {exc}", flush=True)
+            return {}
+        # hub 正在关闭：不再发起慢速推送，照旧拉起（容器走 hub bundle）。
+        if relay is None or self._closing():
+            return {}
+        # 快照含未提交的改动：仓库匿名可读（例如被改成了公开）就绝不推送；
+        # 确认不了也不推（fail closed）。容器照旧走 hub bundle。
+        verdict, detail = self._repo_visibility(relay.url)
+        if verdict == PUBLIC:
+            print(f"[cloudrun] {job['id']}: refusing to push to {relay.url}: the "
+                  "repository is publicly readable; falling back to hub bundles",
+                  flush=True)
+            return {}
+        if verdict == UNKNOWN:
+            print(f"[cloudrun] {job['id']}: not pushing to {relay.url}: could not "
+                  f"verify that the repository is private ({' '.join(detail.split())[:300]}); "
+                  "falling back to hub bundles", flush=True)
+            return {}
+        if verdict == UNCHECKED and not is_local_url(relay.url):
+            # 校验本应已经拒绝；这里兜底：查不了可见性的网络地址一律不推。
+            print(f"[cloudrun] {job['id']}: not pushing to {relay.url}: only "
+                  "http(s) URLs can be checked for public visibility; falling "
+                  "back to hub bundles", flush=True)
+            return {}
+        if self._closing():
+            return {}
+        try:
+            prefix = job_git_prefix(job["id"])
+            sha = str(job.get("sha") or "")
+            if not sha:
+                raise CloudRunError("job has no commit sha")
+            mirror = self.hub.mirror_dir / f"{job['project']}.git"
+            if not (mirror / "HEAD").exists():
+                raise CloudRunError("the hub has no mirror for this project")
+            refs = {f"{prefix}/head": sha}
+            base = str(job.get("base_ref_sha") or "")
+            # 基线不在 hub 镜像里就只推 head：容器缺基线时照常向 hub 要。
+            if base and gitops.has_commit(mirror, base):
+                refs[f"{prefix}/base"] = base
+            # 先记下计划推的 ref 再推：推送超时但服务端已经收下、只收下一部分、
+            # 或 hub 在推完记录前退出时，正常的清理流程都能把落地的 ref 删掉。
+            self.store.cloud_update(job["id"], git_refs=json.dumps({
+                "project": job["project"], "push_url": relay.push_url,
+                "refs": sorted(refs)}))
+            run_git(["push", "--quiet", "--no-verify", relay.push_url,
+                     *[f"+{value}:{ref}" for ref, value in refs.items()]],
+                    cwd=mirror, timeout=GIT_PUSH_TIMEOUT)
+        except Exception as exc:
+            # 记录保留：清理时把可能已经落地的 ref 删掉（一个都没有就算完成）。
+            print(f"[cloudrun] {job['id']}: git push to {relay.push_url} failed, "
+                  f"falling back to hub bundles: {_one_line(exc)}", flush=True)
+            return {}
+        return {"CALLTABLE_GIT_URL": relay.url, "CALLTABLE_GIT_REFS": prefix}
+
+    def _repo_visibility(self, url: str) -> tuple[str, str]:
+        """带缓存的 :func:`repo_visibility`（公开 / 私有 10 分钟，无法确认 1 分钟）。"""
+        cached = self._visibility.get(url)
+        current = now()
+        if cached is not None and current < cached[2]:
+            return cached[0], cached[1]
+        verdict, detail = repo_visibility(url)
+        if verdict != UNCHECKED:
+            ttl = VISIBILITY_UNKNOWN_TTL if verdict == UNKNOWN else VISIBILITY_TTL
+            self._visibility[url] = (verdict, detail, current + ttl)
+        return verdict, detail
+
+    def _cleanup_git_refs(self, host: str) -> None:
+        """execution 记录关闭后删掉推过的临时 ref；失败的留到以后的对账再试。
+
+        退避按 push_url：一个远端删除失败后，它的其余记录在重试时间前都跳过；
+        每轮最多尝试 ``GIT_CLEANUP_BATCH`` 条，不让清理长时间占住线程。
+        """
+        attempts = 0
+        for row in self.store.cloud_git_pending(host):
+            if self._closing() or attempts >= GIT_CLEANUP_BATCH:
+                return
+            job_id = row["job_id"]
+            try:
+                info = json.loads(row["git_refs"])
+                refs = [str(ref) for ref in info.get("refs") or []]
+                push_url = str(info["push_url"])
+                project = str(info["project"])
+            except (ValueError, KeyError, TypeError, AttributeError):
+                print(f"[cloudrun] {job_id}: unreadable git_refs record dropped",
+                      flush=True)
+                self.store.cloud_update(job_id, git_refs="")
+                continue
+            if now() < self._git_retry_at.get(push_url, 0.0):
+                continue
+            attempts += 1
+            try:
+                self._delete_remote_refs(project, push_url, refs)
+            except Exception as exc:
+                self._git_retry_at[push_url] = now() + GIT_CLEANUP_RETRY
+                ended = float(row["ended"] or now())
+                if now() - ended >= GIT_CLEANUP_MAX_AGE:
+                    self._give_up_git_refs(row, push_url, refs, exc)
+                    continue
+                print(f"[cloudrun] {job_id}: deleting git refs on {push_url} "
+                      f"failed (will retry): {_one_line(exc)}", flush=True)
+                continue
+            self._git_retry_at.pop(push_url, None)
+            self.store.cloud_update(job_id, git_refs="")
+
+    def _give_up_git_refs(self, row: dict, push_url: str, refs: list[str],
+                          exc: BaseException) -> None:
+        """删了一天都删不掉（远端没了、hub 没有凭据……）：不再重试，但把可能
+        残留的 ref 写进日志和 note，供人工处理。"""
+        job_id = row["job_id"]
+        listed = " ".join(refs)
+        print(f"[cloudrun] {job_id}: giving up deleting git refs on {push_url} "
+              f"after {int(GIT_CLEANUP_MAX_AGE // 3600)}h; these refs may still "
+              f"exist there and need manual removal: {listed} "
+              f"(last error: {_one_line(exc)[:200]})", flush=True)
+        note = f"git refs possibly left on {push_url}: {listed}"
+        if row.get("note"):
+            note = f"{note}; {row['note']}"
+        self.store.cloud_update(job_id, git_refs="", note=note[:1000])
+
+    def _delete_remote_refs(self, project: str, push_url: str,
+                            refs: list[str]) -> None:
+        if not refs:
+            return
+        # git push 需要在某个仓库里跑；用 hub 的项目镜像（没有就临时建一个空的）。
+        mirror = self.hub.mirror_for(project)
+        try:
+            run_git(["push", "--quiet", "--no-verify", push_url,
+                     *[f":{ref}" for ref in refs]],
+                    cwd=mirror, timeout=GIT_DELETE_TIMEOUT)
+            return
+        except CloudRunError:
+            # 部分 ref 已经不在（手动删过、上次只删掉一半）时 push 也报错：
+            # 远端已经一个都不剩就算删干净了。
+            listed = run_git(["ls-remote", push_url, *refs], cwd=mirror,
+                             timeout=GIT_LS_REMOTE_TIMEOUT).stdout
+            remaining = {line.split()[-1] for line in listed.splitlines()
+                         if line.strip()}
+            if remaining & set(refs):
+                raise
+
     def _reconcile(self, host: str, settings: CloudRunSettings) -> None:
+        try:
+            self._reconcile_executions(host, settings)
+        finally:
+            # 放在最后：这一轮刚关掉的记录也能马上清理远端 ref。
+            if not self._closing():
+                try:
+                    self._cleanup_git_refs(host)
+                except Exception as exc:  # pragma: no cover - 兜底
+                    print(f"[cloudrun] git cleanup {host}: {type(exc).__name__}: "
+                          f"{exc}", flush=True)
+
+    def _reconcile_executions(self, host: str, settings: CloudRunSettings) -> None:
         current = now()
         describe = (current - self._last_reconcile.get(host, 0.0)
                     >= settings.reconcile_interval)
