@@ -1,0 +1,21 @@
+{
+  "name": "webapp@cloudrun",
+  "project": "webapp",
+  "host": "cloudrun",
+  "slot": "light",
+  "locks": [],
+  "timeout": "45m",
+  "env": {"DOTNET_NOLOGO": "1", "DOTNET_CLI_TELEMETRY_OPTOUT": "1"},
+  "artifacts": ["**/TestResults/*.trx"],
+  "rules": [
+    {"match": "IntegrationTests|gate\\.sh", "slot": "heavy", "timeout": "2h"}
+  ],
+  "cloudrun": {
+    "base_image": "mcr.microsoft.com/dotnet/sdk:10.0",
+    "install": [
+      "apt-get update && apt-get install -y --no-install-recommends python3 git && rm -rf /var/lib/apt/lists/*"
+    ],
+    "env": {"DOTNET_NOLOGO": "1"}
+  },
+  "note": "Example: a .NET project (\"webapp\") on the Cloud Run host. `ct cloudrun image --project webapp` builds the image from this profile; `ct cloudrun jobs --project webapp` prints the light/heavy job definitions."
+}

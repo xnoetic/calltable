@@ -27,6 +27,38 @@
         "windows"
       ],
       "note": "Windows runner (interactive desktop session for UI tests)"
+    },
+    "cloudrun": {
+      "slots": {
+        "heavy": 2,
+        "light": 4
+      },
+      "labels": [
+        "linux",
+        "cloudrun"
+      ],
+      "note": "On-demand Cloud Run executions (one container per job)",
+      "provider": "cloudrun",
+      "cloudrun": {
+        "project": "my-gcp-project",
+        "region": "us-central1",
+        "service_account": "calltable-exec@my-gcp-project.iam.gserviceaccount.com",
+        "hub_url": "http://100.64.0.10:8091",
+        "monthly_budget_usd": 60,
+        "on_budget_exceeded": "queue",
+        "max_task_timeout": "3h",
+        "resources": {
+          "light": {
+            "cpu": 2,
+            "memory": "8Gi"
+          },
+          "heavy": {
+            "cpu": 8,
+            "memory": "32Gi",
+            "disk": "10Gi"
+          }
+        }
+      }
     }
   },
   "exec_host": "runner-a",

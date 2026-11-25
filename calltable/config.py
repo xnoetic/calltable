@@ -27,6 +27,16 @@ class HostSpec:
     slots: dict[str, int] = field(default_factory=dict)
     labels: list[str] = field(default_factory=list)
     note: str = ""
+    #: ``"static"``（默认，常驻执行器）或 ``"cloudrun"``（按需拉起的 Cloud Run
+    #: job 执行）。见 ``calltable/cloudrun.py``。
+    provider: str = "static"
+    #: provider 专属配置（``provider == "cloudrun"`` 时是 Cloud Run 设置）。
+    provider_config: dict = field(default_factory=dict)
+
+    @property
+    def ephemeral(self) -> bool:
+        """执行器是否一次一任务、用完即走（心跳按 worker 对账）。"""
+        return self.provider != "static"
 
 
 @dataclass
@@ -40,6 +50,12 @@ class Config:
     @property
     def hub_url(self) -> str:
         return self.raw.get("hub_url", DEFAULT_HUB_URL).rstrip("/")
+
+    @property
+    def hub_proxy(self) -> str:
+        """执行器访问 hub 时用的 HTTP 代理（``hub_proxy`` / ``CALLTABLE_HUB_PROXY``）。"""
+        return (os.environ.get("CALLTABLE_HUB_PROXY", "").strip()
+                or str(self.raw.get("hub_proxy") or "").strip())
 
     @property
     def owner_tailnet(self) -> str:
@@ -150,11 +166,15 @@ class Config:
             slots = spec.get("slots") or {}
             if isinstance(slots, int):
                 slots = {"default": int(slots)}
+            provider = str(spec.get("provider") or "static").strip().lower()
             result[name] = HostSpec(
                 name=name,
                 slots={str(k): int(v) for k, v in slots.items()},
                 labels=list(spec.get("labels") or []),
                 note=str(spec.get("note") or ""),
+                provider=provider,
+                provider_config=(dict(spec.get(provider) or {})
+                                 if provider != "static" else {}),
             )
         return result
 
@@ -372,7 +392,8 @@ def load_config(explicit: str | None = None, *, require_token: bool = True) -> C
         raise ConfigError(f"cannot read config {path}: {exc}") from exc
     if not isinstance(raw, dict):
         raise ConfigError(f"config {path} must be a JSON object")
-    token = str(raw.get("token") or "").strip()
+    token = (str(raw.get("token") or "").strip()
+             or os.environ.get("CALLTABLE_TOKEN", "").strip())
     if not token and require_token:
         raise ConfigError(
             f"config {path} has no token; run `ct setup --hub {DEFAULT_HUB_URL}`")

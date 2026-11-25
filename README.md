@@ -285,6 +285,113 @@ cp profiles/examples/dotnet@runner-a.json profiles/dotnet@runner-a.json
 `env_files` are sourced with `. <file>` on Linux; a missing file fails the job
 with exit code 97. `artifacts` are worktree-relative globs (`**` supported).
 
+## Cloud Run hosts (on-demand executors)
+
+A host can be backed by Google Cloud Run **jobs** instead of an always-on
+machine. Nothing runs (or bills) while the queue is empty; each job gets a fresh
+container that exits when the job is done.
+
+```json
+"hosts": {
+  "cloudrun": {
+    "slots": {"heavy": 2, "light": 4},
+    "provider": "cloudrun",
+    "cloudrun": {
+      "project": "my-gcp-project",
+      "region": "us-central1",
+      "service_account": "calltable-exec@my-gcp-project.iam.gserviceaccount.com",
+      "hub_url": "http://100.64.0.10:8091",
+      "monthly_budget_usd": 60,
+      "on_budget_exceeded": "queue",
+      "max_task_timeout": "3h",
+      "resources": {
+        "light": {"cpu": 2, "memory": "8Gi"},
+        "heavy": {"cpu": 8, "memory": "32Gi", "disk": "10Gi"}
+      }
+    }
+  }
+}
+```
+
+How it works:
+
+* **Same scheduler.** Slots, locks and drain apply exactly as for any host;
+  `slots` caps how many Cloud Run executions run at once. Target it with
+  `--host cloudrun` (it is not meant to be mixed into a group with static hosts).
+* **Reserve, execute, attach.** The hub janitor reserves a queued job for the
+  host (the job turns `running` with a `pending:` worker), then runs
+  `gcloud run jobs execute ct-<project>-<slot> --async` with
+  `CALLTABLE_JOB_ID` set. The container runs
+  `calltable exec --once --job-id <id>`, which attaches through
+  `POST /api/exec/jobs/<id>/attach` and from then on behaves like any executor
+  (bundle, logs, samples, artifacts, terminal state). Plain `claim` is refused
+  on provider hosts.
+* **Reconciliation.** An execution that ends before its job reported marks the
+  job `error`; an execution that outlives its finished job is cancelled; an
+  execution nobody attaches to within `attach_timeout` (15 min) or whose
+  executor stops heartbeating for `heartbeat_timeout` (15 min) is cancelled and
+  its job fails. Job definitions use `--max-retries=0`, so Cloud Run never
+  re-runs a job calltable already finished.
+* **Timeouts.** Each execution gets `task timeout = job timeout + timeout_grace`
+  (5 min), capped at `max_task_timeout` (default 3 h).
+* **Monthly spend cap.** The hub estimates this month's (UTC) spend from the
+  lifetime of every execution × (vCPU price × vCPU + memory price × GiB), with
+  Cloud Run's one-minute minimum and the us-central1 list prices
+  (`cpu_price` 0.000018 USD/vCPU-s, `memory_price` 0.000002 USD/GiB-s,
+  override for other regions). It ignores the free tier and credits, so it
+  errs high. Once the estimate reaches `monthly_budget_usd` no new executions
+  are launched: jobs stay queued (`on_budget_exceeded: "queue"`) or fail
+  (`"fail"`). Running executions are not interrupted. `ct cloudrun status`
+  (or `GET /api/cloudrun`) shows the month-to-date estimate. Keep a real GCP
+  budget alert as well; this cap is an estimate, not the bill.
+* **Identity.** The hub calls Cloud Run with whatever `gcloud` is logged in as
+  on the hub machine (ADC/user login or a service account such as
+  `calltable-hub@…` with `roles/run.developer` and `iam.serviceAccountUser` on
+  the executor service account). Containers run as `service_account` and
+  only read two Secret Manager secrets: the hub token and a Tailscale auth key.
+
+### Per-project images
+
+calltable owns the executor image. A profile for the Cloud Run host says which
+toolchain the project needs (see `profiles/examples/webapp@cloudrun.json`):
+
+```json
+"cloudrun": {
+  "base_image": "mcr.microsoft.com/dotnet/sdk:10.0",
+  "install": ["apt-get update && apt-get install -y --no-install-recommends python3 git"],
+  "env": {"DOTNET_NOLOGO": "1"},
+  "image": "optional: a prebuilt image instead of <registry>/<project>:latest"
+}
+```
+
+```bash
+ct cloudrun bootstrap --hub-account calltable-hub@PROJECT.iam.gserviceaccount.com   # one-time setup commands
+ct cloudrun image --project webapp            # build context + `gcloud builds submit` (dry run)
+ct cloudrun image --project webapp --builder docker --apply   # or local docker build + push
+ct cloudrun jobs  --project webapp            # light/heavy `gcloud run jobs deploy` (dry run)
+ct cloudrun jobs  --project webapp --apply
+ct cloudrun status
+```
+
+Every `image`/`jobs`/`bootstrap` command only prints what it would run unless
+you pass `--apply`. The generated image is `base_image` + git + Python 3.12+
+(installed if missing) + the profile `install` steps + calltable + Tailscale.
+
+### Reaching the hub: userspace Tailscale
+
+The hub is not exposed to the internet. When `TS_AUTHKEY` is present (job
+definition secret `calltable-tailscale-authkey`), the container entrypoint
+starts `tailscaled --tun=userspace-networking --state=mem:` (no TUN device, an
+ephemeral node that disappears with the container) and points **only** the
+executor's hub client at its local HTTP proxy (`hub_proxy`). The job's own
+network traffic does not go through the tailnet. Use a reusable, ephemeral,
+pre-approved, tagged auth key and the hub's tailnet IP as `hub_url`. Without
+Tailscale, put the hub behind a TLS reverse proxy and use that URL instead.
+
+Cloud Run's filesystem is in memory: checkouts count against the memory
+limit. Give heavy jobs a `disk` (ephemeral disk mounted at `/work`, 10 GiB per
+instance by default) when builds are large.
+
 ## Security
 
 The hub has **one shared bearer token, no user accounts and no TLS**. Bind it to
