@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 732" width="1280" height="732" role="img" aria-labelledby="t d" xml:lang="en">
+<title id="t">calltable Cloud Run hosts</title>
+<desc id="d">Seven-step flow: 1 a job is queued for host cloudrun; 2 the hub reserves the job, slots and locks apply; 3 the hub runs gcloud run jobs execute ct-&lt;project&gt;-&lt;slot&gt; --async; 4 a fresh container boots with an ephemeral userspace Tailscale node; 5 it runs calltable exec --once --job-id &lt;id&gt; and attaches to the hub over Tailscale; 6 it downloads the bundle, runs the command and streams logs, samples and artifacts; 7 it reports the terminal state, the container exits and billing stops. A monthly budget cap (default 120 USD), 15-minute attach and heartbeat timeouts and --max-retries=0 are the guard rails; zero containers run while the queue is empty.</desc>
+<style>:root{--bg:#eef2f8;--panel:#ffffff;--panel2:#f1f5fb;--line:rgba(15,23,42,.12);--text:#101a28;--text2:#33455c;--dim:#5c6d82;--acc:#1f6feb;--acc2:#7048e8;--ok:#0e9f6e;--bad:#d92c2c;--warn:#b7791f;--g1:#2f7fe0;--g2:#7350e6;--tileop:.09;--edgeop:.9;--shadow:rgba(15,23,42,.10);--glow:.10}
+@media (prefers-color-scheme: dark){:root{--bg:#070a10;--panel:#111927;--panel2:#1a2433;--line:rgba(255,255,255,.10);--text:#e9eff7;--text2:#c2cfdd;--dim:#8ea0b5;--acc:#5ba8ff;--acc2:#9b8cff;--ok:#3ddc97;--bad:#ff7070;--warn:#f5b544;--g1:#6cb6ff;--g2:#a99bff;--tileop:.13;--edgeop:.5;--shadow:rgba(0,0,0,.45);--glow:.16}}
+text{font-family:-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, &quot;PingFang SC&quot;, &quot;Noto Sans SC&quot;, &quot;Microsoft YaHei&quot;, sans-serif;}
+.mono{font-family:ui-monospace, SFMono-Regular, &quot;SF Mono&quot;, &quot;Cascadia Mono&quot;, Consolas, monospace;}
+.bg{fill:var(--bg)}
+.panel{fill:var(--panel);stroke:var(--line);stroke-width:1.2}
+.panel2{fill:var(--panel2);stroke:var(--line);stroke-width:1}
+.t{fill:var(--text)} .t2{fill:var(--text2)} .dim{fill:var(--dim)}
+.acc{fill:var(--acc)} .acc2{fill:var(--acc2)} .ok{fill:var(--ok)} .bad{fill:var(--bad)} .warn{fill:var(--warn)}
+.st1{stop-color:var(--g1)} .st2{stop-color:var(--g2)}
+.sa{stop-color:var(--acc)} .sb{stop-color:var(--acc2)}
+.tile{fill-opacity:var(--tileop)} .edge{stroke-opacity:var(--edgeop)}
+.ln{stroke:var(--line)}
+.halo{paint-order:stroke;stroke:var(--bg);stroke-width:6px;stroke-linejoin:round}
+.haloP{paint-order:stroke;stroke:var(--panel);stroke-width:6px;stroke-linejoin:round}
+.ar{fill:none;stroke-width:2;stroke-linecap:round}
+.ar-acc{stroke:var(--acc)} .ar-acc2{stroke:var(--acc2)} .ar-dim{stroke:var(--dim)} .ar-ok{stroke:var(--ok)}
+.mk-acc{fill:var(--acc)} .mk-acc2{fill:var(--acc2)} .mk-dim{fill:var(--dim)} .mk-ok{fill:var(--ok)}
+.flow{stroke-dasharray:7 7;animation:flow 1.4s linear infinite}
+.pulse{animation:pulse 2.4s ease-in-out infinite}
+@keyframes flow{to{stroke-dashoffset:-28}}
+@keyframes pulse{50%{opacity:.55}}
+@media (prefers-reduced-motion: reduce){.flow,.pulse{animation:none}}</style>
+<defs>
+<linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1"><stop class="st1" offset="0"/><stop class="st2" offset="1"/></linearGradient>
+<radialGradient id="glowA"><stop class="sa" offset="0" stop-opacity=".9"/><stop class="sa" offset="1" stop-opacity="0"/></radialGradient>
+<radialGradient id="glowB"><stop class="sb" offset="0" stop-opacity=".9"/><stop class="sb" offset="1" stop-opacity="0"/></radialGradient>
+<pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.2" style="fill:var(--dim)" opacity=".22"/></pattern>
+<filter id="shadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="8" stdDeviation="12" style="flood-color:var(--shadow)"/></filter>
+<marker id="ah-acc" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-acc"/></marker><marker id="ah-acc2" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-acc2"/></marker><marker id="ah-dim" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-dim"/></marker><marker id="ah-ok" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-ok"/></marker>
+<symbol id="mark" viewBox="0 0 40 40">
+<rect class="tile" x="1.5" y="1.5" width="37" height="37" rx="11" fill="url(#brandGrad)"/>
+<rect class="edge" x="1.5" y="1.5" width="37" height="37" rx="11" fill="none" stroke="url(#brandGrad)"/>
+<path d="M11 10h12.6a2 2 0 0 1 2 2v3.4a2.8 2.8 0 0 0 0 5.6V26a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2v-5a2.8 2.8 0 0 0 0-5.6V12a2 2 0 0 1 2-2Z" fill="none" stroke="url(#brandGrad)" stroke-width="1.7" stroke-linejoin="round"/>
+<path d="M15.7 11.4v15.2" stroke="url(#brandGrad)" stroke-width="1.3" stroke-dasharray="1.8 2.4" opacity=".75"/>
+<path d="M19.6 15.2h5.2M19.6 19h5.2M19.6 22.8h3.2" stroke="url(#brandGrad)" stroke-width="1.7" stroke-linecap="round"/>
+</symbol>
+<linearGradient id="gaugeGrad" gradientUnits="userSpaceOnUse" x1="1015.0" y1="0" x2="1175.0" y2="0"><stop class="st1" offset="0"/><stop class="st2" offset="1"/></linearGradient><linearGradient id="numGrad" x1="0" y1="0" x2="1" y2="1"><stop class="st1" offset="0"/><stop class="st2" offset="1"/></linearGradient>
+</defs>
+<rect class="bg" x="0" y="0" width="1280" height="732" rx="20"/>
+<circle cx="480" cy="460" r="400" fill="url(#glowA)" style="opacity:var(--glow)"/>
+<circle cx="1100" cy="200" r="280" fill="url(#glowB)" style="opacity:var(--glow)"/>
+<text x="40" y="54" class="t" font-size="28" font-weight="700">Cloud Run hosts: executors on demand</text>
+<rect x="40" y="76" width="340" height="636" rx="16" style="fill:var(--acc);fill-opacity:.06"/>
+<rect x="580" y="76" width="340" height="636" rx="16" style="fill:var(--acc2);fill-opacity:.07"/>
+<text x="210" y="108" text-anchor="middle" font-size="20"><tspan class="t mono" font-weight="700">hub</tspan><tspan class="dim" font-size="18">  ·  private network</tspan></text>
+<text x="750" y="108" class="t" font-size="20" text-anchor="middle" font-weight="700">Google Cloud Run</text>
+<path d="M210 124V696" class="ln" stroke-width="2" stroke-dasharray="2 6" stroke-linecap="round"/>
+<path d="M750 124V696" class="ln" stroke-width="2" stroke-dasharray="2 6" stroke-linecap="round"/>
+<rect x="402" y="424" width="156" height="234" rx="22" style="fill:var(--ok);fill-opacity:.07;stroke:var(--ok);stroke-opacity:.55" stroke-width="1.4" stroke-dasharray="6 6"/>
+<path d="M480 408V424" style="stroke:var(--ok);stroke-opacity:.55" stroke-width="1.4"/>
+<rect x="392" y="354" width="176" height="54" rx="14" class="panel"/>
+<rect x="392" y="354" width="176" height="54" rx="14" fill="none" style="stroke:var(--ok);stroke-opacity:.6" stroke-width="1.4"/>
+<text x="480" y="376" class="ok" font-size="18" text-anchor="middle" font-weight="700">Tailscale</text>
+<text x="480" y="398" class="dim" font-size="17" text-anchor="middle">hub traffic only</text>
+<rect x="60.0" y="126" width="300" height="40" rx="12" class="panel"/>
+<circle cx="86.0" cy="146.0" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="86.0" y="151.76" class="t" font-size="16" text-anchor="middle" font-weight="700">1</text>
+<text x="112.0" y="152" font-size="18" class="t" font-weight="600">job queued for <tspan class="mono acc2">cloudrun</tspan></text>
+<rect x="60.0" y="180" width="300" height="64" rx="12" class="panel"/>
+<circle cx="86.0" cy="202" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="86.0" y="207.76" class="t" font-size="16" text-anchor="middle" font-weight="700">2</text>
+<text x="112.0" y="208" class="t" font-size="18" font-weight="600">hub reserves the job</text>
+<text x="112.0" y="232" class="dim" font-size="18">slots and locks apply</text>
+<circle cx="210" cy="300" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="210" y="305.76" class="t" font-size="16" text-anchor="middle" font-weight="700">3</text>
+<path d="M228 300L746 300" class="ar ar-acc2 flow" marker-end="url(#ah-acc2)"/>
+<text x="480" y="288" class="acc2 mono" font-size="18" text-anchor="middle" font-weight="600">gcloud run jobs execute</text>
+<text x="480" y="326" class="dim mono" font-size="18" text-anchor="middle">ct-&lt;project&gt;-&lt;slot&gt; --async</text>
+<rect x="600.0" y="350" width="300" height="64" rx="12" class="panel"/>
+<circle cx="626.0" cy="372" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="626.0" y="377.76" class="t" font-size="16" text-anchor="middle" font-weight="700">4</text>
+<text x="652.0" y="378" class="t" font-size="18" font-weight="600">fresh container boots</text>
+<text x="652.0" y="402" class="dim" font-size="18">ephemeral Tailscale node</text>
+<circle cx="750" cy="468" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="750" y="473.76" class="t" font-size="16" text-anchor="middle" font-weight="700">5</text>
+<path d="M732 468L214 468" class="ar ar-ok" marker-end="url(#ah-ok)"/>
+<text x="480" y="456" class="t mono" font-size="18" text-anchor="middle">calltable exec --once --job-id &lt;id&gt;</text>
+<text x="480" y="494" class="dim mono" font-size="18" text-anchor="middle">POST /api/exec/jobs/&lt;id&gt;/attach</text>
+<rect x="600.0" y="522" width="300" height="64" rx="12" class="panel"/>
+<circle cx="626.0" cy="544" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="626.0" y="549.76" class="t" font-size="16" text-anchor="middle" font-weight="700">6</text>
+<text x="652.0" y="550" class="t" font-size="18" font-weight="600">run the command</text>
+<text x="652.0" y="574" class="dim" font-size="18">stream logs and samples</text>
+<path d="M214 538L596 538" class="ar ar-ok" marker-end="url(#ah-ok)"/>
+<path d="M596 570L214 570" class="ar ar-ok flow" marker-end="url(#ah-ok)"/>
+<text x="400" y="528" class="t2" font-size="18" text-anchor="middle">bundle</text>
+<text x="400" y="594" class="t2" font-size="18" text-anchor="middle">logs · samples · artifacts</text>
+<circle cx="750" cy="642" r="14" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="750" y="647.76" class="t" font-size="16" text-anchor="middle" font-weight="700">7</text>
+<path d="M732 642L214 642" class="ar ar-ok" marker-end="url(#ah-ok)"/>
+<text x="480" y="630" class="t2" font-size="18" text-anchor="middle">report terminal state</text>
+<path d="M750 656V666" class="ln" stroke-width="2"/>
+<rect x="601.9" y="666" width="296.2" height="34" rx="17" style="fill:var(--ok);fill-opacity:.14;stroke:var(--ok);stroke-opacity:.5"/>
+<path d="M619.9 683l4 4 8-8" fill="none" style="stroke:var(--ok)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+<text x="641.9" y="689" class="ok" font-size="18" font-weight="700">container exits · billing stops</text>
+<rect x="950" y="76" width="290" height="300" rx="16" class="panel"/>
+<text x="972" y="112" class="t" font-size="20" font-weight="700">monthly budget cap</text>
+<path d="M1015.0 228A80 80 0 0 1 1175.0 228" fill="none" class="ln" stroke-width="14" stroke-linecap="round"/>
+<path d="M1015.0 228A80 80 0 0 1 1124.4 153.6" fill="none" stroke="url(#gaugeGrad)" stroke-width="14" stroke-linecap="round"/>
+<text x="1095.0" y="218" class="t" font-size="28" text-anchor="middle" font-weight="700">120 USD</text>
+<text x="1095.0" y="244" class="dim" font-size="18" text-anchor="middle">default cap</text>
+<text x="972" y="282" class="acc mono" font-size="18">monthly_budget_usd</text>
+<text x="972" y="312" class="t2" font-size="18">at cap: new jobs wait or fail,</text>
+<text x="972" y="336" class="t2" font-size="18">running jobs finish</text>
+<rect x="950" y="390" width="290" height="104" rx="16" class="panel"/>
+<text x="978" y="462" font-size="60" font-weight="700" fill="url(#numGrad)">0</text>
+<text x="1034" y="436" class="t" font-size="18" font-weight="600">containers while</text>
+<text x="1034" y="462" class="t2" font-size="18">the queue is empty</text>
+<rect x="950" y="508" width="290" height="204" rx="16" class="panel"/>
+<text x="972" y="544" class="t" font-size="20" font-weight="700">guard rails</text>
+<text x="972" y="584" class="t2" font-size="18">attach timeout</text>
+<text x="1218" y="584" class="t mono" font-size="18" text-anchor="end">15 min</text>
+<text x="972" y="620" class="t2" font-size="18">heartbeat timeout</text>
+<text x="1218" y="620" class="t mono" font-size="18" text-anchor="end">15 min</text>
+<text x="972" y="656" class="acc mono" font-size="18">--max-retries=0</text>
+</svg>
