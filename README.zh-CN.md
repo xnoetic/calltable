@@ -275,10 +275,11 @@ ct cloudrun status     # 本月至今的估算花费、预算、活跃的 execut
 }
 ```
 
-* `url`：写了就开启；容器和镜像构建都从它取代码。
-* `push_url`（默认同 `url`）：hub 往这里推，用的是 hub 进程自己的 git 凭据（ssh key 或 credential helper）；git 以非交互方式运行并带超时。
+* `url`：写了就开启；容器和镜像构建都从它取代码。必须是 `http://` 或 `https://` URL（本地路径或 `file://` URL 也可以，用于测试和本机环境）；ssh 和 `git@host:path` 形式会被拒绝。
+* `push_url`（默认同 `url`）：hub 往这里推，用的是 hub 进程自己的 git 凭据（ssh key 或 credential helper）；git 以非交互方式运行并带超时。可以用 ssh 或 `git@host:path`，但必须和 `url` 指向同一个仓库（主机和路径相同；不看协议、端口、用户名、主机大小写和 `.git` 后缀）。
+* 两个 URL 里都不能带凭据：http(s) URL 不能带用户名或 token，ssh URL 不能带口令（只写 `git@` 这样的用户名可以）。
 * `branch`（默认 `main`）：打进镜像的分支。
-* `token_secret`：Secret Manager 里的 secret 名称，内容是一个有读权限的 HTTPS token。没写这个键时用主机级默认值 `hosts.<name>.cloudrun.git_token_secret`（多个项目共用一个 token 时方便）；显式写 `""` 或 `null` 表示不用 token（公开仓库或 ssh URL）。要把 `roles/secretmanager.secretAccessor` 授给执行器服务账号（运行时用；`ct cloudrun jobs` 会把 `CALLTABLE_GIT_TOKEN` 加进 `--set-secrets`）和 Cloud Build 的服务账号（构建镜像时用）。
+* `token_secret`：Secret Manager 里的 secret 名称，内容是一个有读权限的 HTTPS token。没写这个键时用主机级默认值 `hosts.<name>.cloudrun.git_token_secret`（多个项目共用一个 token 时方便）；显式写 `""` 或 `null` 表示不注入 token。要把 `roles/secretmanager.secretAccessor` 授给执行器服务账号（运行时用；`ct cloudrun jobs` 会把 `CALLTABLE_GIT_TOKEN` 加进 `--set-secrets`）和 Cloud Build 的服务账号（构建镜像时用）。
 
 流程：
 
@@ -289,7 +290,7 @@ ct cloudrun status     # 本月至今的估算花费、预算、活跃的 execut
 任何一步失败（推送、取代码、缺提交）都会回退到 hub bundle，不会让任务失败。
 
 > **只对私有仓库开启。** 任务快照里有未提交、未跟踪的改动。推到公开仓库的话，任务运行期间任何人都能取到；ref 删除后的一段时间里，提交仍可能凭 id 被取到。
-> 作为保护，每次推送前 hub 会在关闭所有凭据来源的情况下，对 `http(s)` 的 `url` 匿名执行 `git ls-remote`（结果缓存 10 分钟）：成功说明仓库公开，不推送；无法确认可见性（超时、网络错误、无法识别的报错）时同样不推送（fail closed）。两种情况任务都改用 hub bundle。ssh、`git@host:path` 和本地路径形式的 URL 不做这项检查。
+> 作为保护，每次推送前 hub 会在关闭所有凭据来源的情况下，对 `http(s)` 的 `url` 匿名执行 `git ls-remote`（结果缓存 10 分钟）：成功说明仓库公开，不推送；无法确认可见性（超时、网络错误、无法识别的报错、HTTP 403）时同样不推送（fail closed）。两种情况任务都改用 hub bundle。因为只有 http(s) 能检查，`url` 必须是 http(s)；本地路径不检查（它不可能是公网仓库）。
 
 ### 通过 userspace Tailscale 访问 hub
 

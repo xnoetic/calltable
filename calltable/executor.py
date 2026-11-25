@@ -58,8 +58,11 @@ OOM_SCORE_ADJ_PATH = "/proc/self/oom_score_adj"
 #: 由 Secret Manager 注入容器环境）。``CALLTABLE_GIT_TOKEN`` 是从远端仓库
 #: （GitHub）取代码用的只读 token。
 HUB_CREDENTIAL_ENV = ("CALLTABLE_TOKEN", "TS_AUTHKEY", "CALLTABLE_GIT_TOKEN")
-#: 从远端仓库取 hub 推过去的临时 ref 的超时上限（秒，另受任务截止时间约束）。
-GIT_RELAY_FETCH_TIMEOUT = 900.0
+#: 从远端仓库取 hub 推过去的临时 ref 的超时上限（秒）。另外最多只用剩余预算的
+#: 一半：远端卡住时超时后还有时间回退到 hub bundle，而不是整个任务超时。
+GIT_RELAY_FETCH_TIMEOUT = 300.0
+#: 剩余预算的一半不到这么多秒就不试远端，直接走 hub bundle。
+GIT_RELAY_MIN_TIMEOUT = 1.0
 #: hub 推送的临时 ref 前缀（``refs/calltable/jobs/<job id>``）。
 _GIT_RELAY_REFS_RE = re.compile(r"^refs/calltable/jobs/[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -681,8 +684,10 @@ class Executor:
                 raise RuntimeError(f"bad CALLTABLE_GIT_REFS {refs!r}")
             if url.startswith("-"):
                 raise RuntimeError("bad CALLTABLE_GIT_URL")
-            remaining = deadline - time.time()
-            if remaining <= 0:
+            budget = min(GIT_RELAY_FETCH_TIMEOUT, (deadline - time.time()) / 2)
+            if budget < GIT_RELAY_MIN_TIMEOUT:
+                print(f"[exec] {job_id}: git relay skipped: not enough time left; "
+                      "using hub bundles", flush=True)
                 return False
             env = {"GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}
             if token:
@@ -699,7 +704,7 @@ class Executor:
             gitops.git(["-C", str(mirror), "fetch", "--no-tags", "--quiet", url,
                         f"+{refs}/*:refs/calltable/relay/*"],
                        env=env, input_data="",
-                       timeout=max(1.0, min(remaining, GIT_RELAY_FETCH_TIMEOUT)))
+                       timeout=budget)
             if not gitops.has_commit(mirror, sha):
                 print(f"[exec] {job_id}: git relay: commit {sha[:12]} not in "
                       f"{refs}; falling back to hub bundles", flush=True)

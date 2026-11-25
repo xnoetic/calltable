@@ -372,15 +372,22 @@ instead. Opt in per project in the profile:
 ```
 
 * `url` enables the feature; the container and the image build fetch from it.
+  It must be an `http://` or `https://` URL (a local path or `file://` URL is
+  also accepted, for tests and local setups); ssh and `git@host:path` forms
+  are rejected.
 * `push_url` (default `url`) is where the hub pushes, using the hub process's
   own git credentials (ssh key or credential helper); git runs
-  non-interactively with a timeout.
+  non-interactively with a timeout. It may use ssh or `git@host:path`, but it
+  must name the same repository as `url` (same host and path, ignoring the
+  scheme, port, user name, case of the host and a `.git` suffix).
+* Neither URL may contain credentials: no user name or token in http(s) URLs,
+  no password in ssh URLs (a bare `git@` user is fine).
 * `branch` (default `main`) is the branch baked into the image.
 * `token_secret` names a Secret Manager secret holding an HTTPS token with read
   access. If the key is absent, the host-level default
   `hosts.<name>.cloudrun.git_token_secret` is used (handy when several
-  projects share one token); an explicit `""` or `null` means no token (public
-  repository or ssh URL). Grant `roles/secretmanager.secretAccessor` on it to
+  projects share one token); an explicit `""` or `null` means no token is
+  injected. Grant `roles/secretmanager.secretAccessor` on it to
   the executor service account (run time; `ct cloudrun jobs` adds
   `CALLTABLE_GIT_TOKEN` to `--set-secrets`) and to the Cloud Build service
   account (image build).
@@ -414,9 +421,10 @@ fails the job.
 > against an `http(s)` `url` with every credential source disabled (result
 > cached for 10 minutes): if it succeeds the repository is public and nothing
 > is pushed; if visibility cannot be confirmed (timeout, network error,
-> unrecognised reply) it also does not push (fail closed). Either way the job
-> uses hub bundles instead. ssh, `git@host:path` and filesystem URLs are not
-> checked.
+> unrecognised reply, HTTP 403) it also does not push (fail closed). Either way
+> the job uses hub bundles instead. Because only http(s) can be checked, `url`
+> must be http(s); local paths are not checked (they cannot be a public network
+> repository).
 
 ### Reaching the hub: userspace Tailscale
 

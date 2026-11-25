@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -762,6 +763,63 @@ class GitRelayFetchTests(unittest.TestCase):
         self.assertIn("git relay fetch failed", out)
         self.assertNotIn(self.TOKEN, out)
         self.assertNotIn(self.TOKEN, json.dumps(finish))
+
+    def fetch_times_out(self):
+        """远端卡住：fetch 用完给它的超时后抛 TimeoutExpired。"""
+        seen = []
+        real = executor_module.gitops.git
+
+        def git(args, *a, **kwargs):
+            if "fetch" in args and kwargs.get("timeout") is not None \
+                    and "refs/calltable/relay" in args[-1]:
+                seen.append(kwargs["timeout"])
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+            return real(args, *a, **kwargs)
+
+        return seen, mock.patch.object(executor_module.gitops, "git", side_effect=git)
+
+    def test_fetch_timeout_uses_at_most_half_the_budget(self):
+        seen, patch = self.fetch_times_out()
+        with patch:
+            finish, out = self.run_job(self.relay_env(), timeout=120)
+        self.assertEqual(len(seen), 1)
+        self.assertLessEqual(seen[0], 60.0)
+        self.assertGreater(seen[0], 50.0)
+        # 超时后预算还剩一半：回退到 hub bundle，任务成功而不是超时。
+        self.assertEqual(finish["status"], "succeeded", finish)
+        self.assertEqual(self.client.downloads, ["/api/jobs/job-relay/bundle"])
+        self.assertIn("git relay fetch failed", out)
+        self.assertIn("TimeoutExpired", out)
+
+    def test_fetch_timeout_is_capped(self):
+        seen, patch = self.fetch_times_out()
+        with patch:
+            finish, _ = self.run_job(self.relay_env(), timeout=6 * 3600)
+        self.assertEqual(seen, [executor_module.GIT_RELAY_FETCH_TIMEOUT])
+        self.assertLessEqual(executor_module.GIT_RELAY_FETCH_TIMEOUT, 300)
+        self.assertEqual(finish["status"], "succeeded", finish)
+
+    @unittest.skipIf(os.name == "nt", "uses the POSIX sleep command")
+    def test_hung_fetch_really_falls_back_to_bundles(self):
+        # 不联网地模拟卡住的远端：fetch 换成一个长 sleep 的真实子进程，
+        # 剩余预算的一半一到就被杀掉，之后仍有时间走 hub bundle。
+        seen = []
+        real_run = subprocess.run
+
+        def slow(argv, *a, **kwargs):
+            if "fetch" in argv and any("refs/calltable/relay" in x for x in argv):
+                seen.append(kwargs.get("timeout"))
+                return real_run(["sleep", "30"], *a, **{**kwargs, "input": None})
+            return real_run(argv, *a, **kwargs)
+
+        with mock.patch.object(executor_module.gitops.subprocess, "run",
+                               side_effect=slow):
+            started = time.time()
+            finish, out = self.run_job(self.relay_env(), timeout=10)
+        self.assertLess(time.time() - started, 25)
+        self.assertLessEqual(seen[0], 5.0)
+        self.assertEqual(finish["status"], "succeeded", finish)
+        self.assertIn("git relay fetch failed", out)
 
     def test_git_token_is_not_in_the_job_env(self):
         job = {"id": "job-secret", "project": "p", "host": "runner-a"}

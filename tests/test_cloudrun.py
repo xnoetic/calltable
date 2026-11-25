@@ -1094,7 +1094,10 @@ class GitRelayHubTests(GitRelayBase):
         self.assertEqual(len(warnings), 1, out)
         self.assertTrue(warnings[0].startswith(f"[cloudrun] {job['id']}: "))
         self.assertIn("falling back to hub bundles", warnings[0])
-        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+        # 计划推的 ref 先记下了：清理流程会处理（一个都没落地就算完成）。
+        prefix = f"refs/calltable/jobs/{job['id']}"
+        self.assertEqual(json.loads(self.store.cloud_executions()[0]["git_refs"])
+                         ["refs"], [f"{prefix}/base", f"{prefix}/head"])
 
     def test_missing_base_pushes_head_only(self):
         job = self.submit(sha=self.sha, base_ref="origin/main",
@@ -1166,10 +1169,26 @@ class GitRelayVisibilityTests(GitRelayBase):
     """推送前匿名 ls-remote：公开 / 无法确认都不推；私有照推；结论按 URL 缓存。"""
 
     URL = "https://git.example.invalid/o/demo.git"
+    PUSH_URL = "git@git.example.invalid:o/demo.git"
 
     def profile_git(self):
         self.remote = Path(self.tmp.name) / "remote.git"
-        return {"url": self.URL, "push_url": str(self.remote)}
+        return {"url": self.URL, "push_url": self.PUSH_URL}
+
+    def setUp(self):
+        super().setUp()
+        # push_url 必须和 url 是同一个仓库；测试里把对它的 git 调用改投到本地
+        # 裸仓库（不联网）。
+        real_run_git = cloudrun.run_git
+
+        def redirect(args, **kwargs):
+            args = [str(self.remote) if arg == self.PUSH_URL else arg
+                    for arg in args]
+            return real_run_git(args, **kwargs)
+
+        patch = mock.patch.object(cloudrun, "run_git", side_effect=redirect)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def fake_ls_remote(self, code=0, stderr="", exc=None):
         calls = []
@@ -1293,7 +1312,7 @@ class GitRelayVisibilityTests(GitRelayBase):
                                      cloudrun.UNCHECKED)
                 check.assert_not_called()
 
-    def test_local_push_url_does_not_bypass_the_check(self):
+    def test_ssh_push_url_does_not_bypass_the_check(self):
         # 检查的是容器取代码的 url，不是 push_url。
         calls, patch = self.fake_ls_remote(code=0)
         with patch, contextlib.redirect_stdout(io.StringIO()):
@@ -1358,6 +1377,255 @@ class AnonymousLsRemoteTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": str(gitconfig)}):
                 proc = cloudrun.anonymous_ls_remote(alias, timeout=20)
             self.assertNotEqual(proc.returncode, 0)
+
+class GitRelayUrlRulesTests(unittest.TestCase):
+    """评审修复 1-3：url 只能是 http(s) / 本地路径；URL 里不许有凭据；
+    push_url 必须和 url 是同一个仓库。"""
+
+    def relay(self, url, push_url=None):
+        git_settings = {"url": url}
+        if push_url is not None:
+            git_settings["push_url"] = push_url
+        return cloudrun.GitRelay.from_profile({"git": git_settings})
+
+    def test_url_must_be_http_or_a_local_path(self):
+        for url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r.git",
+                    "github.com:o/r.git", "git://github.com/o/r.git",
+                    "ftp://github.com/o/r.git"):
+            with self.subTest(url=url):
+                with self.assertRaises(ValueError):
+                    self.relay(url)
+        for url in ("https://github.com/o/r.git", "http://git.internal/o/r",
+                    "/srv/git/r.git", "file:///srv/git/r.git"):
+            with self.subTest(url=url):
+                self.assertEqual(self.relay(url).url, url)
+
+    def test_ssh_or_scp_push_url_is_still_allowed(self):
+        for push_url in ("git@github.com:o/r.git", "ssh://git@github.com/o/r.git",
+                         "ssh://git@GitHub.com:22/o/r", "https://github.com/o/r"):
+            with self.subTest(push_url=push_url):
+                self.assertEqual(
+                    self.relay("https://github.com/o/r.git", push_url).push_url,
+                    push_url)
+
+    def test_no_credentials_in_urls(self):
+        token = "ghp_SECRETTOKEN123"
+        cases = [(f"https://{token}@github.com/o/r.git", None),
+                 (f"https://x-access-token:{token}@github.com/o/r.git", None),
+                 ("https://user@github.com/o/r.git", None),
+                 ("https://github.com/o/r.git", f"https://{token}@github.com/o/r.git"),
+                 ("https://github.com/o/r.git", f"ssh://git:{token}@github.com/o/r.git"),
+                 ("https://github.com/o/r.git", f"git:{token}@github.com:o/r.git")]
+        for url, push_url in cases:
+            with self.subTest(url=url, push_url=push_url):
+                with self.assertRaises(ValueError) as ctx:
+                    self.relay(url, push_url)
+                self.assertNotIn(token, str(ctx.exception))
+
+    def test_push_url_must_name_the_same_repository(self):
+        url = "https://github.com/o/r.git"
+        for push_url in ("git@github.com:o/other.git", "git@gitlab.com:o/r.git",
+                         "https://github.com/x/r.git", "/srv/git/r.git"):
+            with self.subTest(push_url=push_url):
+                with self.assertRaises(ValueError) as ctx:
+                    self.relay(url, push_url)
+                self.assertIn("same repository", str(ctx.exception))
+        for push_url in ("git@GITHUB.com:o/r", "ssh://git@github.com:22/o/r.git/",
+                         "https://github.com/o/r/", "https://github.com:443/o/r"):
+            with self.subTest(push_url=push_url):
+                self.relay(url, push_url)
+        self.relay("/srv/git/r.git", "file:///srv/git/../git/r.git/")
+        with self.assertRaises(ValueError):
+            self.relay("/srv/git/r.git", "/srv/git/other.git")
+
+    def test_backslash_is_rejected(self):
+        with self.assertRaises(ValueError):
+            self.relay("https://github.com/o\\r.git")
+
+
+class GitRelayRuleEnforcementTests(GitRelayBase):
+    def write_git(self, git_settings):
+        path = self.root / "profiles" / "demo@cloudrun.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["cloudrun"]["git"] = git_settings
+        path.write_text(json.dumps(data), encoding="utf-8")
+        from calltable.profiles import load_profiles
+        self.hub.profiles = load_profiles(self.config.profiles_dir)
+
+    def test_hub_ignores_an_ssh_url(self):
+        self.write_git({"url": "git@github.com:o/demo.git"})
+        with mock.patch.object(cloudrun, "run_git") as git_call, \
+                mock.patch.object(cloudrun, "anonymous_ls_remote") as check:
+            job, out = self.launch()
+        git_call.assert_not_called()
+        check.assert_not_called()
+        self.assertIn(f"[cloudrun] {job['id']}: cloudrun.git ignored", out)
+        self.assertNotIn("CALLTABLE_GIT_URL", self.api.runs[0]["env"])
+
+    def test_unchecked_network_url_is_refused_even_if_validation_is_bypassed(self):
+        self.write_git({"url": "git@github.com:o/demo.git"})
+        with mock.patch.object(cloudrun.GitRelay, "validate"), \
+                mock.patch.object(cloudrun, "run_git") as git_call:
+            job, out = self.launch()
+        git_call.assert_not_called()
+        self.assertIn("only http(s) URLs can be checked", out)
+        self.assertNotIn("CALLTABLE_GIT_URL", self.api.runs[0]["env"])
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_token_in_url_never_reaches_the_launch(self):
+        token = "ghp_SECRETTOKEN123"
+        self.write_git({"url": f"https://{token}@github.com/o/demo.git"})
+        with mock.patch.object(cloudrun, "run_git") as git_call:
+            job, out = self.launch()
+        git_call.assert_not_called()
+        self.assertNotIn(token, out)
+        self.assertNotIn(token, json.dumps(self.api.runs[0]["env"]))
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_cli_rejects_ssh_url_and_mismatched_push_url(self):
+        for git_settings, fragment in (
+                ({"url": "git@github.com:o/demo.git"}, "must be an http(s)"),
+                ({"url": "https://github.com/o/demo.git",
+                  "push_url": "git@github.com:o/other.git"}, "same repository")):
+            with self.subTest(git_settings=git_settings):
+                self.write_git(git_settings)
+                for action in (("jobs", "--project", "demo"),
+                               ("image", "--project", "demo", "--context",
+                                str(self.root / "ctx-rules"))):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), \
+                            mock.patch.object(cloudrun_cli.subprocess, "call") as call:
+                        code, _ = CliTests.run_cli(self, *action)
+                    self.assertEqual(code, 2, action)
+                    call.assert_not_called()
+                    self.assertIn(fragment, err.getvalue())
+
+
+class GitRelayCleanupSafetyTests(GitRelayBase):
+    """评审修复 4-5：先记录再推；清理超时短、按远端退避、每轮限量。"""
+
+    def pending_row(self, job_id, push_url, ref_names=("head",)):
+        self.store.cloud_record_launch(job_id, "cloudrun", cloud_job="ct-demo-light",
+                                       vcpu=1, memory_gib=1)
+        self.store.cloud_update(job_id, ended=now(), state="ended",
+                                git_refs=json.dumps({
+                                    "project": "demo", "push_url": push_url,
+                                    "refs": [f"refs/calltable/jobs/{job_id}/{name}"
+                                             for name in ref_names]}))
+
+    def test_refs_are_recorded_before_the_push(self):
+        seen = []
+        real = cloudrun.run_git
+
+        def spy(args, **kwargs):
+            if args[0] == "push":
+                row = self.store.cloud_executions()[0]
+                seen.append((row["git_refs"], kwargs["timeout"]))
+            return real(args, **kwargs)
+
+        with mock.patch.object(cloudrun, "run_git", side_effect=spy):
+            job, _ = self.launch()
+        self.assertEqual(len(seen), 1)
+        self.assertNotEqual(seen[0][0], "")
+        self.assertEqual(seen[0][1], cloudrun.GIT_PUSH_TIMEOUT)
+        self.assertLessEqual(cloudrun.GIT_PUSH_TIMEOUT, 120)
+
+    def test_push_that_landed_but_reported_failure_is_cleaned_up(self):
+        real = cloudrun.run_git
+
+        def applied_then_timed_out(args, **kwargs):
+            result = real(args, **kwargs)
+            if args[0] == "push" and not any(a.startswith(":") for a in args):
+                raise cloudrun.CloudRunError("git push timed out after 120s")
+            return result
+
+        with mock.patch.object(cloudrun, "run_git",
+                               side_effect=applied_then_timed_out):
+            job, out = self.launch()
+        self.assertIn("falling back to hub bundles", out)
+        self.assertNotIn("CALLTABLE_GIT_URL", self.api.runs[0]["env"])
+        self.assertEqual(len(self.remote_refs()), 2)  # 实际落地了
+        self.close(job)
+        self.assertEqual(self.remote_refs(), {})
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_partial_push_is_cleaned_up(self):
+        # 服务端只收下 head（例如 base 被拒）：记录里两个 ref 都在，清理后不剩。
+        prefix_holder = {}
+        real = cloudrun.run_git
+
+        def head_only(args, **kwargs):
+            if args[0] == "push" and not any(a.startswith(":") for a in args):
+                heads = [a for a in args if a.endswith("/head")]
+                prefix_holder["head"] = heads[0]
+                real([*args[:4], *heads], **kwargs)
+                raise cloudrun.CloudRunError("! [remote rejected] .../base")
+            return real(args, **kwargs)
+
+        with mock.patch.object(cloudrun, "run_git", side_effect=head_only):
+            job, _ = self.launch()
+        self.assertEqual(len(self.remote_refs()), 1)
+        out = self.close(job)
+        self.assertEqual(self.remote_refs(), {})
+        self.assertNotIn("will retry", out)
+
+    def test_cleanup_uses_short_timeouts(self):
+        self.pending_row("job-x", str(self.remote))
+        timeouts = []
+        real = cloudrun.run_git
+
+        def spy(args, **kwargs):
+            timeouts.append((args[0], kwargs["timeout"]))
+            if args[0] == "push":
+                raise cloudrun.CloudRunError("remote ref does not exist")
+            return real(args, **kwargs)
+
+        with mock.patch.object(cloudrun, "run_git", side_effect=spy):
+            self.provisioner._cleanup_git_refs("cloudrun")
+        # 删除报错 → ls-remote 核对（远端没有这个 ref）→ 视为已删。
+        self.assertEqual(timeouts, [("push", cloudrun.GIT_DELETE_TIMEOUT),
+                                    ("ls-remote", cloudrun.GIT_LS_REMOTE_TIMEOUT)])
+        self.assertLessEqual(cloudrun.GIT_DELETE_TIMEOUT, 60)
+        self.assertLessEqual(cloudrun.GIT_LS_REMOTE_TIMEOUT, 30)
+        self.assertEqual(self.store.cloud_executions()[0]["git_refs"], "")
+
+    def test_backoff_is_per_remote(self):
+        dead = str(self.root / "gone.git")
+        for index in range(3):
+            self.pending_row(f"job-dead-{index}", dead)
+        self.pending_row("job-alive", str(self.remote))
+        calls = []
+        real = cloudrun.run_git
+
+        def spy(args, **kwargs):
+            calls.append(args)
+            return real(args, **kwargs)
+
+        out = io.StringIO()
+        with mock.patch.object(cloudrun, "run_git", side_effect=spy), \
+                contextlib.redirect_stdout(out):
+            self.provisioner._cleanup_git_refs("cloudrun")
+        dead_pushes = [c for c in calls if c[0] == "push" and dead in c]
+        self.assertEqual(len(dead_pushes), 1)  # 其余两条同远端的记录被跳过
+        self.assertEqual(out.getvalue().count("will retry"), 1)
+        pending = {row["job_id"] for row in self.store.cloud_git_pending("cloudrun")}
+        self.assertEqual(pending, {f"job-dead-{i}" for i in range(3)})
+        # 退避期内再来一轮：死远端一次都不碰
+        calls.clear()
+        with mock.patch.object(cloudrun, "run_git", side_effect=spy):
+            self.provisioner._cleanup_git_refs("cloudrun")
+        self.assertEqual(calls, [])
+
+    def test_one_pass_is_bounded(self):
+        total = cloudrun.GIT_CLEANUP_BATCH * 2 + 3
+        for index in range(total):
+            self.pending_row(f"job-{index:03d}", str(self.remote))
+        with mock.patch.object(self.provisioner, "_delete_remote_refs") as delete:
+            self.provisioner._cleanup_git_refs("cloudrun")
+            self.assertEqual(delete.call_count, cloudrun.GIT_CLEANUP_BATCH)
+            self.provisioner._cleanup_git_refs("cloudrun")
+            self.assertEqual(delete.call_count, cloudrun.GIT_CLEANUP_BATCH * 2)
+        self.assertEqual(len(self.store.cloud_git_pending("cloudrun")), 3)
 
 class GitRelayOffTests(GitRelayBase):
     def profile_git(self):
