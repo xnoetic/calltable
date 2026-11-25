@@ -136,6 +136,8 @@ class Profile:
     rules: list[Rule] = field(default_factory=list)
     unsupported: bool = False
     note: str = ""
+    #: Cloud Run 执行环境（镜像、基础镜像、额外安装步骤），见 README「Cloud Run」。
+    cloudrun: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -163,6 +165,7 @@ class Profile:
             rules=[Rule.from_dict(item) for item in (data.get("rules") or [])],
             unsupported=bool(data.get("unsupported")),
             note=str(data.get("note") or ""),
+            cloudrun=dict(data.get("cloudrun") or {}),
         )
 
 

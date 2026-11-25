@@ -869,6 +869,9 @@ def build_parser() -> argparse.ArgumentParser:
     ex.add_argument("--config")
     ex.add_argument("--host")
     ex.add_argument("--once", action="store_true", help="claim at most one job then exit")
+    ex.add_argument("--job-id", dest="job_id",
+                    help="attach to this job reserved by a provider host "
+                         "(Cloud Run), run it, then exit; implies --once")
 
     cli = sub.add_parser("cli", help="client commands (ct ...)")
     cli.add_argument("--version", action="version", version=__version__)
@@ -1004,6 +1007,9 @@ def build_parser() -> argparse.ArgumentParser:
     hosts.add_argument("--json", action="store_true")
     hosts.set_defaults(func=cmd_hosts)
 
+    from .cloudrun_cli import add_parser as add_cloudrun_parser
+    add_cloudrun_parser(csub, _add_cli_options)
+
     dash = csub.add_parser("dashboard", help="print the dashboard URL with token")
     _add_cli_options(dash)
     dash.set_defaults(func=cmd_dashboard)
@@ -1059,8 +1065,9 @@ def main(argv: list[str] | None = None) -> int:
         from . import executor as exec_module
         if getattr(args, "host", None):
             config.raw["exec_host"] = args.host
-        exec_module.serve(config, once=bool(getattr(args, "once", False)))
-        return 0
+        job_id = getattr(args, "job_id", None) or None
+        return int(exec_module.serve(config, once=bool(getattr(args, "once", False)),
+                                     job_id=job_id) or 0)
     # cli
     if getattr(args, "command", None) and args.command[:1] == ["--"]:
         args.command = args.command[1:]

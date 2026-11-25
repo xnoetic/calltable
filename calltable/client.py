@@ -22,10 +22,26 @@ class HubError(RuntimeError):
 
 
 class HubClient:
-    def __init__(self, base_url: str, token: str, timeout: float = 60):
+    def __init__(self, base_url: str, token: str, timeout: float = 60,
+                 proxy: str | None = None):
         self.base = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        #: 只给 hub 流量用的 HTTP 代理（Cloud Run 里是 Tailscale 用户态
+        #: tailscaled 的 outbound proxy）。不设全局环境变量，任务自己的外网
+        #: 流量不受影响。
+        self.proxy = (proxy or "").strip() or None
+        if self.proxy:
+            self._opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": self.proxy,
+                                             "https": self.proxy}))
+        else:
+            self._opener = None
+
+    def _open(self, req, timeout):
+        if self._opener is not None:
+            return self._opener.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
 
     # ------------------------------------------------------------ 基础
     def _url(self, path: str, params: dict | None = None) -> str:
@@ -48,7 +64,7 @@ class HubClient:
         req = urllib.request.Request(self._url(path, params), data=body,
                                      method=method, headers=hdrs)
         try:
-            with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:
+            with self._open(req, timeout or self.timeout) as resp:
                 payload = resp.read()
                 if raw:
                     return payload, dict(resp.headers)
@@ -174,8 +190,7 @@ class HubClient:
                 headers["Range"] = f"bytes={offset}-"
             req = urllib.request.Request(url, headers=headers)
             try:
-                with urllib.request.urlopen(
-                        req, timeout=max(self.timeout, 600)) as resp:
+                with self._open(req, max(self.timeout, 600)) as resp:
                     status = getattr(resp, "status", 200)
                     if offset and status == 200:
                         offset = 0  # 服务端忽略了 Range：从头写

@@ -402,6 +402,21 @@ below the default hold); a detached agent that never runs `ct wait` therefore
 does not block the queue forever. The feature is off by default and does not
 affect running jobs.
 
+### Provider hosts: `POST /api/exec/jobs/<id>/attach` (Cloud Run)
+
+Hosts with `provider: "cloudrun"` have no long-running executor. The hub
+reserves a queued job for such a host (status `running`, `worker` =
+`pending:<random>`), then starts a one-shot executor with the job id. That
+executor sends `{"host": "<host>", "worker": "<worker id>"}` to
+`POST /api/exec/jobs/<id>/attach` and receives the same payload as
+`/api/exec/claim`. The call returns `409` unless the job is running on that
+host and is still reserved (or already attached by the same worker).
+`POST /api/exec/claim` returns `204` for provider hosts. Heartbeats from a
+provider host only reconcile jobs owned by the reporting worker, because
+several executions share one host name. `GET /api/cloudrun` reports each
+provider host's month-to-date spend estimate and active executions. Health
+advertises the `exec_attach` and `cloudrun` capabilities.
+
 ## 11. Reference: existing 0.2 API
 
 Unchanged endpoints (still supported):

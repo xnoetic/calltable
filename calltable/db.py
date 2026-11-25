@@ -174,6 +174,23 @@ CREATE TABLE IF NOT EXISTS idempotency (
     created     REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idempotency_created ON idempotency(created);
+
+-- Cloud Run provider：每个任务一次 job execution，用来对账和估算月度花费。
+CREATE TABLE IF NOT EXISTS cloud_executions (
+    job_id     TEXT PRIMARY KEY,
+    host       TEXT NOT NULL,
+    cloud_job  TEXT NOT NULL DEFAULT '',
+    execution  TEXT NOT NULL DEFAULT '',
+    vcpu       REAL NOT NULL DEFAULT 0,
+    memory_gib REAL NOT NULL DEFAULT 0,
+    launched   REAL NOT NULL,
+    attached   REAL,
+    last_seen  REAL,
+    ended      REAL,
+    state      TEXT NOT NULL DEFAULT 'launching',
+    note       TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS cloud_executions_launched ON cloud_executions(launched);
 """
 
 #: 旧库升级：(表, 列, 定义)
@@ -200,6 +217,9 @@ MIGRATIONS = [
     ("jobs", "last_hold", "REAL"),
     ("jobs", "idempotency_key", "TEXT NOT NULL DEFAULT ''"),
 ]
+
+#: provider 预留任务时写进 ``jobs.worker`` 的占位前缀；执行器 attach 后替换。
+PENDING_WORKER_PREFIX = "pending:"
 
 RUNNING = "running"
 QUEUED = "queued"
@@ -292,10 +312,15 @@ class Store:
 
     def heartbeat(self, name: str, worker: str, running: list[str],
                   os_name: str = "", version: str = "",
-                  system: dict | None = None) -> list[dict]:
+                  system: dict | None = None, *,
+                  ephemeral: bool = False) -> list[dict]:
         """记录一次心跳并立即对账；返回被回收的任务。
 
         对账规则见模块文档。``running`` 必须是该执行器实例当前持有的 job id。
+
+        ``ephemeral=True``（Cloud Run 这类一次一任务的主机）：同一主机名下会有
+        多个执行器实例同时在跑，只对账本实例持有的任务，不因 worker 不同而回收
+        别人的任务；丢失的 execution 由 provider 的对账负责。
         """
         reaped: list[dict] = []
         now_ts = now()
@@ -326,6 +351,8 @@ class Store:
                     "SELECT * FROM jobs WHERE status='running' AND host=?",
                     (name,)).fetchall()
                 for job in jobs:
+                    if ephemeral and job["worker"] != worker:
+                        continue
                     if job["worker"] != worker:
                         # 执行器重启（或这条任务从来没绑定 worker）：本实例不会再
                         # 报告它，立即回收，槽位/锁马上释放。
@@ -339,6 +366,10 @@ class Store:
                         self.conn.execute(
                             "UPDATE jobs SET misses=0, needs_reconcile=0 WHERE id=?",
                             (job["id"],))
+                        if ephemeral:
+                            self.conn.execute(
+                                "UPDATE cloud_executions SET last_seen=? "
+                                "WHERE job_id=?", (now_ts, job["id"]))
                         continue
                     misses = int(job["misses"]) + 1
                     if misses >= MISSING_STRIKES:
@@ -360,8 +391,12 @@ class Store:
         with self.lock:
             self.conn.execute("UPDATE hosts SET last_seen=? WHERE name=?", (now(), name))
 
-    def reap_stale_hosts(self, stale_seconds: int = HOST_STALE_SECONDS) -> list[dict]:
-        """主机心跳超时：回收它名下的 running 任务。"""
+    def reap_stale_hosts(self, stale_seconds: int = HOST_STALE_SECONDS,
+                         skip_hosts: tuple[str, ...] | list[str] = ()) -> list[dict]:
+        """主机心跳超时：回收它名下的 running 任务。
+
+        ``skip_hosts``：由 provider 自己按 execution 对账的主机（Cloud Run）。
+        """
         reaped: list[dict] = []
         cutoff = now() - stale_seconds
         with self.lock:
@@ -372,6 +407,8 @@ class Store:
                     "FROM jobs j JOIN hosts h ON h.name=j.host "
                     "WHERE j.status='running'").fetchall()
                 for row in rows:
+                    if row["host"] in skip_hosts:
+                        continue
                     seen = row["seen"]
                     if seen and seen > cutoff:
                         continue
@@ -916,6 +953,79 @@ class Store:
                 self.conn.execute("ROLLBACK")
                 raise
         return self.job(job_id)
+
+    # ------------------------------------------------------------ Cloud Run
+    def attach_job(self, job_id: str, host: str, worker: str) -> dict | None:
+        """一次性执行器（``exec --once --job-id``）认领 provider 预留的任务。
+
+        任务必须已被 provider 置为 running、属于 ``host``，且还没有别的执行器
+        实例认领（worker 仍是预留占位）；同一实例重复 attach 视为幂等。
+        """
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if (row is None or row["status"] != RUNNING
+                        or row["host"] != host):
+                    self.conn.execute("COMMIT")
+                    return None
+                current = row["worker"] or ""
+                if current != worker and not current.startswith(PENDING_WORKER_PREFIX):
+                    self.conn.execute("COMMIT")
+                    return None
+                ts = now()
+                self.conn.execute(
+                    "UPDATE jobs SET worker=?, misses=0, needs_reconcile=0 "
+                    "WHERE id=?", (worker, job_id))
+                self.conn.execute(
+                    "UPDATE cloud_executions SET attached=COALESCE(attached, ?), "
+                    "last_seen=?, state=CASE WHEN state IN ('launching','launched') "
+                    "THEN 'attached' ELSE state END WHERE job_id=?",
+                    (ts, ts, job_id))
+                self.conn.execute("UPDATE hosts SET last_seen=? WHERE name=?",
+                                  (ts, host))
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return self.job(job_id)
+
+    def cloud_record_launch(self, job_id: str, host: str, *, cloud_job: str,
+                            vcpu: float, memory_gib: float,
+                            launched: float | None = None) -> None:
+        with self.lock:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO cloud_executions(job_id, host, cloud_job, "
+                "vcpu, memory_gib, launched, state) VALUES(?,?,?,?,?,?,'launching')",
+                (job_id, host, cloud_job, float(vcpu), float(memory_gib),
+                 launched if launched is not None else now()))
+
+    def cloud_update(self, job_id: str, **fields) -> None:
+        allowed = {"execution", "state", "ended", "note", "attached", "last_seen"}
+        sets = {k: v for k, v in fields.items() if k in allowed}
+        if not sets:
+            return
+        cols = ", ".join(f"{k}=?" for k in sets)
+        with self.lock:
+            self.conn.execute(f"UPDATE cloud_executions SET {cols} WHERE job_id=?",
+                              (*sets.values(), job_id))
+
+    def cloud_executions(self, *, active_only: bool = False,
+                         since: float | None = None) -> list[dict]:
+        query = "SELECT * FROM cloud_executions"
+        clauses, params = [], []
+        if active_only:
+            clauses.append("ended IS NULL")
+        if since is not None:
+            clauses.append("(launched >= ? OR ended IS NULL OR ended >= ?)")
+            params.extend([since, since])
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY launched"
+        with self.lock:
+            rows = self.conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     def touch_hold(self, job_id: str) -> dict | None:
         """排队期间的号码绑定心跳；返回更新后的任务（没有任务返回 None）。"""

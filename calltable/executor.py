@@ -89,12 +89,17 @@ class Aborted(Exception):
 
 class Executor:
     def __init__(self, config: Config, *, once: bool = False,
-                 client: HubClient | None = None):
+                 client: HubClient | None = None, job_id: str | None = None):
         self.config = config
-        self.once = once
+        #: ``--job-id``：一次性执行器（Cloud Run）只认领 hub 为它预留的这条任务。
+        self.job_id = (job_id or "").strip() or None
+        self.once = once or bool(self.job_id)
+        #: 0 正常；attach 失败时非 0（让 Cloud Run execution 记为失败）。
+        self.exit_code = 0
         self.host = config.exec_host
         self.worker_id = f"{self.host}-{uuid.uuid4().hex[:10]}"
-        self.client = client or HubClient(config.hub_url, config.token_value)
+        self.client = client or HubClient(config.hub_url, config.token_value,
+                                          proxy=config.hub_proxy)
         self.runs_root = config.runs_root
         self.mirror_root = config.mirror_root
         self.pending_dir = config.data_dir / "pending"
@@ -352,8 +357,22 @@ class Executor:
                     print(f"[exec] disk_low: {status.reason}; not claiming "
                           "new jobs", file=sys.stderr, flush=True)
                 return
-            job = self.client.post_json("/api/exec/claim", {
-                "host": self.host, "worker": self.worker_id})
+            if self.job_id:
+                try:
+                    job = self.client.post_json(
+                        f"/api/exec/jobs/{self.job_id}/attach",
+                        {"host": self.host, "worker": self.worker_id})
+                except HubError as exc:
+                    print(f"[exec] attach {self.job_id} failed: {exc}",
+                          file=sys.stderr, flush=True)
+                    self.exit_code = 3
+                    return
+                if not job:
+                    self.exit_code = 3
+                    return
+            else:
+                job = self.client.post_json("/api/exec/claim", {
+                    "host": self.host, "worker": self.worker_id})
             if not job:
                 return
             thread = threading.Thread(target=self._run_job, args=(job,),
@@ -443,7 +462,28 @@ class Executor:
 
     def _run_once(self) -> None:
         self.heartbeat()
-        self._claim_loop()
+        if not self.job_id:
+            self._claim_loop()
+            return
+        # 一次性执行器：任务跑多久就要心跳多久，否则 hub/provider 会当它失联。
+        done = threading.Event()
+        interval = max(1.0, min(30.0, self.config.poll_interval * 10))
+
+        def beat() -> None:
+            while not done.wait(interval):
+                self.heartbeat()
+
+        beater = threading.Thread(target=beat, daemon=True, name="exec-beat")
+        beater.start()
+        try:
+            self._claim_loop()
+        finally:
+            done.set()
+            beater.join(timeout=5)
+        # 终态没送达就再试一次（容器马上要回收，pending 文件留不下来）。
+        if any(self.pending_dir.glob("*.json")):
+            self.replay_pending()
+        self.heartbeat()
 
     # ------------------------------------------------------------ 单个任务
     def _run_job(self, job: dict) -> None:
@@ -976,9 +1016,11 @@ class LogPump:
             self._post(leftover)
 
 
-def serve(config: Config, *, once: bool = False) -> None:
-    executor = Executor(config, once=once)
+def serve(config: Config, *, once: bool = False,
+          job_id: str | None = None) -> int:
+    executor = Executor(config, once=once, job_id=job_id)
     try:
         executor.run()
     except KeyboardInterrupt:
         executor.stop()
+    return executor.exit_code

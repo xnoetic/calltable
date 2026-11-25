@@ -18,6 +18,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 EXECUTABLE_PATHS = (
     "bin/ct",
     "bin/install.sh",
+    "calltable/cloudrun_assets/entrypoint.sh",
     "deploy/drain-restart.sh",
     "deploy/sync-remote.sh",
     "deploy/wsl/exec.sh",

@@ -127,7 +127,11 @@ class PnpmAndPytestRuleTests(unittest.TestCase):
             self.assertIn(name, PROFILES)
         self.assertEqual(sorted(p.stem for p in
                                 (REPO / "profiles" / "examples").glob("*.json")),
-                         ["dotnet@runner-a", "pnpm@runner-a", "pytest@runner-a"])
+                         ["dotnet@runner-a", "pnpm@runner-a", "pytest@runner-a",
+                          "webapp@cloudrun"])
+        self.assertIn("webapp@cloudrun", readme)
+        self.assertEqual(PROFILES["webapp@cloudrun"].cloudrun["base_image"],
+                         "mcr.microsoft.com/dotnet/sdk:10.0")
 
 
 class RuleParsingTests(unittest.TestCase):

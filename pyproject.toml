@@ -31,3 +31,6 @@ ct = "calltable.cli:main"
 
 [tool.setuptools]
 packages = ["calltable"]
+
+[tool.setuptools.package-data]
+calltable = ["cloudrun_assets/*"]

@@ -46,11 +46,12 @@ MAX_JOB_WEBHOOKS = 10
 IDEMPOTENCY_RE = re.compile(r"[A-Za-z0-9._:-]{1,200}")
 #: 0.3 新增能力的自述（客户端据此判断是否降级）。
 CAPABILITIES = ["queue_eta", "wait_longpoll", "events_sse", "webhooks",
-                "idempotency", "queue_hold"]
+                "idempotency", "queue_hold", "exec_attach", "cloudrun"]
 
 
 class Hub:
-    def __init__(self, config: Config, store: Store | None = None):
+    def __init__(self, config: Config, store: Store | None = None, *,
+                 cloudrun_api=None):
         self.config = config
         self.data_dir = config.data_dir
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +95,15 @@ class Hub:
                                "hosts; it will never receive jobs")
         # hub 重启：遗留 running 任务进入「待对账」，由心跳或超时回收。
         self.store.mark_running_for_reconcile()
+        # 按需拉起的 provider 主机（Cloud Run）。没有配置就完全不加载。
+        self.cloudrun = None
+        if any(spec.provider == "cloudrun" for spec in config.hosts.values()):
+            from .cloudrun import Provisioner
+            self.cloudrun = Provisioner(self, api=cloudrun_api)
+        for name, spec in config.hosts.items():
+            if spec.provider not in ("static", "cloudrun"):
+                self._warn(f"host {name} has unknown provider {spec.provider!r}; "
+                           "it is treated as a static host")
         if self.config.webhook_urls and not self.config.webhook_secret:
             self._warn("webhook_urls is configured but webhook_secret is empty; "
                        "webhooks are disabled until a signing secret is set")
@@ -166,8 +176,17 @@ class Hub:
             except Exception as exc:  # pragma: no cover - 常驻兜底
                 print(f"[hub] janitor: {type(exc).__name__}: {exc}", flush=True)
 
+    def ephemeral_hosts(self) -> list[str]:
+        return [name for name, spec in self.config.hosts.items()
+                if spec.provider == "cloudrun"]
+
     def janitor_once(self) -> None:
-        for job in self.store.reap_stale_hosts():
+        if self.cloudrun is not None:
+            try:
+                self.cloudrun.tick()
+            except Exception as exc:  # pragma: no cover - 兜底
+                print(f"[hub] cloudrun: {type(exc).__name__}: {exc}", flush=True)
+        for job in self.store.reap_stale_hosts(skip_hosts=self.ephemeral_hosts()):
             print(f"[hub] reaped {job['id']}: {job.get('error', '')}", flush=True)
         for job in self.store.reap_queue_holds():
             print(f"[hub] queue hold expired: {job['id']}: "
@@ -454,18 +473,34 @@ class Hub:
         spec = self.config.hosts.get(host)
         if spec is None:
             self._warn(f"host {host} is not configured; it will get 0 slots")
-        reaped = self.store.heartbeat(host, worker, running, os_name, version,
-                                     system=system)
+        reaped = self.store.heartbeat(
+            host, worker, running, os_name, version, system=system,
+            ephemeral=bool(spec is not None and spec.ephemeral))
         return {"reaped": reaped, "host": self.store.host(host)}
 
     def claim(self, host: str, worker: str) -> dict | None:
         spec = self.config.hosts.get(host)
+        if spec is not None and spec.ephemeral:
+            # provider 主机的任务由 hub 预留，执行器只能 attach 指定任务。
+            self._warn(f"host {host} uses provider {spec.provider!r}; executors "
+                       "must use `exec --once --job-id`, refusing plain claim")
+            return None
         limits = spec.slots if spec else {}
         if not limits:
             self._warn(f"host {host} has no slots configured; refusing to dispatch "
                        "(limits are 0)")
             return None
         job = self.store.claim(host, worker)
+        if job is None:
+            return None
+        return self._exec_payload(job)
+
+    def attach(self, job_id: str, host: str, worker: str) -> dict | None:
+        """一次性执行器认领 provider 为它预留的任务。"""
+        spec = self.config.hosts.get(host)
+        if spec is None or not spec.ephemeral:
+            return None
+        job = self.store.attach_job(job_id, host, worker)
         if job is None:
             return None
         return self._exec_payload(job)
@@ -749,6 +784,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/hosts":
                 return self._json(200, {"hosts": self.hub.store.hosts(),
                                         "groups": self.hub.config.groups})
+            if path == "/api/cloudrun":
+                summary = (self.hub.cloudrun.summary()
+                           if self.hub.cloudrun is not None else {})
+                return self._json(200, {"hosts": summary})
             if path == "/api/groups":
                 return self._json(200, {"groups": self.hub.config.groups,
                                         "hosts": self.hub.store.hosts()})
@@ -967,6 +1006,20 @@ class Handler(BaseHTTPRequestHandler):
                 job = self.hub.claim(host, worker)
                 if job is None:
                     return self._send(204, b"", ctype="application/json")
+                return self._json(200, job)
+
+            match = re.fullmatch(r"/api/exec/jobs/([^/]+)/attach", path)
+            if match:
+                body = self._body_json()
+                host = str(body.get("host") or "").strip()
+                worker = str(body.get("worker") or "").strip()
+                if not host or not worker:
+                    return self._error(400, "host and worker are required")
+                job = self.hub.attach(match.group(1), host, worker)
+                if job is None:
+                    return self._error(409, "job is not reserved for this "
+                                            "executor (not running on this "
+                                            "provider host, or already attached)")
                 return self._json(200, job)
 
             match = re.fullmatch(r"/api/hosts/([^/]+)/drain", path)
