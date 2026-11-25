@@ -107,7 +107,7 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.region, "us-central1")
         self.assertEqual(settings.registry,
                          "us-central1-docker.pkg.dev/p/calltable")
-        self.assertEqual(settings.monthly_budget_usd, 60.0)
+        self.assertEqual(settings.monthly_budget_usd, 120.0)
         self.assertEqual(settings.slot_resources("heavy"), (8.0, 32.0))
         self.assertEqual(settings.slot_resources("light"), (2.0, 8.0))
         self.assertEqual(settings.max_task_timeout, 3 * 3600)

@@ -56,7 +56,7 @@ DEFAULT_RESOURCES = {
 
 DEFAULTS = {
     "region": "us-central1",
-    "monthly_budget_usd": 60.0,
+    "monthly_budget_usd": 120.0,
     "on_budget_exceeded": "queue",
     "max_task_timeout": "3h",
     "timeout_grace": "5m",
@@ -116,7 +116,7 @@ class CloudRunSettings:
     hub_url: str = ""
     job_prefix: str = "ct"
     resources: dict = field(default_factory=dict)
-    monthly_budget_usd: float = 60.0
+    monthly_budget_usd: float = 120.0
     on_budget_exceeded: str = "queue"
     cpu_price: float = DEFAULT_CPU_PRICE
     memory_price: float = DEFAULT_MEMORY_PRICE
