@@ -467,6 +467,42 @@ class ExecutorTests(unittest.TestCase):
             self.exec.cleanup_disk()
         self.assertEqual(seen, {"min_free_gb": 100, "runs_max_gb": 300})
 
+    def test_cleanup_disk_is_single_flight(self):
+        # janitor 线程和按需清理线程曾经同时在删同一批目录。
+        calls = []
+
+        def fake_enforce(runs_root, **kwargs):
+            calls.append(1)
+            return executor_module.disk.DiskStatus()
+
+        with mock.patch.object(executor_module.disk, "enforce",
+                               side_effect=fake_enforce):
+            self.assertTrue(self.exec._disk_cleanup_running.acquire(blocking=False))
+            try:
+                self.exec.cleanup_disk()  # 另一份清理还在跑：直接返回
+            finally:
+                self.exec._disk_cleanup_running.release()
+            self.assertEqual(calls, [])
+            self.exec.cleanup_disk()
+        self.assertEqual(calls, [1])
+
+    def test_cleanup_disk_reports_undeletable_dirs_once(self):
+        def fake_enforce(runs_root, **kwargs):
+            return executor_module.disk.DiskStatus(
+                low=True, reason="runs 334.7GB > 300GB",
+                undeletable=["job-stuck"])
+
+        with mock.patch.object(executor_module.disk, "enforce",
+                               side_effect=fake_enforce), \
+                mock.patch.object(executor_module, "print") as printer:
+            self.exec.cleanup_disk()
+            self.exec.cleanup_disk()
+        messages = [" ".join(str(arg) for arg in call.args)
+                    for call in printer.call_args_list]
+        stuck = [text for text in messages if "job-stuck" in text]
+        self.assertEqual(len(stuck), 1)
+        self.assertIn("cannot fully remove", stuck[0])
+
     def test_heartbeat_measurement_never_deletes_run_dirs(self):
         run_dir = self.root / "runs" / "old-run"
         (run_dir / "work").mkdir(parents=True)

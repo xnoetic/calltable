@@ -141,6 +141,9 @@ class Executor:
         self._disk_warned_at = 0.0
         self._disk_cleanup_lock = threading.Lock()
         self._disk_cleanup_thread: threading.Thread | None = None
+        #: janitor 和按需清理都会调 cleanup_disk；同一时刻只让一份在删。
+        self._disk_cleanup_running = threading.Lock()
+        self._disk_undeletable_logged: list[str] = []
 
         self.use_systemd, self.systemd_reason = self._decide_systemd()
 
@@ -268,22 +271,38 @@ class Executor:
         return self._disk_status
 
     def cleanup_disk(self) -> disk.DiskStatus:
-        """把 runs 清理到水位以下（慢操作；放在后台线程或 janitor 里跑）。"""
-        with self._lock:
-            protected = set(self._active_jobs)
-        status = disk.enforce(
-            self.runs_root,
-            min_free_gb=self.config.min_free_gb,
-            runs_max_gb=self.config.runs_max_gb,
-            protected=protected,
-            cache=self._run_size_cache,
-            scan_budget=self.config.disk_scan_budget)
+        """把 runs 清理到水位以下（慢操作；放在后台线程或 janitor 里跑）。
+
+        janitor 和按需清理可能同时触发；已经有一份在删时直接返回上次的状态，
+        不要两个线程抢着 rmtree 同一批目录。
+        """
+        if not self._disk_cleanup_running.acquire(blocking=False):
+            return self._disk_status
+        try:
+            with self._lock:
+                protected = set(self._active_jobs)
+            status = disk.enforce(
+                self.runs_root,
+                min_free_gb=self.config.min_free_gb,
+                runs_max_gb=self.config.runs_max_gb,
+                protected=protected,
+                cache=self._run_size_cache,
+                scan_budget=self.config.disk_scan_budget)
+        finally:
+            self._disk_cleanup_running.release()
         self._disk_status = status
         self._disk_checked_at = time.time()
         if status.reclaimed:
             print(f"[exec] disk watermark: removed "
                   f"{status.reclaimed} finished run dir(s), "
                   f"freed {status.reclaimed_bytes / disk.GB:.1f}G", flush=True)
+        stuck = sorted(status.undeletable)
+        if stuck and stuck != self._disk_undeletable_logged:
+            shown = ", ".join(stuck[:5]) + (" ..." if len(stuck) > 5 else "")
+            print(f"[exec] disk watermark: cannot fully remove {len(stuck)} "
+                  f"run dir(s) under {self.runs_root} (files owned by another "
+                  f"user?), skipped: {shown}", file=sys.stderr, flush=True)
+        self._disk_undeletable_logged = stuck
         return status
 
     def request_disk_cleanup(self) -> bool:

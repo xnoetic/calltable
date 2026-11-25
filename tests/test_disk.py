@@ -128,6 +128,59 @@ class DiskGuardTests(unittest.TestCase):
         self.assertEqual(status.reclaimed, 1)
         self.assertFalse((self.root / "big").exists())
 
+    def test_undeletable_oldest_run_does_not_stall_cleanup(self):
+        # lazyprod 实况：最旧的 run 里有容器以 root 写进来的 node_modules，
+        # rmtree(ignore_errors=True) 静默失败，旧逻辑每轮都重新挑中它、死循环。
+        stuck = self._run("stuck", 2, finished_at=1000)
+        old = self._run("old", 2, finished_at=2000)
+        new = self._run("new", 2, finished_at=3000)
+        original = disk.shutil.rmtree
+        attempts: list[str] = []
+
+        def fake_rmtree(path, ignore_errors=False):
+            attempts.append(Path(path).name)
+            if len(attempts) > 20:
+                raise AssertionError("enforce keeps retrying the same run dir")
+            if Path(path).name == "stuck":
+                return
+            original(path, ignore_errors=ignore_errors)
+
+        disk.shutil.rmtree = fake_rmtree
+        try:
+            status = disk.enforce(self.root, min_free_gb=0,
+                                  runs_max_gb=4.5 / 1024,  # 4.5 MiB；现有 6 MiB
+                                  free_fn=lambda path: 500 * GB, cache={})
+        finally:
+            disk.shutil.rmtree = original
+        self.assertEqual(attempts.count("stuck"), 1)
+        self.assertEqual(status.undeletable, ["stuck"])
+        self.assertTrue(stuck.exists())
+        self.assertFalse(old.exists())
+        self.assertTrue(new.exists())
+        self.assertEqual(status.reclaimed, 1)
+        self.assertFalse(status.low)
+        self.assertEqual(status.to_dict()["disk_undeletable"], 1)
+
+    def test_cleanup_accounts_victims_with_their_cached_size(self):
+        runs = [self._run(f"r{index}", 2, finished_at=1000 + index)
+                for index in range(3)]
+        cache: dict = {}
+        disk.runs_size(self.root, cache)
+        original = disk.directory_size
+        # 限时 walk 被截断时只量到一点点；旧逻辑拿它去扣总量，会一路多删。
+        disk.directory_size = lambda path, deadline=None: 0
+        try:
+            status = disk.enforce(self.root, min_free_gb=0,
+                                  runs_max_gb=4.5 / 1024,
+                                  free_fn=lambda path: 500 * GB, cache=cache)
+        finally:
+            disk.directory_size = original
+        self.assertEqual(status.reclaimed, 1)
+        self.assertFalse(runs[0].exists())
+        self.assertTrue(runs[1].exists())
+        self.assertTrue(runs[2].exists())
+        self.assertNotIn("r0", cache)
+
     def test_host_stats_reports_memory_load_and_disk(self):
         self._run("a", 1, finished_at=1000)
         payload = disk.host_stats(self.root, min_free_gb=0, runs_max_gb=0,

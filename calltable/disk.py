@@ -43,6 +43,8 @@ class DiskStatus:
     reason: str = ""
     reclaimed: int = 0
     reclaimed_bytes: int = 0
+    #: 本轮想删却删不干净的 run 目录名（例如容器以 root 写进来的文件）。
+    undeletable: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -53,6 +55,7 @@ class DiskStatus:
             "disk_low": self.low,
             "disk_reason": self.reason,
             "disk_runs_partial": self.runs_partial,
+            "disk_undeletable": len(self.undeletable),
         }
 
 
@@ -146,7 +149,8 @@ def runs_size(runs_root: Path, cache: dict | None = None,
     if cache is not None:
         for name in list(cache):
             if name not in seen:
-                del cache[name]
+                # 心跳线程和清理线程共用这份缓存，别的线程可能刚删过这一项。
+                cache.pop(name, None)
     return total, partial
 
 
@@ -181,6 +185,22 @@ def measure(runs_root: Path, *, min_free_gb: float = 0,
     return status
 
 
+def _known_size(run_dir: Path, cache: dict | None) -> int:
+    """删除前的目录大小：优先用扫描缓存里的完整值。
+
+    缓存没有（或目录又变过）才限时 walk；限时 walk 对大目录会偏小，
+    拿它去扣 runs 总量会让清理多删好几个目录。
+    """
+    cached = (cache or {}).get(run_dir.name)
+    if cached:
+        try:
+            if cached[0] == run_dir.stat().st_mtime:
+                return cached[1]
+        except OSError:
+            pass
+    return directory_size(run_dir, deadline=time.monotonic() + 2)
+
+
 def enforce(runs_root: Path, *, min_free_gb: float, runs_max_gb: float,
             protected: set[str] | None = None, free_fn=None,
             max_removals: int = 400, cache: dict | None = None,
@@ -188,6 +208,9 @@ def enforce(runs_root: Path, *, min_free_gb: float, runs_max_gb: float,
     """检查水位；不够就删最旧的已结束目录。返回最终状态。
 
     删除可能很慢（几十 GB 的 run 目录），调用方要放在后台线程/janitor 里。
+    删不干净的目录（典型是容器以 root 写进来、执行器用户删不动的文件）本轮
+    不再重试，记进 ``status.undeletable``，接着删下一个；否则它会一直是
+    「最旧的候选」，循环永远退不出来。
     """
     protected = protected or set()
     free_fn = free_fn or (lambda path: shutil.disk_usage(path).free)
@@ -195,14 +218,26 @@ def enforce(runs_root: Path, *, min_free_gb: float, runs_max_gb: float,
                      runs_max_gb=runs_max_gb, free_fn=free_fn,
                      cache=cache, scan_budget=scan_budget)
     reason = status.reason
+    stuck: set[str] = set()
     while reason and status.reclaimed < max_removals:
-        candidates = cleanup_candidates(runs_root, protected)
+        candidates = [entry for entry in cleanup_candidates(runs_root, protected)
+                      if entry.name not in stuck]
         if not candidates:
             break
         victim = candidates[0]
-        size = directory_size(victim, deadline=time.monotonic() + 2)
+        size = _known_size(victim, cache)
         shutil.rmtree(victim, ignore_errors=True)
-        if not victim.exists():
+        if cache is not None:
+            cache.pop(victim.name, None)
+        if victim.exists():
+            stuck.add(victim.name)
+            status.undeletable.append(victim.name)
+            # 删掉的那部分大小不清楚，只刷新空闲，runs 保守地不减。
+            try:
+                status.free = int(free_fn(runs_root))
+            except OSError:
+                pass
+        else:
             status.reclaimed += 1
             status.reclaimed_bytes += size
             status.runs = max(0, status.runs - size)
