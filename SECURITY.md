@@ -4,7 +4,7 @@
 
 Please do **not** open a public issue for a security problem. Report it privately
 through GitHub's "Report a vulnerability" (Security → Advisories) on
-`github.com/eanzhao-os/calltable`, or by email to the maintainers listed in the
+`github.com/xnoetic/calltable`, or by email to the maintainers listed in the
 repository profile. Include a reproduction and the affected version; we aim to
 respond within a few days.
 

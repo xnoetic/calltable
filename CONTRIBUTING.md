@@ -19,7 +19,7 @@ Thanks for taking a look at calltable.
 ## Development
 
 ```bash
-git clone https://github.com/eanzhao-os/calltable.git
+git clone https://github.com/xnoetic/calltable.git
 cd calltable
 python -m unittest discover -s tests -t . -v     # full suite, this machine
 python -m calltable --version
@@ -46,7 +46,8 @@ against a real deployment from a test.
 1. Keep changes focused; one behaviour per pull request when practical.
 2. Add or update tests for every behaviour change.
 3. Update `README.md` when user-facing commands, config keys or profile fields
-   change.
+   change, and make the same change in `README.zh-CN.md` (the Chinese
+   translation; both files share the images in `docs/images/`).
 4. Make sure the suite is green on your platform. There is no GitHub Actions
    workflow in this repository: run `python bin/ci-local` to execute the suite
    through calltable on the real executors, `devpc` (Linux) and `yiqipc`

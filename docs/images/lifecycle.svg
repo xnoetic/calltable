@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 440" width="1280" height="440" role="img" aria-labelledby="t d" xml:lang="en">
+<title id="t">calltable job lifecycle</title>
+<desc id="d">Four stages: 1 take a ticket — ct run returns a receipt with job id, jobs ahead and ETA; 2 wait in line — queued, waiting via long poll, SSE or a signed webhook instead of a polling loop; 3 get called — running the exact commit in an isolated checkout and its own process tree with live logs and CPU/memory samples; 4 result — exit code, logs and artifacts with sha256. Terminal states: succeeded, failed, timeout, error; cancelled can happen from queued or running.</desc>
+<style>:root{--bg:#eef2f8;--panel:#ffffff;--panel2:#f1f5fb;--line:rgba(15,23,42,.12);--text:#101a28;--text2:#33455c;--dim:#5c6d82;--acc:#1f6feb;--acc2:#7048e8;--ok:#0e9f6e;--bad:#d92c2c;--warn:#b7791f;--g1:#2f7fe0;--g2:#7350e6;--tileop:.09;--edgeop:.9;--shadow:rgba(15,23,42,.10);--glow:.10}
+@media (prefers-color-scheme: dark){:root{--bg:#070a10;--panel:#111927;--panel2:#1a2433;--line:rgba(255,255,255,.10);--text:#e9eff7;--text2:#c2cfdd;--dim:#8ea0b5;--acc:#5ba8ff;--acc2:#9b8cff;--ok:#3ddc97;--bad:#ff7070;--warn:#f5b544;--g1:#6cb6ff;--g2:#a99bff;--tileop:.13;--edgeop:.5;--shadow:rgba(0,0,0,.45);--glow:.16}}
+text{font-family:-apple-system, BlinkMacSystemFont, &quot;Segoe UI&quot;, &quot;PingFang SC&quot;, &quot;Noto Sans SC&quot;, &quot;Microsoft YaHei&quot;, sans-serif;}
+.mono{font-family:ui-monospace, SFMono-Regular, &quot;SF Mono&quot;, &quot;Cascadia Mono&quot;, Consolas, monospace;}
+.bg{fill:var(--bg)}
+.panel{fill:var(--panel);stroke:var(--line);stroke-width:1.2}
+.panel2{fill:var(--panel2);stroke:var(--line);stroke-width:1}
+.t{fill:var(--text)} .t2{fill:var(--text2)} .dim{fill:var(--dim)}
+.acc{fill:var(--acc)} .acc2{fill:var(--acc2)} .ok{fill:var(--ok)} .bad{fill:var(--bad)} .warn{fill:var(--warn)}
+.st1{stop-color:var(--g1)} .st2{stop-color:var(--g2)}
+.sa{stop-color:var(--acc)} .sb{stop-color:var(--acc2)}
+.tile{fill-opacity:var(--tileop)} .edge{stroke-opacity:var(--edgeop)}
+.ln{stroke:var(--line)}
+.halo{paint-order:stroke;stroke:var(--bg);stroke-width:6px;stroke-linejoin:round}
+.haloP{paint-order:stroke;stroke:var(--panel);stroke-width:6px;stroke-linejoin:round}
+.ar{fill:none;stroke-width:2;stroke-linecap:round}
+.ar-acc{stroke:var(--acc)} .ar-acc2{stroke:var(--acc2)} .ar-dim{stroke:var(--dim)} .ar-ok{stroke:var(--ok)}
+.mk-acc{fill:var(--acc)} .mk-acc2{fill:var(--acc2)} .mk-dim{fill:var(--dim)} .mk-ok{fill:var(--ok)}
+.flow{stroke-dasharray:7 7;animation:flow 1.4s linear infinite}
+.pulse{animation:pulse 2.4s ease-in-out infinite}
+@keyframes flow{to{stroke-dashoffset:-28}}
+@keyframes pulse{50%{opacity:.55}}
+@media (prefers-reduced-motion: reduce){.flow,.pulse{animation:none}}</style>
+<defs>
+<linearGradient id="brandGrad" x1="0" y1="0" x2="1" y2="1"><stop class="st1" offset="0"/><stop class="st2" offset="1"/></linearGradient>
+<radialGradient id="glowA"><stop class="sa" offset="0" stop-opacity=".9"/><stop class="sa" offset="1" stop-opacity="0"/></radialGradient>
+<radialGradient id="glowB"><stop class="sb" offset="0" stop-opacity=".9"/><stop class="sb" offset="1" stop-opacity="0"/></radialGradient>
+<pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.2" style="fill:var(--dim)" opacity=".22"/></pattern>
+<filter id="shadow" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="8" stdDeviation="12" style="flood-color:var(--shadow)"/></filter>
+<marker id="ah-acc" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-acc"/></marker><marker id="ah-acc2" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-acc2"/></marker><marker id="ah-dim" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-dim"/></marker><marker id="ah-ok" viewBox="0 0 12 12" refX="10" refY="6" markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M1.5 1.5L10.5 6L1.5 10.5L4 6Z" class="mk-ok"/></marker>
+<symbol id="mark" viewBox="0 0 40 40">
+<rect class="tile" x="1.5" y="1.5" width="37" height="37" rx="11" fill="url(#brandGrad)"/>
+<rect class="edge" x="1.5" y="1.5" width="37" height="37" rx="11" fill="none" stroke="url(#brandGrad)"/>
+<path d="M11 10h12.6a2 2 0 0 1 2 2v3.4a2.8 2.8 0 0 0 0 5.6V26a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2v-5a2.8 2.8 0 0 0 0-5.6V12a2 2 0 0 1 2-2Z" fill="none" stroke="url(#brandGrad)" stroke-width="1.7" stroke-linejoin="round"/>
+<path d="M15.7 11.4v15.2" stroke="url(#brandGrad)" stroke-width="1.3" stroke-dasharray="1.8 2.4" opacity=".75"/>
+<path d="M19.6 15.2h5.2M19.6 19h5.2M19.6 22.8h3.2" stroke="url(#brandGrad)" stroke-width="1.7" stroke-linecap="round"/>
+</symbol>
+
+</defs>
+<rect class="bg" x="0" y="0" width="1280" height="440" rx="20"/>
+<circle cx="800" cy="200" r="380" fill="url(#glowA)" style="opacity:var(--glow)"/>
+<circle cx="160" cy="420" r="260" fill="url(#glowB)" style="opacity:var(--glow)"/>
+<text x="40" y="58" class="t" font-size="28" font-weight="700">Job lifecycle</text>
+<rect x="40" y="90" width="276" height="256" rx="16" class="panel"/>
+<circle cx="80" cy="134" r="18" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="80" y="140.48" class="t" font-size="18" text-anchor="middle" font-weight="700">1</text>
+<text x="110" y="142" class="t" font-size="23" font-weight="700">Take a ticket</text>
+<rect x="64.0" y="170" width="108.8" height="34" rx="17.0" style="fill:var(--acc);fill-opacity:.12;stroke:var(--acc);stroke-opacity:.45"/>
+<circle cx="81.0" cy="187.0" r="4.5" style="fill:var(--acc)"/>
+<text x="94.0" y="193.3" class="acc mono" font-size="18">ct run</text>
+<text x="64" y="242" class="t2" font-size="18">ticket receipt:</text>
+<text x="64" y="269" class="t2" font-size="18">job id · ahead · ETA</text>
+<text x="64" y="296" class="t2" font-size="18">ETA = median of</text>
+<text x="64" y="323" class="t2" font-size="18">last 20 succeeded runs</text>
+<path d="M322 134L342 134" class="ar ar-dim" marker-end="url(#ah-dim)"/>
+<rect x="348" y="90" width="276" height="256" rx="16" class="panel"/>
+<circle cx="388" cy="134" r="18" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="388" y="140.48" class="t" font-size="18" text-anchor="middle" font-weight="700">2</text>
+<text x="418" y="142" class="t" font-size="23" font-weight="700">Wait in line</text>
+<rect x="372.0" y="170" width="108.8" height="34" rx="17.0" style="fill:var(--dim);fill-opacity:.12;stroke:var(--dim);stroke-opacity:.45"/>
+<circle cx="389.0" cy="187.0" r="4.5" style="fill:var(--dim)"/>
+<text x="402.0" y="193.3" class="dim mono" font-size="18">queued</text>
+<text x="372" y="242" class="t2" font-size="18">long poll or SSE,</text>
+<text x="372" y="269" class="t2" font-size="18">or a signed webhook</text>
+<text x="372" y="296" class="t2" font-size="18">no polling loop</text>
+<path d="M630 134L650 134" class="ar ar-dim" marker-end="url(#ah-dim)"/>
+<g filter="url(#shadow)"><rect x="656" y="90" width="276" height="256" rx="16" class="panel"/></g>
+<rect x="656.8" y="90.8" width="274.4" height="254.4" rx="15.2" fill="none" stroke="url(#brandGrad)" stroke-width="1.6"/>
+<circle cx="696" cy="134" r="18" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="696" y="140.48" class="t" font-size="18" text-anchor="middle" font-weight="700">3</text>
+<text x="726" y="142" class="t" font-size="23" font-weight="700">Get called</text>
+<rect x="680.0" y="170" width="119.6" height="34" rx="17.0" style="fill:var(--acc);fill-opacity:.12;stroke:var(--acc);stroke-opacity:.45"/>
+<circle cx="697.0" cy="187.0" r="4.5" style="fill:var(--acc)"/>
+<text x="710.0" y="193.3" class="acc mono" font-size="18">running</text>
+<text x="680" y="242" class="t2" font-size="18">exact commit,</text>
+<text x="680" y="269" class="t2" font-size="18">isolated checkout</text>
+<text x="680" y="296" class="t2" font-size="18">own process tree</text>
+<text x="680" y="323" class="t2" font-size="18">live logs + CPU/mem</text>
+<path d="M938 134L958 134" class="ar ar-dim" marker-end="url(#ah-dim)"/>
+<rect x="964" y="90" width="276" height="256" rx="16" class="panel"/>
+<circle cx="1004" cy="134" r="18" style="fill:var(--panel)" stroke="url(#brandGrad)" stroke-width="2"/><text x="1004" y="140.48" class="t" font-size="18" text-anchor="middle" font-weight="700">4</text>
+<text x="1034" y="142" class="t" font-size="23" font-weight="700">Result</text>
+<rect x="988.0" y="170" width="117.8" height="34" rx="17.0" style="fill:var(--ok);fill-opacity:.12;stroke:var(--ok);stroke-opacity:.45"/>
+<circle cx="1005.0" cy="187.0" r="4.5" style="fill:var(--ok)"/>
+<text x="1018.0" y="193.3" class="ok" font-size="18">exit code</text>
+<text x="988" y="242" class="t2" font-size="18">full logs</text>
+<text x="988" y="269" class="t2" font-size="18">artifacts + sha256</text>
+<text x="988" y="296" class="t2" font-size="18">one terminal state</text>
+<text x="40" y="401" class="dim" font-size="18" font-weight="600">terminal states</text>
+<rect x="182.8" y="378" width="141.2" height="34" rx="17.0" style="fill:var(--ok);fill-opacity:.12;stroke:var(--ok);stroke-opacity:.45"/>
+<circle cx="199.8" cy="395.0" r="4.5" style="fill:var(--ok)"/>
+<text x="212.8" y="401.3" class="ok mono" font-size="18">succeeded</text>
+<rect x="334.0" y="378" width="108.8" height="34" rx="17.0" style="fill:var(--bad);fill-opacity:.12;stroke:var(--bad);stroke-opacity:.45"/>
+<circle cx="351.0" cy="395.0" r="4.5" style="fill:var(--bad)"/>
+<text x="364.0" y="401.3" class="bad mono" font-size="18">failed</text>
+<rect x="452.8" y="378" width="119.6" height="34" rx="17.0" style="fill:var(--warn);fill-opacity:.12;stroke:var(--warn);stroke-opacity:.45"/>
+<circle cx="469.8" cy="395.0" r="4.5" style="fill:var(--warn)"/>
+<text x="482.8" y="401.3" class="warn mono" font-size="18">timeout</text>
+<rect x="582.4" y="378" width="98.0" height="34" rx="17.0" style="fill:var(--bad);fill-opacity:.12;stroke:var(--bad);stroke-opacity:.45"/>
+<circle cx="599.4" cy="395.0" r="4.5" style="fill:var(--bad)"/>
+<text x="612.4" y="401.3" class="bad mono" font-size="18">error</text>
+<rect x="690.4" y="378" width="141.2" height="34" rx="17.0" style="fill:var(--warn);fill-opacity:.12;stroke:var(--warn);stroke-opacity:.45"/>
+<circle cx="707.4" cy="395.0" r="4.5" style="fill:var(--warn)"/>
+<text x="720.4" y="401.3" class="warn mono" font-size="18">cancelled</text>
+<text x="1240" y="401" class="dim" font-size="18" text-anchor="end">cancelled: from queued or running</text>
+</svg>
