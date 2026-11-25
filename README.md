@@ -318,8 +318,10 @@ How it works:
 * **Same scheduler.** Slots, locks and drain apply exactly as for any host;
   `slots` caps how many Cloud Run executions run at once. Target it with
   `--host cloudrun` (it is not meant to be mixed into a group with static hosts).
-* **Reserve, execute, attach.** The hub janitor reserves a queued job for the
-  host (the job turns `running` with a `pending:` worker), then runs
+* **Reserve, execute, attach.** A dedicated hub thread (separate from the
+  janitor, so a slow `gcloud` never delays housekeeping for other hosts)
+  reserves a queued job for the host (the job turns `running` with a
+  `pending:` worker), then runs
   `gcloud run jobs execute ct-<project>-<slot> --async` with
   `CALLTABLE_JOB_ID` set. The container runs
   `calltable exec --once --job-id <id>`, which attaches through

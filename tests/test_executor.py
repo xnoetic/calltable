@@ -6,6 +6,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -304,6 +305,35 @@ class ExecutorTests(unittest.TestCase):
         self.assertEqual(env["TEMP"], str(tmp))
         self.assertEqual(env["CALLTABLE_JOB_ID"], "job-env")
         self.assertEqual(env["CALLTABLE_HOST"], "runner-a")
+
+    def test_env_drops_hub_credentials(self):
+        # Cloud Run 上 token 由 Secret Manager 注入容器环境：任务命令不能看到，
+        # 但执行器自己还要用（配置文件里没有 token 时回退到环境变量）。
+        job = {"id": "job-secret", "project": "p", "host": "runner-a"}
+        secrets = {"CALLTABLE_TOKEN": "hub-secret", "TS_AUTHKEY": "tskey-secret",
+                   "CALLTABLE_KEEP_ME": "kept"}
+        with mock.patch.dict(os.environ, secrets):
+            env = self.exec._build_env(job, {}, self.root / "tmp",
+                                       self.root / "work")
+            self.assertNotIn("CALLTABLE_TOKEN", env)
+            self.assertNotIn("TS_AUTHKEY", env)
+            self.assertNotIn("hub-secret", env.values())
+            self.assertNotIn("tskey-secret", env.values())
+            self.assertEqual(env["CALLTABLE_KEEP_ME"], "kept")
+            # 只动传给任务的副本，执行器进程自己的环境不变。
+            self.assertEqual(os.environ["CALLTABLE_TOKEN"], "hub-secret")
+            self.assertEqual(self.config.token_value, "hub-secret")
+
+    def test_profile_env_can_still_set_credential_names(self):
+        job = {"id": "job-explicit", "project": "p", "host": "runner-a"}
+        profile = {"env": {"CALLTABLE_TOKEN": "from-profile",
+                           "TS_AUTHKEY": "profile-key"}}
+        with mock.patch.dict(os.environ, {"CALLTABLE_TOKEN": "hub-secret",
+                                          "TS_AUTHKEY": "tskey-secret"}):
+            env = self.exec._build_env(job, profile, self.root / "tmp",
+                                       self.root / "work")
+        self.assertEqual(env["CALLTABLE_TOKEN"], "from-profile")
+        self.assertEqual(env["TS_AUTHKEY"], "profile-key")
 
     def test_launcher_raises_task_oom_score(self):
         self.exec.config.raw["task_oom_score_adj"] = 650

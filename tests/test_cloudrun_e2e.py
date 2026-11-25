@@ -210,7 +210,8 @@ class CloudRunEndToEndTests(unittest.TestCase):
              "--timeout", "3m", "--",
              sys.executable, "-c",
              "import os; print('hello from', os.environ['CALLTABLE_HOST']);"
-             "print(open('README.md').read().strip())"],
+             "print(open('README.md').read().strip());"
+             "print('token in job env:', 'CALLTABLE_TOKEN' in os.environ)"],
             cwd=str(REPO_ROOT), env=self.env, capture_output=True, text=True,
             timeout=240)
         self.assertEqual(cli.returncode, 0,
@@ -222,6 +223,9 @@ class CloudRunEndToEndTests(unittest.TestCase):
         self.assertFalse(job["worker"].startswith("pending:"))
         self.assertIn("hello from cloudrun", cli.stdout)
         self.assertIn("demo", cli.stdout)
+        # 执行器靠环境变量里的 token 连上了 hub（配置文件里 token 为空），
+        # 但任务命令看不到它。
+        self.assertIn("token in job env: False", cli.stdout)
 
         calls = [json.loads(line) for line in
                  (self.state / "calls.log").read_text().splitlines()]

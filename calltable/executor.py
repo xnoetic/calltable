@@ -53,6 +53,9 @@ FINISH_MAX_DELAY = 30.0
 DISK_SCAN_INTERVAL = 60.0
 #: 调整任务进程 OOM 权重的 procfs 入口（只在 Linux 上存在）。
 OOM_SCORE_ADJ_PATH = "/proc/self/oom_score_adj"
+#: 只给执行器自己用的 hub 凭据：不随环境变量传给任务命令（Cloud Run 上它们
+#: 由 Secret Manager 注入容器环境）。
+HUB_CREDENTIAL_ENV = ("CALLTABLE_TOKEN", "TS_AUTHKEY")
 
 
 def _artifact_regex(pattern: str) -> re.Pattern[str]:
@@ -800,6 +803,11 @@ class Executor:
     def _build_env(self, job: dict, profile: dict, tmp: Path,
                    work: Path) -> dict[str, str]:
         env = os.environ.copy()
+        # 任务代码和它打的日志不该读到 hub 的 bearer token。只动这份副本：
+        # 执行器自己仍从 os.environ 取 token（config.token_value）。profile 的
+        # env 在这之后合并，所以仍然可以显式设置同名变量。
+        for name in HUB_CREDENTIAL_ENV:
+            env.pop(name, None)
         env.update({str(k): str(v) for k, v in (profile.get("env") or {}).items()})
         env["TMPDIR"] = str(tmp)
         env["TMP"] = str(tmp)
