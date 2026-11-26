@@ -1056,11 +1056,13 @@ class Store:
             (row["group_name"] or remaining[0], row["lock_templates"],
              json_dumps(remaining), merged[-2000:], now(), job_id))
         self._emit_locked(job_id, "job.requeued",
-                          webhook_urls=self._retract_started_webhooks(job_id))
+                          webhook_urls=self._retract_started_webhooks_locked(job_id))
         return REQUEUED
 
-    def _retract_started_webhooks(self, job_id: str) -> list[str]:
+    def _retract_started_webhooks_locked(self, job_id: str) -> list[str]:
         """放回队列时撤掉 ``job.started`` 投递；返回已经发出过的 URL。
+
+        调用方负责事务；``self.lock`` 必须已持有。
 
         还没尝试过的直接删掉（接收端从没见过「开始」）；已经发出或正在
         发的也删掉，让真正开跑时的 ``job.started`` 能再投一次（每个事件每个

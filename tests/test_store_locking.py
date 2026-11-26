@@ -112,6 +112,9 @@ class CheckpointLockingTests(unittest.TestCase):
         self.store.checkpoint()
         job = self._job("right-after")
         self.assertEqual(self.store.job(job["id"])["status"], "queued")
+        # 放掉留住的游标：否则连接要等它们被回收才真正关闭，Windows 上临时
+        # 目录会因为数据库文件还开着而清理不掉。
+        self.store.conn.cursors.clear()
 
 
 class StoreLockCoverageTests(unittest.TestCase):
