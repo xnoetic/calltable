@@ -170,9 +170,12 @@ curl -fsSL https://raw.githubusercontent.com/xnoetic/calltable/main/bin/install.
 #    Windows (no admin rights needed):
 #      powershell -ExecutionPolicy Bypass -File .\bin\install.ps1
 
-# 2. point it at a hub and store the token (chmod 0600 on Unix)
+# 2. point it at a hub and store the token in ~/.calltable/config.json
+#    (chmod 0600 on Unix)
 ct setup --hub http://hub.example.internal:8091 --token "$(cat my.token)"
 ct doctor          # one MODE=... line, exit code 0 = ready
+ct doctor --json   # same checks as one JSON object, for scripts
+ct config show     # which config file is in use; never prints the token
 
 # 3. submit a job from inside a git repository and wait for the result
 ct run --project myproj --host runner-a --wait -- pytest -q
@@ -544,7 +547,8 @@ ct show <id> | ct logs <id> -f | ct cancel <id>
 ct wait <id> [--until started|done] [--timeout 2h]
 ct hosts [--json] | ct drain <host> | ct undrain <host>
 ct seed --project P --from <checkout> [--mirror-root DIR]
-ct doctor | ct setup | ct self-update | ct dashboard
+ct doctor [--json] | ct setup | ct self-update | ct dashboard
+ct config show [--json]   (config file in use, hub, token present?, machines)
 ct cloudrun status | bootstrap | image --project P | jobs --project P   (--apply)
 ```
 
@@ -651,6 +655,7 @@ complete starting point). Keys include:
 | `retention_*`, `log_cap_bytes`, `keep_ref_days` | retention and hard caps |
 | `upstreams`, `upstream_interval` | optional read-only upstream fetch by the hub |
 | `owner_tailnet` | optional: only enables the tailnet branch of `ct doctor` |
+| `machines` | client, optional: verification machines registered on this computer, `{name: {ssh, platform, purpose}}`; not used for scheduling, reported by `ct config show --json` |
 | `webhook_secret`, `webhook_urls` | 0.3: Standard Webhooks signing key and hub-level notification URLs |
 | `webhook_timeout`, `webhook_max_attempts`, `webhook_retry_base_seconds`, `webhook_max_delay_seconds` | 0.3: delivery retry policy (defaults 10 s / 6 / 2 s / 300 s) |
 | `estimate_window`, `estimate_min_samples` | 0.3: ETA sample window (20) and minimum samples (3) |
@@ -659,8 +664,39 @@ complete starting point). Keys include:
 | `public_url` | 0.3: dashboard base URL placed in webhook payloads (never contains a token) |
 
 Config lookup order: `--config` → `CALLTABLE_CONFIG` →
-`~/.config/calltable/config.json` (`%USERPROFILE%\.config\calltable\config.json`
-on Windows). Profiles live next to the config or in the checkout's `profiles/`
+`~/.calltable/config.json` → `~/.config/calltable/config.json` (on Windows the
+same paths under `%USERPROFILE%`). `ct setup` writes `~/.calltable/config.json`
+on a new machine and updates an existing `~/.config/calltable/config.json` in
+place, so older installs keep working. On Unix the file is created `0600`; a
+directory `ct setup` creates is `0700`, an existing `~/.calltable` keeps its
+mode. If both user-level files exist,
+`~/.calltable/config.json` wins; `ct config show` and `ct doctor` name the file
+in use and the one being ignored.
+
+Other tools should not read the config file (it holds the token) or parse the
+`MODE=...` line: `ct config show --json` reports the config file in use, the
+hub URL, whether a token is present and the registered `machines`, and
+`ct doctor --json` reports mode, readiness, not-ready reasons and per-host
+online state with the usual exit codes. Neither ever prints the token. Both
+outputs are versioned (`schema_version`); the contract is
+[spec/client-config.md](spec/client-config.md).
+
+```json
+{
+  "hub_url": "http://hub.example.internal:8091",
+  "token": "…",
+  "machines": {
+    "runner-a": {"ssh": "runner-a", "platform": "linux", "purpose": "Linux builds"}
+  }
+}
+```
+
+`machines.<name>` accepts only `ssh` (an alias from your ssh config, or
+`user@alias`: letters, digits, `.`, `_`, `-`, not starting with `-`),
+`platform` (`linux`, `windows` or `macos`) and `purpose`; keep addresses and key
+paths in `~/.ssh/config`.
+
+Profiles live next to the config or in the checkout's `profiles/`
 directory. Only `*.json` files at the **top level** of the profile directory are
 loaded; subdirectories are ignored.
 

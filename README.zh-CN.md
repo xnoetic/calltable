@@ -128,9 +128,11 @@ curl -fsSL https://raw.githubusercontent.com/xnoetic/calltable/main/bin/install.
 #    Windows（不需要管理员权限）：
 #      powershell -ExecutionPolicy Bypass -File .\bin\install.ps1
 
-# 2. 指向 hub 并保存 token（Unix 上权限为 chmod 0600）
+# 2. 指向 hub 并把 token 存进 ~/.calltable/config.json（Unix 上权限为 chmod 0600）
 ct setup --hub http://hub.example.internal:8091 --token "$(cat my.token)"
 ct doctor          # 输出一行 MODE=...，退出码 0 表示就绪
+ct doctor --json   # 同样的检查，输出一个 JSON 对象，给脚本用
+ct config show     # 实际用的是哪个配置文件；从不输出 token
 
 # 3. 在 git 仓库里提交任务，并等待结果
 ct run --project myproj --host runner-a --wait -- pytest -q
@@ -362,7 +364,8 @@ ct show <id> | ct logs <id> -f | ct cancel <id>
 ct wait <id> [--until started|done] [--timeout 2h]
 ct hosts [--json] | ct drain <host> | ct undrain <host>
 ct seed --project P --from <checkout> [--mirror-root DIR]
-ct doctor | ct setup | ct self-update | ct dashboard
+ct doctor [--json] | ct setup | ct self-update | ct dashboard
+ct config show [--json]   （实际用的配置文件、hub、有没有 token、machines）
 ct cloudrun status | bootstrap | image --project P | jobs --project P   (--apply)
 ```
 
@@ -422,6 +425,7 @@ hub 和执行器共用一个 JSON 文件（`config.example.json` 是完整的起
 | `retention_*`、`log_cap_bytes`、`keep_ref_days` | 保留期限和硬上限 |
 | `upstreams`、`upstream_interval` | 可选：由 hub 只读拉取上游 |
 | `owner_tailnet` | 可选：只用来启用 `ct doctor` 的 tailnet 分支 |
+| `machines` | 客户端，可选：本机登记的验证机，`{name: {ssh, platform, purpose}}`；排队不用它，由 `ct config show --json` 输出 |
 | `webhook_secret`、`webhook_urls` | 0.3：Standard Webhooks 签名密钥，以及 hub 级的通知 URL |
 | `webhook_timeout`、`webhook_max_attempts`、`webhook_retry_base_seconds`、`webhook_max_delay_seconds` | 0.3：投递重试策略（默认 10 秒 / 6 次 / 2 秒 / 300 秒） |
 | `estimate_window`、`estimate_min_samples` | 0.3：预计时间的采样窗口（20）和最少采样数（3） |
@@ -429,7 +433,23 @@ hub 和执行器共用一个 JSON 文件（`config.example.json` 是完整的起
 | `idempotency_window_seconds` | 0.3：幂等 key 保留多久（默认 24 小时） |
 | `public_url` | 0.3：写进 webhook 载荷的看板基础 URL（不含 token） |
 
-配置文件的查找顺序：`--config` → `CALLTABLE_CONFIG` → `~/.config/calltable/config.json`（Windows 上是 `%USERPROFILE%\.config\calltable\config.json`）。profile 放在配置文件旁边，或者检出目录的 `profiles/` 目录里。只加载 profile 目录**顶层**的 `*.json` 文件，子目录不加载。
+配置文件的查找顺序：`--config` → `CALLTABLE_CONFIG` → `~/.calltable/config.json` → `~/.config/calltable/config.json`（Windows 上是 `%USERPROFILE%` 下的同名路径）。`ct setup` 在新机器上写 `~/.calltable/config.json`；已有 `~/.config/calltable/config.json` 的机器就地更新旧文件，老安装照常可用。Unix 上文件一创建就是 0600；`ct setup` 新建的目录是 0700，已有的 `~/.calltable` 不改权限。两个用户级文件都在时用 `~/.calltable/config.json`，`ct config show` 和 `ct doctor` 会标出实际用的文件和被忽略的那个。
+
+其他工具不要直接读配置文件（里面有 token），也不要解析 `MODE=...` 那一行：`ct config show --json` 输出实际使用的配置文件、hub 地址、有没有 token 和登记的 `machines`；`ct doctor --json` 输出模式、是否就绪、不就绪的原因和各主机在线情况，退出码不变。两条命令都不会输出 token。输出带版本号（`schema_version`），契约见 [spec/client-config.md](spec/client-config.md)。
+
+```json
+{
+  "hub_url": "http://hub.example.internal:8091",
+  "token": "…",
+  "machines": {
+    "runner-a": {"ssh": "runner-a", "platform": "linux", "purpose": "Linux 构建"}
+  }
+}
+```
+
+`machines.<name>` 只接受 `ssh`（ssh 配置里的别名或 `user@别名`：字母、数字、`.`、`_`、`-`，不能以 `-` 开头）、`platform`（`linux`、`windows` 或 `macos`）和 `purpose`；地址和密钥路径留在 `~/.ssh/config` 里。
+
+profile 放在配置文件旁边，或者检出目录的 `profiles/` 目录里。只加载 profile 目录**顶层**的 `*.json` 文件，子目录不加载。
 
 ## Profile
 

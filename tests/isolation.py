@@ -1,7 +1,8 @@
 """Test-time isolation of user-level state.
 
 Nothing in the suite may read or write the real user's home directory, nor fall
-back to the real ``~/.config/calltable/config.json`` if a test forgets to pass
+back to the real ``~/.calltable/config.json`` or
+``~/.config/calltable/config.json`` if a test forgets to pass
 ``--config``. Importing :mod:`tests` calls :func:`apply` before any test module
 loads ``calltable``, so ``Path.home()``, ``find_config()`` and the CLI
 subprocesses all see a throwaway home.
@@ -92,7 +93,7 @@ def apply() -> None:
 
     from calltable import config as config_module
 
-    for name in ("user_config_path", "user_data_dir"):
+    for name in ("user_config_path", "legacy_user_config_path", "user_data_dir"):
         original = getattr(config_module, name)
 
         def guarded(*args, _original=original, **kwargs):
