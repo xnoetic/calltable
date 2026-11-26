@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from calltable import __version__, gitops
 from calltable.hub import Hub
@@ -178,6 +179,35 @@ class HubTests(unittest.TestCase):
         self._overflow_group()
         self._write_profile("demo@cr", project="other", host="cr")
         self.assertEqual(self._submit("pool")["targets"], ["h1"])
+
+    def test_group_job_keeps_only_the_first_eligible_provider_host(self):
+        self._overflow_group()
+        self.hub.config.raw["hosts"]["cr2"] = {
+            "slots": {"light": 2}, "provider": "cloudrun",
+            "cloudrun": {"project": "demo-cloud"}}
+        self.hub.config.raw["groups"]["pool"] = ["h1", "cr", "cr2"]
+        self._write_profile("demo@cr2")
+        # cr 没有 profile：第一台符合条件的是 cr2。
+        self.assertEqual(self._submit("pool")["targets"], ["h1", "cr2"])
+        self._write_profile("demo@cr")
+        self.assertEqual(self._submit("pool")["targets"], ["h1", "cr"])
+
+    def test_group_with_several_provider_hosts_warns_at_start(self):
+        self._overflow_group()
+        self.hub.config.raw["hosts"]["cr2"] = {
+            "slots": {"light": 2}, "provider": "cloudrun",
+            "cloudrun": {"project": "demo-cloud"}}
+        self.hub.config.raw["groups"]["pool"] = ["h1", "cr", "cr2"]
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            hub = Hub(self.hub.config, cloudrun_api=mock.Mock())
+        try:
+            self.assertIn("group pool lists several cloudrun hosts (cr, cr2)",
+                          buffer.getvalue())
+            self.assertNotIn("group cloud-only lists several", buffer.getvalue())
+        finally:
+            hub.close()
+            hub.store.close()
 
     def test_group_without_an_eligible_host_is_rejected(self):
         self._overflow_group()

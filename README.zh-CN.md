@@ -269,9 +269,10 @@ ct cloudrun status     # 本月至今的估算花费、预算、活跃的 execut
 
 发给 `--host linux` 的任务，`host-a` 或 `host-b` 有空位就在那里跑，两台都满了或离线才去 Cloud Run。
 
-* **哪些任务会溢出。** 只有为 Cloud Run 主机单独写了 `<project>@cloudrun` profile（且不是 `unsupported`）的项目，任务的目标里才保留这台主机；`<project>@*` 或 `*@cloudrun` 这样的通配 profile 不算。其他项目的组任务只会等专用主机。直接用 `--host cloudrun` 提交的任务不需要 profile，和以前一样。
+* **哪些任务会溢出。** 只有为 Cloud Run 主机单独写了 `<project>@cloudrun` profile（且不是 `unsupported`）的项目，任务的目标里才保留这台主机；`<project>@*` 或 `*@cloudrun` 这样的通配 profile 不算。其他项目的组任务只会等专用主机。直接用 `--host cloudrun` 提交的任务不需要 profile，和以前一样。一个任务最多保留一台 Cloud Run 主机：组里列了多台时，只用项目有 profile 的第一台（hub 启动时会对这样的组打警告）。
 * **开跑前失败。** 拉起失败、execution 在执行器接管前就结束、或者 `attach_timeout` 内没人接管，hub 会取消 execution（如果有），把任务放回队列并去掉 Cloud Run 主机：排队位置不变，锁恢复成提交时的样子，并发出 `job.requeued` 事件（SSE；已经收到 `job.started` 的 webhook 也会收到）。`ct show` 的 `requeued` 一行写着原因。目标只有 Cloud Run 主机的任务仍然记为 `error`，执行器接管之后的失败也一样。
-* **冷却。** 出现这类失败后，hub 在 `launch_cooldown`（5 分钟，`0` 表示关闭）内不再给这台主机预留任务。冷却期间调度器把它当作不可用，组任务交给下一台有空位的专用主机。`ct cloudrun status` 会显示冷却状态和原因。
+* **冷却。** 组任务这样放回队列之后，hub 在 `launch_cooldown`（5 分钟，`0` 表示关闭）内不再给这台主机预留任务。直接发给 Cloud Run 主机的任务失败照旧记为 `error`，不触发冷却。冷却期间调度器把这台主机当作不可用：组任务交给下一台有空位的专用主机，直接发给它的任务继续等。`ct cloudrun status` 会显示冷却状态和原因。
+* **已知限制。** 某条投递重试时，webhook 接收端看到的顺序可能是乱的；`ct wait --until started` 在任务被预留给 Cloud Run 时就返回，那时容器还没有接管。
 * **资源档位。** hub 级的 `resource_defaults` 是按多个任务共用一台专用主机来定的。Cloud Run 上的任务独占容器，所以给 Cloud Run 主机单独配 `hosts.cloudrun.resource_defaults`，每个槽位的 `memory_max` 比容器内存略小（比如 32 GiB 的 `heavy` 容器配 `28G`）。
 
 ### 代码经 GitHub 中转（`cloudrun.git`）

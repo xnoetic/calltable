@@ -725,6 +725,41 @@ class OverflowGroupTests(Base):
         self.assertEqual(failed["status"], "error")
         self.assertEqual(failed["requeue_note"], "")
 
+    def assert_not_cooling_and_other_project_launches(self):
+        self.assertFalse(self.provisioner.summary()["cloudrun"]["cooling_down"])
+        self.assertEqual(self.store.host_cooldowns, {})
+        healthy = self.hub.create_job({"project": "other", "host": "cloudrun",
+                                       "cmd": ["true"], "client_version": "9.9.9"})
+        self.api.fail_run = False
+        self.tick()
+        self.assertEqual(self.api.runs[-1]["env"]["CALLTABLE_JOB_ID"], healthy["id"])
+
+    def test_single_target_launch_failure_starts_no_cooldown(self):
+        self.api.fail_run = True
+        job = self.submit(host="cloudrun")
+        out = self.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "error")
+        self.assertNotIn("not reserving new jobs", out)
+        self.assert_not_cooling_and_other_project_launches()
+
+    def test_single_target_attach_timeout_starts_no_cooldown(self):
+        job = self.submit(host="cloudrun")
+        self.tick()
+        self.store.conn.execute("UPDATE cloud_executions SET launched=?",
+                                (now() - 3600,))
+        out = self.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "error")
+        self.assertNotIn("not reserving new jobs", out)
+        self.assert_not_cooling_and_other_project_launches()
+
+    def test_group_job_failure_starts_the_cooldown(self):
+        self.fill_h1()
+        self.api.fail_run = True
+        self.submit_group()
+        out = self.tick()
+        self.assertIn("not reserving new jobs", out)
+        self.assertTrue(self.provisioner.summary()["cloudrun"]["cooling_down"])
+
     def test_attach_racing_the_timeout_leaves_the_job_alone(self):
         self.fill_h1()
         job = self.submit_group()
@@ -785,12 +820,14 @@ class NoCooldownTests(Base):
     hosts_overrides = {"launch_cooldown": "0"}
 
     def test_zero_disables_the_cooldown(self):
+        self.config.raw["groups"] = {"pool": ["h1", "cloudrun"]}
         self.api.fail_run = True
-        self.submit()
+        first = self.submit(host="pool")  # h1 离线：溢出到 cloudrun
         with contextlib.redirect_stdout(io.StringIO()):
             self.provisioner.tick()
+        self.assertEqual(self.store.job(first["id"])["status"], "queued")
         self.api.fail_run = False
-        self.submit()
+        self.submit(host="pool")
         with contextlib.redirect_stdout(io.StringIO()):
             self.provisioner.tick()
         self.assertEqual(len(self.api.runs), 1)

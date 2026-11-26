@@ -1038,12 +1038,15 @@ class Store:
             return NOT_REQUEUED
         existing = row["requeue_note"] or ""
         merged = (existing + "; " + note) if existing else note
+        # 号码绑定（hold_seconds）按重新入队的时间重新起算：预留期间客户端
+        # 不发排队心跳，旧的 last_hold 会让 reap_queue_holds 立刻把它取消。
         self.conn.execute(
             "UPDATE jobs SET status='queued', host=?, worker='', started=NULL, "
             "locks=?, lock_templates='', targets=?, misses=0, needs_reconcile=0, "
-            "requeue_note=? WHERE id=?",
+            "requeue_note=?, last_hold=CASE WHEN hold_seconds>0 THEN ? "
+            "ELSE last_hold END WHERE id=?",
             (row["group_name"] or remaining[0], row["lock_templates"],
-             json_dumps(remaining), merged[-2000:], job_id))
+             json_dumps(remaining), merged[-2000:], now(), job_id))
         self._emit_locked(job_id, "job.requeued",
                           webhook_urls=self._retract_started_webhooks(job_id))
         return REQUEUED
@@ -1321,16 +1324,22 @@ class Store:
                 (now_ts if now_ts is not None else now(), int(limit))).fetchall()
         return [dict(row) for row in rows]
 
-    def webhook_attempt(self, delivery_id: int) -> int:
-        """投递前先落库 attempts+1；返回新的 attempts。"""
+    def webhook_attempt(self, delivery_id: int) -> int | None:
+        """投递前先落库 attempts+1；返回新的 attempts。
+
+        记录已经不在（取批之后被撤掉，例如任务放回队列时撤回 job.started）
+        返回 None：调用方不能再发送这条旧载荷。
+        """
         with self.lock:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 "UPDATE webhook_deliveries SET attempts=attempts+1, updated=? "
-                "WHERE id=?", (now(), delivery_id))
+                "WHERE id=? AND status='pending'", (now(), delivery_id))
+            if cursor.rowcount == 0:
+                return None
             row = self.conn.execute(
                 "SELECT attempts FROM webhook_deliveries WHERE id=?",
                 (delivery_id,)).fetchone()
-        return int(row["attempts"]) if row else 0
+        return int(row["attempts"]) if row else None
 
     def webhook_delivered(self, delivery_id: int, status_code: int | None) -> None:
         with self.lock:

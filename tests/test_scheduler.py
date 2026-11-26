@@ -544,6 +544,27 @@ class RequeueTests(unittest.TestCase):
         self.store.requeue_unattached(job["id"], "cr", note="x")
         self.assertEqual(self.store.webhook_deliveries(job["id"]), [])
 
+    def test_requeue_restarts_the_queue_hold(self):
+        self._fill_h1()
+        job = self.store.create_job(
+            project="p", host="pool", slot="light", locks=[], cmd=["true"],
+            group_name="pool", targets=["h1", "cr"], hold_seconds=60)
+        self.store.claim("cr", f"{PENDING_WORKER_PREFIX}abc")
+        # 预留期间客户端不发排队心跳：last_hold 早就过期了。
+        self.store.conn.execute("UPDATE jobs SET last_hold=? WHERE id=?",
+                                (time.time() - 3600, job["id"]))
+        self.assertEqual(self.store.requeue_unattached(job["id"], "cr", note="x")[0],
+                         REQUEUED)
+        self.assertEqual(self.store.reap_queue_holds(), [])
+        self.assertEqual(self.store.job(job["id"])["status"], "queued")
+
+    def test_requeue_leaves_last_hold_alone_without_a_hold(self):
+        self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+        self.store.requeue_unattached(job["id"], "cr", note="x")
+        self.assertIsNone(self.store.job(job["id"])["last_hold"])
+
     def test_cooling_down_member_does_not_block_the_next_member(self):
         # cr 在线、有空位、排在前面：不冷却时 h1 领不到。
         job = self._group_job(targets=("cr", "h1"), locks=())

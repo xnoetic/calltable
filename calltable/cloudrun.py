@@ -19,7 +19,8 @@
   ``<project>@<这台主机>`` profile 时才会溢出过来（见 ``Hub.create_job``）。
   还没有执行器 attach 就失败（拉起报错、execution 提前结束、attach 超时、
   ``pending:`` 占位超时）的组任务放回队列、去掉这台主机，由其余成员领取；
-  之后 ``launch_cooldown`` 内不再为这台主机预留新任务。
+  之后 ``launch_cooldown`` 内不再为这台主机预留新任务（只有真的放回了
+  队列才冷却；只发给这台主机的任务失败照旧记 error，不触发冷却）。
 * 花费封顶：按 execution 的存活时间 × (vCPU 单价 × vCPU + 内存单价 × GiB) 估算
   本自然月（UTC）花费，最少按 60 秒计；达到 ``monthly_budget_usd`` 后不再拉起
   新 execution，任务继续排队（``on_budget_exceeded: "queue"``，默认）或直接
@@ -821,8 +822,9 @@ class Provisioner:
             note = f"cloud run launch failed ({cloud_job}): {exc}"
             self.store.cloud_update(job["id"], state="failed", ended=now(),
                                     note=note[:500])
-            self._start_cooldown(host, settings, note)
-            if self._requeue(job["id"], host, note[:1000]) != REQUEUED:
+            if self._requeue(job["id"], host, note[:1000]) == REQUEUED:
+                self._start_cooldown(host, settings, note)
+            else:
                 self._fail(job["id"], note[:1000])
             return
         self.store.cloud_update(job["id"], execution=execution, state="launched")
@@ -1032,7 +1034,8 @@ class Provisioner:
                         outcome = self._requeue(row["job_id"], host, message)
                         if outcome == ALREADY_ATTACHED:
                             continue
-                        self._start_cooldown(host, settings, message)
+                        if outcome == REQUEUED:
+                            self._start_cooldown(host, settings, message)
                     self.store.cloud_update(row["job_id"], state="failed",
                                             ended=current, note=reason[:500])
                     if outcome != REQUEUED:
@@ -1059,7 +1062,7 @@ class Provisioner:
                     outcome = ""
                     if not row["attached"]:
                         outcome = self._requeue(job["id"], host, message)
-                        if outcome != ALREADY_ATTACHED:
+                        if outcome == REQUEUED:
                             self._start_cooldown(host, settings, message)
                     if outcome != REQUEUED:
                         self._fail(job["id"], message)
@@ -1078,7 +1081,8 @@ class Provisioner:
                 outcome = self._requeue(job["id"], host, message)
                 if outcome == ALREADY_ATTACHED:
                     continue
-                self._start_cooldown(host, settings, message)
+                if outcome == REQUEUED:
+                    self._start_cooldown(host, settings, message)
                 self._cancel(row, settings, "no executor attached within "
                              f"{settings.attach_timeout}s")
                 if outcome != REQUEUED:
@@ -1103,8 +1107,9 @@ class Provisioner:
                 outcome = self._requeue(job["id"], host, message)
                 if outcome == ALREADY_ATTACHED:
                     continue
-                self._start_cooldown(host, settings, message)
-                if outcome != REQUEUED:
+                if outcome == REQUEUED:
+                    self._start_cooldown(host, settings, message)
+                else:
                     self._fail(job["id"], message)
 
     @staticmethod
@@ -1146,7 +1151,8 @@ class Provisioner:
 
     def _start_cooldown(self, host: str, settings: CloudRunSettings,
                         reason: str) -> None:
-        """拉起失败 / 没人 attach：``launch_cooldown`` 内不再给这台主机预留任务。
+        """组任务拉起失败 / 没人 attach 并已放回队列：``launch_cooldown`` 内
+        不再给这台主机预留任务。
 
         claim 里冷却中的主机按不可用处理，组任务由其余成员照常领取。
         冷却期间再出错只延长截止时间，不重复打日志。

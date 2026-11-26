@@ -369,7 +369,9 @@ slot and only goes to Cloud Run when both are full or offline.
   profile (not `unsupported`) keep the Cloud Run host in the job's targets; a
   `<project>@*` or `*@cloudrun` fallback does not count. Every other project's
   group job simply waits for a dedicated host. Jobs sent with
-  `--host cloudrun` need no profile, as before.
+  `--host cloudrun` need no profile, as before. A job keeps at most one Cloud
+  Run host: if a group lists several, only the first one the project has a
+  profile for is used (the hub warns about such groups at start-up).
 * **Failures before the job starts.** If the launch fails, the execution ends
   before an executor attaches, or nobody attaches within `attach_timeout`, the
   hub cancels the execution (if any) and puts the job back in the queue
@@ -378,10 +380,16 @@ slot and only goes to Cloud Run when both are full or offline.
   `job.started`). `ct show` prints the reason on a `requeued` line. Jobs
   whose only target is the Cloud Run host still end as `error`, and so does
   anything that fails after the executor attached.
-* **Cooldown.** After such a failure the hub stops reserving jobs for that
-  host for `launch_cooldown` (5 min, `0` disables). During the cooldown the
-  scheduler treats the host as unavailable, so group jobs go to the next free
-  dedicated host. `ct cloudrun status` shows an active cooldown and its reason.
+* **Cooldown.** After a group job was put back in the queue this way, the hub
+  stops reserving jobs for that host for `launch_cooldown` (5 min, `0`
+  disables). A failed job sent directly to the Cloud Run host ends as `error`
+  without a cooldown, as before. During a cooldown the scheduler treats the
+  host as unavailable: group jobs go to the next free dedicated host and jobs
+  sent directly to it wait. `ct cloudrun status` shows an active cooldown and
+  its reason.
+* **Known limitations.** A webhook receiver may see deliveries out of order
+  when one is retried, and `ct wait --until started` returns once the job is
+  reserved for Cloud Run, before the container has attached.
 * **Resource tiers.** The hub-wide `resource_defaults` are sized for shared
   dedicated hosts. A job on Cloud Run has its container to itself, so give the
   Cloud Run host its own `hosts.cloudrun.resource_defaults`, with `memory_max`

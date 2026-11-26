@@ -94,6 +94,13 @@ class Hub:
                 if member not in config.hosts:
                     self._warn(f"group {group} lists {member}, but it is not in "
                                "hosts; it will never receive jobs")
+            providers = [member for member in members
+                         if member in config.hosts
+                         and config.hosts[member].provider == "cloudrun"]
+            if len(providers) > 1:
+                self._warn(f"group {group} lists several cloudrun hosts "
+                           f"({', '.join(providers)}); a job keeps only the first "
+                           "one its project has a profile for")
         # hub 重启：遗留 running 任务进入「待对账」，由心跳或超时回收。
         self.store.mark_running_for_reconcile()
         # 按需拉起的 provider 主机（Cloud Run）。没有配置就完全不加载。
@@ -436,15 +443,21 @@ class Hub:
         没有镜像 / job 定义的项目溢出到 Cloud Run 只会拉起失败；通配 profile
         （``<project>@*``、``*@<host>``）不算数。直接写 ``--host <provider 主机>``
         的提交不经过这里，行为不变。
+
+        一个组任务最多保留**一台** provider 主机（第一台符合条件的）：
+        ``cloud_executions`` 按任务 id 记一条，第二台的拉起会覆盖第一台的
+        花费和待删 git ref 记录。
         """
         kept, dropped = [], []
+        provider_kept = False
         for member in members:
             spec = self.config.hosts.get(member)
-            if (spec is not None and spec.provider == "cloudrun"
-                    and not self._has_host_profile(project, member)):
-                dropped.append(member)
-            else:
-                kept.append(member)
+            if spec is not None and spec.provider == "cloudrun":
+                if provider_kept or not self._has_host_profile(project, member):
+                    dropped.append(member)
+                    continue
+                provider_kept = True
+            kept.append(member)
         if not kept:
             raise ValueError(
                 f"no host of group {group!r} can run project {project!r}: "
