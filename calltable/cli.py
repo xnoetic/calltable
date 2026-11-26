@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import shlex
 import shutil
 import socket
 import sys
@@ -13,7 +14,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import __version__, gitops
+from . import __version__, gitops, repoconf
 from .client import HubClient, HubError
 from .config import (DEFAULT_HUB_URL, DEFAULT_OWNER_TAILNET, Config,
                      ConfigError, load_config)
@@ -235,8 +236,11 @@ def cmd_run(config: Config, args) -> int:
         # --dry-run 只做规则判定，不需要 git 仓库。
         repo = Path(args.repo or ".").resolve()
     profiles = load_profiles(config.profiles_dir)
+    decl = getattr(args, "declaration", None)
     try:
-        host = resolve_host(args.project, args.host, args.platform, profiles)
+        # 命令行 > 仓库声明 .calltable.json > hub profile 推断。
+        host, host_source = repoconf.choose_host(
+            args.project, args.host, args.platform, decl, profiles, resolve_host)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -255,18 +259,25 @@ def cmd_run(config: Config, args) -> int:
         print(f"error: profile {profile.key} is unsupported: {profile.note}",
               file=sys.stderr)
         return 2
-    # 最终生效的 slot / locks / timeout 由规则决定；命令行显式值优先，
-    # hub 会用同一套规则再算一次（以 hub 的 profile 为准）。
-    resolution = resolve_job(
-        profile, args.command,
+    # 最终生效的 slot / locks / timeout 由规则决定；命令行显式值优先，其次是
+    # 仓库声明（以显式值送给 hub），hub 会用同一套规则再算一次（以 hub 的
+    # profile 为准）。
+    explicit = repoconf.explicit_values(
+        decl, args.command,
         slot=args.slot,
         locks=list(args.lock or []),
         timeout=(parse_duration(args.timeout) if args.timeout else None),
-        no_lock=bool(getattr(args, "no_lock", False)),
+        no_lock=bool(getattr(args, "no_lock", False)))
+    resolution = resolve_job(
+        profile, args.command,
+        slot=explicit.slot,
+        locks=explicit.locks,
+        timeout=explicit.timeout,
+        no_lock=explicit.no_lock,
         default_slot=config.default_slot,
     )
-    locks = resolution.locks
     timeout = resolution.timeout
+    artifact_patterns = decl.artifacts if decl is not None else None
     if dry_run:
         print("dry-run (nothing submitted)")
         print(f"  project={args.project} host={host} "
@@ -274,6 +285,8 @@ def cmd_run(config: Config, args) -> int:
         print(f"  profile={profile.name if profile else '-'}")
         print(f"  {resolution.describe()}")
         print(f"  command={' '.join(args.command)}")
+        _print_sources(args, decl, host, host_source, profile, resolution,
+                       explicit, artifact_patterns)
         return 0
     submitter = args.submitter or make_submitter(repo, agent)
     base_ref = "" if args.no_base_ref else (args.base_ref or "")
@@ -290,7 +303,6 @@ def cmd_run(config: Config, args) -> int:
         base_ref = ""
         submission["base_ref"] = ""
 
-    locks = list(args.lock or [])
     base = submission["base_ref_sha"] or None
     hub_commits = set(client.get_json(
         f"/api/projects/{args.project}/commits",
@@ -326,10 +338,11 @@ def cmd_run(config: Config, args) -> int:
         body = {
             "project": args.project,
             "host": host,
-            # 只送显式值；规则与 profile 默认值交给 hub 统一算。
-            "slot": args.slot or None,
-            "locks": locks,
-            "no_lock": bool(getattr(args, "no_lock", False)),
+            # 只送显式值（命令行 + 仓库声明）；规则与 profile 默认值交给
+            # hub 统一算。
+            "slot": explicit.slot,
+            "locks": explicit.locks,
+            "no_lock": explicit.no_lock,
             "client_version": __version__,
             "cmd": args.command,
             "profile": profile.name if profile else "",
@@ -342,14 +355,15 @@ def cmd_run(config: Config, args) -> int:
             "base_sha": submission["base_sha"],
             "dirty": dirty,
             "tree_sha": code_tree,
-            "timeout": (parse_duration(args.timeout)
-                        if args.timeout else None),
+            "timeout": explicit.timeout,
             "bundle_id": server_bundle,
             "webhooks": notify,
             "hold_seconds": hold_seconds,
         }
         if idempotency_key:
             body["idempotency_key"] = idempotency_key
+        if artifact_patterns is not None:
+            body["artifact_patterns"] = artifact_patterns
         try:
             job, response_headers = client.request(
                 "POST", "/api/jobs", json_body=body,
@@ -380,6 +394,14 @@ def cmd_run(config: Config, args) -> int:
               f"locks={','.join(job.get('locks_display') or job['locks']) or '-'} "
               f"timeout={human_duration(job.get('timeout'))} "
               "(hub profile differs from the local one)", file=sys.stderr)
+    if decl is not None:
+        task = getattr(args, "task", "")
+        print(f"  declaration={decl.path}" + (f" task={task}" if task else ""))
+        if (artifact_patterns is not None
+                and job.get("artifact_patterns") is None):
+            print("  warning: this hub ignores artifact_patterns; artifacts "
+                  f"from {repoconf.DECLARATION_FILE} are not collected "
+                  "(upgrade the hub)", file=sys.stderr)
     print(f"  submitter={submitter}" + (f" agent={agent}" if agent else ""))
     print(f"  sha={sha[:12]}{' (dirty)' if dirty else ''} "
           f"base={base[:12] if base else '-'} timeout={human_duration(timeout)}")
@@ -403,6 +425,89 @@ def cmd_run(config: Config, args) -> int:
 
     return _follow(client, job["id"], timeout=timeout + 120,
                    until="done", chunk=RUN_WAIT_CHUNK, stream_logs=True)
+
+
+def _print_sources(args, decl, host, host_source, profile, resolution,
+                   explicit, artifact_patterns) -> None:
+    """`ct run --dry-run`：每个生效值和它的来源。"""
+    sources = getattr(args, "value_sources", {}) or {}
+    fallback = repoconf.fallback_source(resolution, profile)
+    task = getattr(args, "task", "")
+    if artifact_patterns is not None:
+        artifacts = ",".join(artifact_patterns) or "-"
+        artifacts_source = f"{repoconf.DECLARATION_FILE} artifacts"
+    elif profile is not None:
+        artifacts = ",".join(profile.artifacts) or "-"
+        artifacts_source = f"hub profile {profile.name}"
+    else:
+        artifacts, artifacts_source = "-", "hub profile (no local copy)"
+    rows = [
+        ("project", args.project, sources.get("project", "--project")),
+        ("host", host, host_source),
+        ("command", " ".join(args.command),
+         f"task {task!r} in {repoconf.DECLARATION_FILE}" if task
+         else "command line"),
+        ("slot", resolution.slot, explicit.sources.get("slot", fallback)),
+        ("locks", ",".join(resolution.locks) or "-",
+         explicit.sources.get("locks", fallback)),
+        ("timeout", f"{resolution.timeout}s",
+         explicit.sources.get("timeout", fallback)),
+        ("artifacts", artifacts, artifacts_source),
+    ]
+    print(f"  declaration={decl.path if decl is not None else '-'}")
+    print("  effective values (value <- source):")
+    for name, value, source in rows:
+        print(f"    {name:<9} {value}  <- {source}")
+
+
+def _prepare_run(args, argv: list[str]) -> int | None:
+    """读仓库声明 .calltable.json，展开任务名、补上 project。
+
+    返回退出码表示应当就此结束；None 表示继续。没有声明文件时什么都不改。
+    """
+    args.declaration = None
+    args.task = ""
+    args.value_sources = {}
+    command = list(args.command or [])
+    if command[:1] == ["--"]:
+        command = command[1:]
+    separator = "--" in argv
+    try:
+        decl = repoconf.load_declaration(args.repo or ".")
+    except repoconf.DeclarationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    if decl is not None:
+        args.declaration = decl
+        expanded, task = repoconf.expand_task(decl, command, separator)
+        if task:
+            args.command = expanded
+            args.task = task
+        elif decl.tasks and not separator and len(command) == 1:
+            print(f"note: {command[0]!r} is not a task in {decl.path} "
+                  f"(tasks: {', '.join(sorted(decl.tasks))}); running it as "
+                  "a command", file=sys.stderr)
+        elif not separator and len(command) > 1 and command[0] in decl.tasks:
+            # 任务名后面又跟了词：argparse 已把它们都收进命令。带 - 的词多半是
+            # 写错位置的选项（ct run verify --slot heavy），不能悄悄当命令提交。
+            if any(word.startswith("-") for word in command[1:]):
+                print(f"error: {command[0]!r} is a task in {decl.path}, but "
+                      f"options after a task name are not parsed: "
+                      f"`{shlex.join(command)}`. Put options before the task "
+                      f"name (ct run [options] {command[0]}), or use -- to run "
+                      "these words as a literal command", file=sys.stderr)
+                return 2
+            print(f"note: `{shlex.join(command)}` was not treated as the task "
+                  f"{command[0]!r} in {decl.path} (a task name must be the only "
+                  "word); running it as a command", file=sys.stderr)
+        if not args.project and decl.project:
+            args.project = decl.project
+            args.value_sources["project"] = (
+                f"{repoconf.DECLARATION_FILE} project")
+    if not args.project:
+        # 与原来 argparse required=True 的报错一致。
+        args.run_parser.error("the following arguments are required: --project")
+    return None
 
 
 def _validated_webhooks(urls: list[str]) -> list[str]:
@@ -909,7 +1014,9 @@ def build_parser() -> argparse.ArgumentParser:
                      help="target host; omitted => inferred from project/platform")
     run.add_argument("--platform", choices=["linux", "windows", "macos"],
                      help="platform hint used to pick a host from the profiles")
-    run.add_argument("--project", required=True)
+    run.add_argument("--project",
+                     help="calltable project; omitted => \"project\" from "
+                          ".calltable.json at the repository root")
     run.add_argument("--slot")
     run.add_argument("--lock", action="append", default=[],
                      help="named lock (repeatable); profile/rule locks are added")
@@ -944,8 +1051,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="agent/session name (or CALLTABLE_AGENT); shown on the board")
     run.add_argument("--repo", help="git repository (default: cwd)")
     run.add_argument("command", nargs=argparse.REMAINDER,
-                     help="-- <command...>")
-    run.set_defaults(func=cmd_run)
+                     help="-- <command...>, or a task name from .calltable.json")
+    run.set_defaults(func=cmd_run, run_parser=run)
 
     ls = csub.add_parser("ls", help="list jobs")
     _add_cli_options(ls)
@@ -1076,6 +1183,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     name = getattr(args, "command_name", None)
+    if getattr(args, "mode", None) == "cli" and name == "run":
+        code = _prepare_run(args, argv)
+        if code is not None:
+            return code
 
     # setup 不需要已有配置；doctor/self-update 允许没有配置也能跑。
     if name == "setup":

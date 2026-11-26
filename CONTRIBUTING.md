@@ -60,6 +60,7 @@ calltable/
   cli.py         command line entry point (hub/exec/cli subcommands)
   config.py      config model and lookup order
   profiles.py    profile loading, rules, host inference
+  repoconf.py    repository declaration .calltable.json (ct run defaults, tasks)
   db.py          SQLite schema, atomic scheduling, reconciliation
   hub.py         HTTP JSON API + dashboard routes + janitor
   client.py      standard-library hub client (streaming upload/download)

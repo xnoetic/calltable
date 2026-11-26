@@ -830,5 +830,59 @@ class GitRelayFetchTests(unittest.TestCase):
         self.assertNotIn(self.TOKEN, env.values())
 
 
+class ArtifactRegexTests(unittest.TestCase):
+    """产物 glob -> 正则：连续的 ``*`` 合成一个通配，匹配集合不变，且在上限
+    之内（最多 4 段通配）的最坏 glob 也很快匹配完。"""
+
+    def matches(self, pattern, path):
+        return bool(executor_module._artifact_regex(pattern).fullmatch(path))
+
+    def test_patterns_in_use_keep_matching(self):
+        cases = [
+            ("ct-smoke-artifacts/**", "ct-smoke-artifacts/a/b.txt", True),
+            ("ct-smoke-artifacts/**", "other/a.txt", False),
+            ("artifacts/*", "artifacts/big.bin", True),
+            ("artifacts/*", "artifacts/sub/big.bin", False),
+            ("**/TestResults/*.trx", "TestResults/a.trx", True),
+            ("**/TestResults/*.trx", "x/y/TestResults/a.trx", True),
+            ("tests/**/TestResults/**/*.trx", "tests/P/TestResults/a.trx", True),
+            ("reports/**/*.xml", "reports/a.xml", True),
+            ("out/*.json", "out/a.json", True),
+            ("out/?.json", "out/ab.json", False),
+        ]
+        for pattern, path, expected in cases:
+            with self.subTest(pattern=pattern, path=path):
+                self.assertEqual(self.matches(pattern, path), expected)
+
+    def test_longer_star_runs_match_like_before(self):
+        # 原来逐对翻译：*** = ** + *，**** = ** + **（最后一对后跟 / 时是 **/）。
+        cases = [
+            ("a/***", "a/b/c", True),
+            ("***.txt", "x/y.txt", True),
+            ("***/a", "a", False),        # 奇数个：/ 按字面匹配
+            ("***/a", "x/a", True),
+            ("****/a", "a", True),        # 偶数个：最后一对是 **/，/ 可以不出现
+            ("****/a", "xa", True),
+            ("**/a", "xa", False),
+        ]
+        for pattern, path, expected in cases:
+            with self.subTest(pattern=pattern, path=path):
+                self.assertEqual(self.matches(pattern, path), expected)
+        regex = executor_module._artifact_regex("a/******b")
+        self.assertEqual(regex.pattern.count("*"), 1)
+
+    def test_worst_allowed_pattern_is_fast(self):
+        from calltable.util import artifact_pattern_problem
+        name = "a" * 120
+        for pattern in ("**a**a**a**a!", "*a*a*a*a!", "**?**?**?**?!",
+                        "*****a*****a*****a*****a!"):
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(artifact_pattern_problem(pattern))
+                regex = executor_module._artifact_regex(pattern)
+                started = time.monotonic()
+                self.assertIsNone(regex.fullmatch(name))
+                self.assertLess(time.monotonic() - started, 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

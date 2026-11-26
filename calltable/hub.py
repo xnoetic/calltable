@@ -30,7 +30,8 @@ from .dashboard import render_page
 from .db import QUEUED, TERMINAL, IdempotencyConflict, Store
 from .profiles import (Profile, find_profile, load_profiles, match_rule,
                        resolve_job)
-from .util import (iso, json_dumps, now, parse_duration, valid_project_name,
+from .util import (MAX_ARTIFACT_PATTERNS, artifact_pattern_problem, iso,
+                   json_dumps, now, parse_duration, valid_project_name,
                    version_tuple)
 from .webhooks import (WebhookDispatcher, deliveries_for_display,
                        validate_url)
@@ -412,13 +413,15 @@ class Hub:
                 raise ValueError("bundle path rejected")
         webhooks = self._job_webhooks(body)
         hold_seconds = self._job_hold_seconds(body)
+        artifact_patterns = self._job_artifact_patterns(body)
         idempotency = self._job_idempotency(
             body, project=project, host=host, cmd=cmd,
             sha=str(body.get("sha") or ""),
             tree_sha=str(body.get("tree_sha") or "").strip(),
             base_ref=str(body.get("base_ref") or ""),
             dirty=bool(body.get("dirty")), slot=slot, locks=locks,
-            timeout=timeout, label=str(body.get("label") or ""))
+            timeout=timeout, label=str(body.get("label") or ""),
+            artifact_patterns=artifact_patterns)
         job = self.store.create_job(
             project=project, host=host, slot=slot, locks=locks, cmd=cmd,
             profile=(profile.name if profile else ""),
@@ -432,8 +435,29 @@ class Hub:
             dirty=bool(body.get("dirty")),
             timeout=timeout, bundle_id=bundle_id, group_name=group_name,
             targets=targets, webhooks=webhooks, hold_seconds=hold_seconds,
-            idempotency=idempotency)
+            idempotency=idempotency, artifact_patterns=artifact_patterns)
         return job
+
+    @staticmethod
+    def _job_artifact_patterns(body: dict) -> list[str] | None:
+        """仓库声明的产物 glob：缺省（None）表示沿用 hub profile。"""
+        raw = body.get("artifact_patterns")
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or len(raw) > MAX_ARTIFACT_PATTERNS:
+            raise ValueError("artifact_patterns must be an array of at most "
+                             f"{MAX_ARTIFACT_PATTERNS} strings")
+        patterns: list[str] = []
+        for index, item in enumerate(raw):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("artifact_patterns must be non-empty strings")
+            pattern = item.strip()
+            # 和客户端 repoconf 同一套检查（相对路径、长度、通配段数）。
+            problem = artifact_pattern_problem(pattern)
+            if problem:
+                raise ValueError(f"artifact_patterns[{index}] {problem}")
+            patterns.append(pattern)
+        return patterns
 
     def _group_targets(self, group: str, project: str,
                        members: list[str]) -> list[str]:
@@ -503,7 +527,9 @@ class Hub:
                          cmd: list[str], sha: str, tree_sha: str,
                          base_ref: str, dirty: bool,
                          slot: str, locks: list[str], timeout: int,
-                         label: str) -> dict | None:
+                         label: str,
+                         artifact_patterns: list[str] | None = None
+                         ) -> dict | None:
         key = str(body.get("idempotency_key") or "").strip()
         if not key:
             return None
@@ -518,10 +544,12 @@ class Hub:
             code_identity = "tree:" + tree_sha
         else:
             code_identity = "commit:" + sha
+        extra = ({} if artifact_patterns is None
+                 else {"artifact_patterns": list(artifact_patterns)})
         fingerprint = submission_fingerprint(
             project=project, host=host, cmd=list(cmd), base_ref=base_ref,
             dirty=bool(dirty), code_identity=code_identity, slot=slot,
-            locks=list(locks), timeout=timeout, label=label)
+            locks=list(locks), timeout=timeout, label=label, **extra)
         return {"key": key, "fingerprint": fingerprint,
                 "window": self.config.idempotency_window_seconds}
 
@@ -650,6 +678,9 @@ class Hub:
         payload = dict(job)
         payload["bundle_url"] = (f"/api/jobs/{job['id']}/bundle" if bundle else "")
         payload["profile_data"] = profile_to_dict(profile) if profile else {}
+        if job.get("artifact_patterns") is not None:
+            # 仓库声明的产物 glob 取代 hub profile 的（命令行 > 声明 > profile）。
+            payload["profile_data"]["artifacts"] = list(job["artifact_patterns"])
         # 按实际执行主机取档位（与 hub_profile 同一台）：主机级覆盖 hub 级。
         tier = self.config.host_resource_tier(job["host"], job["slot"])
         rule, _ = match_rule(profile, job.get("cmd") or [])

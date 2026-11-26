@@ -68,21 +68,35 @@ _GIT_RELAY_REFS_RE = re.compile(r"^refs/calltable/jobs/[A-Za-z0-9][A-Za-z0-9._-]
 
 
 def _artifact_regex(pattern: str) -> re.Pattern[str]:
-    """把产物 glob 转成正则（``**`` 跨目录，``**/`` 可匹配零层）。"""
+    """把产物 glob 转成正则（``**`` 跨目录，``**/`` 可匹配零层）。
+
+    一段连续的 ``*`` 只生成一个通配，不再叠出会回溯的多个量词。匹配的集合与
+    原来逐对翻译（``**`` -> ``.*``，``**/`` -> ``(?:.*/)?``，剩一个 ``*`` ->
+    ``[^/]*``）完全相同：
+
+    - ``*`` -> ``[^/]*``；两个及以上 -> ``.*``；
+    - 后面紧跟 ``/`` 且个数为偶数时，最后一对原来是 ``**/``，``/`` 可以不出现：
+      恰好两个 -> ``(?:.*/)?``，四个及以上 -> ``.*``（``.*(?:.*/)?`` 等于
+      ``.*``），都把这个 ``/`` 一并吃掉；个数为奇数时 ``/`` 仍按字面匹配。
+    """
     out = ["^"]
     i = 0
     while i < len(pattern):
-        if pattern.startswith("**/", i):
-            out.append("(?:.*/)?")
-            i += 3
-            continue
         ch = pattern[i]
         if ch == "*":
-            if pattern.startswith("**", i):
+            end = i
+            while end < len(pattern) and pattern[end] == "*":
+                end += 1
+            run = end - i
+            slash = pattern.startswith("/", end) and run % 2 == 0
+            if run == 1:
+                out.append("[^/]*")
+            elif run == 2 and slash:
+                out.append("(?:.*/)?")
+            else:
                 out.append(".*")
-                i += 2
-                continue
-            out.append("[^/]*")
+            i = end + 1 if slash else end
+            continue
         elif ch == "?":
             out.append("[^/]")
         else:

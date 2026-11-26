@@ -129,6 +129,32 @@ def valid_project_name(name: str) -> bool:
     return bool(name) and bool(PROJECT_RE.fullmatch(name))
 
 
+#: 随提交送给 hub 的产物 glob（``artifact_patterns``）的上限。仓库声明由写被测
+#: 代码的人提供，glob 转成的正则会回溯，所以限制条数、长度和通配段数；
+#: hub（``Hub._job_artifact_patterns``）和客户端（``repoconf``）共用这一份。
+MAX_ARTIFACT_PATTERNS = 100
+MAX_ARTIFACT_PATTERN_LENGTH = 256
+#: 连续的 ``*`` 算一段（``**`` 是一段，``*a*`` 是两段）。
+MAX_ARTIFACT_PATTERN_WILDCARDS = 4
+
+
+def artifact_pattern_problem(pattern: str) -> str | None:
+    """检查一条（已去掉首尾空白的）产物 glob；合格返回 None，否则返回原因。"""
+    # 与平台无关地判断：执行器可能在 Windows 上，hub 在 Linux 上。
+    if (".." in re.split(r"[\\/]+", pattern)
+            or pattern.startswith(("/", "\\"))
+            or re.match(r"[A-Za-z]:", pattern)):
+        return f"must be a worktree-relative glob: {pattern!r}"
+    if len(pattern) > MAX_ARTIFACT_PATTERN_LENGTH:
+        return (f"must be at most {MAX_ARTIFACT_PATTERN_LENGTH} characters, "
+                f"got {len(pattern)}")
+    runs = len(re.findall(r"\*+", pattern))
+    if runs > MAX_ARTIFACT_PATTERN_WILDCARDS:
+        return (f"must contain at most {MAX_ARTIFACT_PATTERN_WILDCARDS} "
+                f"wildcard runs ('*' or '**'), got {runs}: {pattern!r}")
+    return None
+
+
 # ---------------------------------------------------------------- 小工具
 
 def json_dumps(value) -> str:
