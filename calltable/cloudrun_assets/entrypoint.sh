@@ -10,6 +10,12 @@
 #                        a userspace tailscaled is started in this container and
 #                        only the executor's hub traffic goes through it.
 #   CALLTABLE_WORK_DIR   optional work root (an ephemeral-disk mount); default /tmp
+#   CALLTABLE_MIRROR_ROOT  directory with git mirrors baked into the image
+#                        (default /opt/calltable/mirrors); used as the executor's
+#                        mirror_root when it exists, else $WORK/mirrors
+#   CALLTABLE_GIT_URL, CALLTABLE_GIT_REFS  set by the hub when it pushed the job's
+#                        commit to the project's git remote (profile cloudrun.git);
+#                        CALLTABLE_GIT_TOKEN optional read token (Secret Manager)
 set -eu
 
 : "${CALLTABLE_JOB_ID:?CALLTABLE_JOB_ID is required}"
@@ -20,6 +26,11 @@ WORK="${CALLTABLE_WORK_DIR:-/tmp}/calltable"
 STATE="/tmp/calltable-state"
 mkdir -p "$WORK" "$STATE"
 chmod 0700 "$WORK" "$STATE"
+MIRRORS="$WORK/mirrors"
+BAKED="${CALLTABLE_MIRROR_ROOT:-/opt/calltable/mirrors}"
+if [ -d "$BAKED" ]; then
+  MIRRORS="$BAKED"
+fi
 
 PROXY=""
 if [ -n "${TS_AUTHKEY:-}" ]; then
@@ -54,7 +65,7 @@ cat >"$STATE/config.json" <<JSON
   "exec_host": "$HOST",
   "data_dir": "$WORK/data",
   "runs_root": "$WORK/runs",
-  "mirror_root": "$WORK/mirrors",
+  "mirror_root": "$MIRRORS",
   "max_jobs": 1,
   "poll_interval": 3,
   "use_systemd": false,

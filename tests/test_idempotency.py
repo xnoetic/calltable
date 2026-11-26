@@ -321,6 +321,27 @@ class MigrationTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_overflow_columns_are_added_to_an_old_database(self):
+        store = Store(self.db)
+        try:
+            columns = {row["name"] for row in store.conn.execute(
+                "PRAGMA table_info(jobs)")}
+            self.assertIn("lock_templates", columns)
+            self.assertIn("requeue_note", columns)
+            old = store.job("job-old")
+            self.assertEqual(old["requeue_note"], "")
+            self.assertNotIn("lock_templates", old)
+            # 迁移后 claim 照常记下锁模板。
+            store.heartbeat("h1", "w1", [])
+            new = store.create_job(project="demo", host="h1", slot="light",
+                                   locks=["gate@{host}"], cmd=["true"])
+            self.assertEqual(store.claim("h1", "w1")["locks"], ["gate@h1"])
+            row = store.conn.execute("SELECT lock_templates FROM jobs WHERE id=?",
+                                     (new["id"],)).fetchone()
+            self.assertEqual(json.loads(row["lock_templates"]), ["gate@{host}"])
+        finally:
+            store.close()
+
     def test_hub_starts_on_an_old_database(self):
         config = make_config(self.root / "cfg", hosts={
             "h1": {"slots": {"light": 1}}})

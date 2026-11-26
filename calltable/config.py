@@ -23,6 +23,28 @@ class ConfigError(RuntimeError):
     pass
 
 
+def _host_tiers(host: str, raw) -> dict[str, dict[str, str]]:
+    """校验并规整 ``hosts.<name>.resource_defaults``（slot → {键: 值}）。
+
+    与 hub 级 ``resource_defaults`` 一致：slot 名和键都不限定，值转成字符串；
+    缺省 / null 表示不覆盖。结构不对直接报错，指明是哪台主机。
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"host {host}: resource_defaults must be an object of "
+                          "slot -> {memory_max, cpu_weight, slice}")
+    tiers: dict[str, dict[str, str]] = {}
+    for slot, spec in raw.items():
+        if spec is None:
+            continue
+        if not isinstance(spec, dict):
+            raise ConfigError(f"host {host}: resource_defaults.{slot} must be an "
+                              "object such as {\"memory_max\": \"8G\"}")
+        tiers[str(slot)] = {str(k): str(v) for k, v in spec.items()}
+    return tiers
+
+
 @dataclass
 class HostSpec:
     name: str
@@ -34,6 +56,9 @@ class HostSpec:
     provider: str = "static"
     #: provider 专属配置（``provider == "cloudrun"`` 时是 Cloud Run 设置）。
     provider_config: dict = field(default_factory=dict)
+    #: 这台主机自己的资源档位（``hosts.<name>.resource_defaults``），按 slot、
+    #: 按键覆盖 hub 级 ``resource_defaults``。只含配置里写了的键。
+    resource_defaults: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def ephemeral(self) -> bool:
@@ -180,6 +205,7 @@ class Config:
                 provider=provider,
                 provider_config=(dict(spec.get(provider) or {})
                                  if provider != "static" else {}),
+                resource_defaults=_host_tiers(name, spec.get("resource_defaults")),
             )
         return result
 
@@ -210,6 +236,17 @@ class Config:
             defaults.setdefault(str(slot), {}).update(
                 {str(k): str(v) for k, v in (spec or {}).items()})
         return defaults
+
+    def host_resource_tier(self, host: str, slot: str) -> dict[str, str]:
+        """某台主机上某个 slot 的资源档位：主机级按键覆盖 hub 级。
+
+        没配主机级档位（或主机不在配置里）就是 hub 级档位。
+        """
+        tier = dict(self.resource_defaults.get(slot, {}))
+        spec = self.hosts.get(host)
+        if spec is not None:
+            tier.update(spec.resource_defaults.get(slot, {}))
+        return tier
 
     @property
     def upstreams(self) -> dict[str, str]:
@@ -405,4 +442,7 @@ def load_config(explicit: str | None = None, *, require_token: bool = True) -> C
     data_dir = Path(raw.get("data_dir") or (path.parent / "data")).expanduser()
     if not data_dir.is_absolute():
         data_dir = (path.parent / data_dir).resolve()
+    for name, spec in (raw.get("hosts") or {}).items():
+        if isinstance(spec, dict):
+            _host_tiers(str(name), spec.get("resource_defaults"))
     return Config(path=path, raw=raw, token=token, data_dir=data_dir)

@@ -2272,6 +2272,7 @@ function renderDetail(job) {
   rows.push(metaItem('内存峰值', esc(fmtBytes(job.mem_peak))));
   rows.push(metaItem('命令', '<span class="mono">' +
     esc((job.cmd || []).join(' ') || '–') + '</span>', 'wide cmd'));
+  if (job.requeue_note) rows.push(metaItem('放回队列', esc(job.requeue_note), 'wide'));
   if (job.error) rows.push(metaItem('错误', esc(job.error), 'wide'));
   document.getElementById('d-meta').innerHTML = rows.join('');
 }

@@ -270,9 +270,14 @@ Exit codes of `ct wait`:
 
 ## 6. Events and webhook payloads
 
-Event types: `job.queued`, `job.started`, `job.finished`. Webhooks are sent for
-`job.started` and `job.finished` only (that is "your table is ready" and "the
-meal is over"). Both the SSE `data` and the webhook body use:
+Event types: `job.queued`, `job.started`, `job.requeued`, `job.finished`.
+Webhooks are sent for `job.started` and `job.finished` (that is "your table is
+ready" and "the meal is over"). `job.requeued` means a reserved job went back
+to `queued` before any executor attached (a Cloud Run overflow that failed to
+start); it is sent as a webhook only to URLs that already received
+`job.started`, and that job's `job.started` is delivered again when it really
+starts. Consumers should ignore event types they do not know. Both the SSE
+`data` and the webhook body use:
 
 ```json
 {

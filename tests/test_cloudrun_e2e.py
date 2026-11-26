@@ -114,6 +114,17 @@ class CloudRunEndToEndTests(unittest.TestCase):
             "name": "demo@cloudrun", "slot": "light", "timeout": "5m",
             "cloudrun": {"base_image": "python:3.12-slim"},
         }), encoding="utf-8")
+        # 「GitHub」：本地裸仓库。项目 relay 配了 cloudrun.git，代码经它中转。
+        cls.remote = root / "github-remote.git"
+        git(root, "clone", "-q", "--bare", str(cls.repo), str(cls.remote))
+        (profiles / "relay@cloudrun.json").write_text(json.dumps({
+            "name": "relay@cloudrun", "slot": "light", "timeout": "5m",
+            "cloudrun": {"base_image": "python:3.12-slim",
+                         "git": {"url": str(cls.remote)}},
+        }), encoding="utf-8")
+        # 镜像里预置的镜像目录：默认不存在（其余用例走 $WORK/mirrors），
+        # relay 用例临时建出来，模拟 `ct cloudrun image` 烘进去的历史。
+        cls.baked = root / "baked-mirrors"
         cls.config_path = root / "config.json"
         cls.config_path.write_text(json.dumps({
             "token": TOKEN,
@@ -147,6 +158,7 @@ class CloudRunEndToEndTests(unittest.TestCase):
             # What Cloud Run injects from Secret Manager / the job definition.
             "CALLTABLE_TOKEN": TOKEN,
             "CALLTABLE_WORK_DIR": str(root / "cloudrun-work"),
+            "CALLTABLE_MIRROR_ROOT": str(cls.baked),
         })
         env.pop("TS_AUTHKEY", None)
         # 子进程的 python3 必须是 3.12+；把当前解释器放到 PATH 最前面。
@@ -229,7 +241,9 @@ class CloudRunEndToEndTests(unittest.TestCase):
 
         calls = [json.loads(line) for line in
                  (self.state / "calls.log").read_text().splitlines()]
-        execute = [c for c in calls if c[:3] == ["run", "jobs", "execute"]]
+        # 同一个 hub 上别的用例也会 execute：只看这个任务的那一次。
+        execute = [c for c in calls if c[:3] == ["run", "jobs", "execute"]
+                   and f"CALLTABLE_JOB_ID={job_id}" in " ".join(c)]
         self.assertEqual(len(execute), 1)
         self.assertEqual(execute[0][3], "ct-demo-light")
         self.assertIn(f"CALLTABLE_JOB_ID={job_id}",
@@ -288,6 +302,60 @@ class CloudRunEndToEndTests(unittest.TestCase):
         self.assertIn("demo second", second.stdout)
         job = self._api(f"/api/jobs/{job_id_from(second.stdout)}")
         self.assertEqual(job["status"], "succeeded", self._diagnostics())
+
+    def test_cloudrun_git_relays_code_through_the_remote(self):
+        """profile 配了 cloudrun.git：hub 把快照（含未提交改动）推成远端临时
+        ref，容器在预置镜像上只取增量，不从 hub 下载 bundle；结束后 ref 被删。"""
+        self.baked.mkdir()
+        self.addCleanup(shutil.rmtree, self.baked, True)
+        git(self.root, "clone", "-q", "--bare", "--single-branch", "--branch",
+            "main", str(self.remote), str(self.baked / "relay.git"))
+        untracked = self.repo / "relay.txt"
+        untracked.write_text("uncommitted relay work\n", encoding="utf-8")
+        self.addCleanup(untracked.unlink, True)
+        shutil.rmtree(Path(self.env["CALLTABLE_WORK_DIR"]), ignore_errors=True)
+
+        cli = subprocess.run(
+            [sys.executable, "-m", "calltable", "cli", "run",
+             "--config", str(self.config_path), "--host", "cloudrun",
+             "--project", "relay", "--repo", str(self.repo), "--wait",
+             "--timeout", "3m", "--",
+             sys.executable, "-c", "print(open('relay.txt').read().strip())"],
+            cwd=str(REPO_ROOT), env=self.env, capture_output=True, text=True,
+            timeout=240)
+        self.assertEqual(cli.returncode, 0,
+                         cli.stdout + cli.stderr + self._diagnostics())
+        self.assertIn("uncommitted relay work", cli.stdout)
+        job_id = job_id_from(cli.stdout)
+        self.assertEqual(self._api(f"/api/jobs/{job_id}")["status"], "succeeded")
+
+        calls = [json.loads(line) for line in
+                 (self.state / "calls.log").read_text().splitlines()]
+        execute = [c for c in calls if c[:3] == ["run", "jobs", "execute"]
+                   and c[3] == "ct-relay-light"]
+        self.assertEqual(len(execute), 1)
+        env_arg = next(a for a in execute[0] if a.startswith("--update-env-vars="))
+        self.assertIn(f"CALLTABLE_GIT_URL={self.remote}", env_arg)
+        self.assertIn(f"CALLTABLE_GIT_REFS=refs/calltable/jobs/{job_id}", env_arg)
+        exec_logs = "".join(log.read_text() for log in self.state.glob("ct-relay-*.log"))
+        self.assertIn(f"git relay: fetched refs/calltable/jobs/{job_id}", exec_logs,
+                      self._diagnostics())
+        self.assertNotIn("falling back", exec_logs)
+        # 用的是预置镜像（CALLTABLE_MIRROR_ROOT），提交进了它的私有命名空间。
+        relayed = git(self.baked / "relay.git", "for-each-ref",
+                      "--format=%(refname)", "refs/calltable/relay/")
+        self.assertIn("refs/calltable/relay/head", relayed)
+
+        self._wait_executions_gone()
+        deadline = time.time() + 30
+        remaining = "?"
+        while time.time() < deadline:
+            remaining = git(self.root, "ls-remote", str(self.remote),
+                            "refs/calltable/*")
+            if not remaining:
+                break
+            time.sleep(0.5)
+        self.assertEqual(remaining, "", self._diagnostics())
 
 
 if __name__ == "__main__":
