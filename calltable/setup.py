@@ -7,7 +7,9 @@ token 获取顺序：``--token`` → ``--token-file <path>`` → 环境变量
 写到哪里：``--config`` 给了就写那里；否则新装写 ``~/.calltable/config.json``，
 已经只有旧位置 ``~/.config/calltable/config.json`` 的机器就地更新旧文件（不
 悄悄多出一份新文件把它遮住）。见 :func:`default_target`。
-文件权限：Unix 0600（目录 0700），Windows 用 icacls 把继承权限去掉、只留当前用户。
+文件权限：Unix 上文件一创建就是 0600；目录只有本次新建的（以及旧位置
+``~/.config/calltable``）才设为 0700，已有的 ``~/.calltable`` 不改权限。
+Windows 用 icacls 把继承权限去掉、只留当前用户。
 """
 
 from __future__ import annotations
@@ -56,11 +58,6 @@ def resolve_token(explicit: str | None = None,
         f"no token given; pass --token, --token-file <path>, or set {TOKEN_ENV}")
 
 
-def _restrict_posix(path: Path) -> None:
-    os.chmod(path.parent, 0o700)
-    os.chmod(path, 0o600)
-
-
 def _restrict_windows(path: Path) -> None:
     user = os.environ.get("USERNAME") or getpass.getuser()
     # 去掉继承 ACE，只给当前用户完全控制；失败不致命（文件本身已经写好）。
@@ -72,15 +69,30 @@ def _restrict_windows(path: Path) -> None:
         pass
 
 
+def _owns_parent(path: Path, created: bool) -> bool:
+    """目录要不要收紧到 0700：本次新建的，或旧位置 ``~/.config/calltable``
+    （那是 calltable 专用的目录，沿用以前的做法）。已有的 ``~/.calltable`` 里
+    还放着源码检出等别的东西，``--config`` 指向的目录也不归 setup 管，都不动。"""
+    return created or path.parent == legacy_user_config_path().parent
+
+
 def write_config(path: str | Path, data: dict) -> Path:
     path = Path(path).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-                    encoding="utf-8")
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    created = not path.parent.is_dir()
     if os.name == "nt":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
         _restrict_windows(path)
-    else:
-        _restrict_posix(path)
+        return path
+    # POSIX：目录和文件一创建就是仅本人可读写，不留按 umask 可读的空窗。
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if _owns_parent(path, created):
+        os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        os.fchmod(handle.fileno(), 0o600)  # 已有文件：写入新内容前先收紧
+        handle.write(text)
     return path
 
 
@@ -105,7 +117,8 @@ def default_target() -> Path:
     """
     preferred = user_config_path()
     legacy = legacy_user_config_path()
-    if not preferred.exists() and legacy.exists():
+    # 与 locate_config 一致只认普通文件：新位置上是目录时更新旧文件。
+    if not preferred.is_file() and legacy.is_file():
         return legacy
     return preferred
 
@@ -126,7 +139,11 @@ def setup(*, hub: str | None = None, token: str | None = None,
     if owner_tailnet or DEFAULT_OWNER_TAILNET:
         updates["owner_tailnet"] = owner_tailnet or DEFAULT_OWNER_TAILNET
     data = merge_config(target, updates)
-    write_config(target, data)
+    try:
+        write_config(target, data)
+    except OSError as exc:
+        raise SetupError(f"cannot write config {target}: {exc}; remove or fix "
+                         "that path, or pass --config <path>") from exc
     return target, data
 
 

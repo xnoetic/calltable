@@ -34,7 +34,9 @@ Both outputs carry `schema_version` (an integer, currently `1`) and `kind`.
 ### Location
 
 The client config is one JSON object. It is looked up in this fixed order; the
-first one that exists is used:
+first one that exists is used (for the two user-level locations, only a regular
+file counts: a directory at `~/.calltable/config.json` is skipped. An empty or
+invalid regular file is still selected and reported as an error):
 
 1. `--config <path>` (source `flag`; a missing file is an error)
 2. the `CALLTABLE_CONFIG` environment variable (source `env`; a missing file is
@@ -51,8 +53,14 @@ file is ignored; it is listed in `config.shadowed` of both outputs, and
 `ct setup` without `--config` writes `~/.calltable/config.json` on a new
 machine. On a machine that only has `~/.config/calltable/config.json` it updates
 that file in place, so an existing install keeps working unchanged. The file is
-written owner-only: mode `0600` in a `0700` directory on POSIX; on Windows
-inherited ACEs are removed and only the current user is granted access.
+written owner-only: on POSIX it is created with mode `0600` (an existing file is
+set to `0600` before the new content is written). A directory that `ct setup`
+creates is created with mode `0700`; an existing directory keeps its mode
+(`~/.calltable` may also hold a source checkout and other files), except the
+legacy `~/.config/calltable`, which is calltable's own directory and is still
+set to `0700`. On Windows inherited ACEs are removed and only the current user
+is granted access. If the file cannot be written (for example because the path
+is a directory), `ct setup` fails with exit code `2` and names the path.
 
 ### Client fields
 
@@ -66,15 +74,19 @@ uses are:
 | `token` | string | bearer token; `CALLTABLE_TOKEN` overrides it. Never printed by the commands below |
 | `owner_tailnet` | string | optional; enables the tailscale branch of `ct doctor` |
 | `machines` | object | optional; verification machines registered on this computer, keyed by name |
-| `machines.<name>.ssh` | string | optional; an ssh alias (one word, no spaces), resolved by the user's own ssh config |
+| `machines.<name>.ssh` | string | optional; an ssh alias or `user@alias`, resolved by the user's own ssh config (see below for the allowed characters) |
 | `machines.<name>.platform` | string | optional; `linux`, `windows` or `macos` (case-insensitive, reported lower-case) |
 | `machines.<name>.purpose` | string | optional; free-text note on what the machine is for |
 
 `machines` is not used for scheduling; calltable only validates it and reports
 it, so that this information is kept in one place instead of in each project's
-documentation. A machine name matches `[A-Za-z0-9][A-Za-z0-9._-]*`. A machine
-entry may be `null` or `{}`. Unknown keys inside an entry, non-string values, an
-ssh value containing whitespace, or an unknown platform make the config invalid
+documentation. A machine name matches `[A-Za-z0-9][A-Za-z0-9._-]*` in full (no
+trailing newline or other characters). A non-empty `ssh` value matches
+`([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*` in full, so it is
+always one word that cannot start with `-` and scripts can pass it to `ssh`
+as the destination. A machine entry may be `null` or `{}`. Unknown keys inside
+an entry, non-string values, an ssh value outside that pattern (whitespace,
+a leading `-`, `$`, `/`, `=` and so on), or an unknown platform make the config invalid
 (every `ct` command then fails with a config error naming the entry). Do not put
 addresses, ports, user names or key paths here: keep those in `~/.ssh/config`
 and register only the alias.
@@ -110,7 +122,7 @@ still printed, with `config.error` set). It does not contact the hub.
 | `config.search_order` | array of objects | every location checked, in lookup order (`flag` and `env` only when given) |
 | `config.search_order[].source` | string | `flag`, `env`, `home` or `legacy` |
 | `config.search_order[].path` | string | path checked |
-| `config.search_order[].exists` | boolean | whether that file exists |
+| `config.search_order[].exists` | boolean | whether that file exists (for `home` and `legacy`: whether it is a regular file) |
 | `config.error` | string or null | why no usable config was loaded; `null` when it loaded |
 | `hub_url` | string or null | configured hub URL with any `user:password@`, query and fragment removed; `null` without a config |
 | `token_present` | boolean | whether a token is available (config or `CALLTABLE_TOKEN`) |
@@ -188,7 +200,13 @@ it is reported in `config.error` and the defaults are used, exactly as in
 
 Neither output ever contains the token, whether it comes from the config file,
 `CALLTABLE_TOKEN` or `--token`: only `token_present` and `token_source` are
-reported. Hub URLs are printed without `user:password@`, query or fragment. As
-a safety net, any occurrence of a known secret value (token, URL password or
-query value, at least 8 characters long) in any string of the output is
-replaced with `[redacted]`.
+reported. Hub URLs are printed without `user:password@`, query or fragment,
+including where `ct doctor --json` quotes the hub URL inside `line`, `reasons`,
+`hub.detail` and `hosts_error`. In those free-text fields any remaining
+occurrence of the hub URL's user name, password or query values (as written
+and percent-decoded) is replaced with `[redacted]` whatever its length, so a
+very short value may also replace ordinary text there. As a safety net, any
+occurrence of a known secret value (token, URL user name, password or query
+value, at least 8 characters long) in any string of either output is replaced
+with `[redacted]`. The human `ct doctor` line is unchanged and still shows
+the hub URL as configured.

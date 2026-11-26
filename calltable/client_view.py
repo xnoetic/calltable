@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from . import __version__
 from .config import (SOURCE_ENV, SOURCE_FLAG, Config, ConfigError, load_config,
@@ -27,6 +27,8 @@ TOKEN_ENV = "CALLTABLE_TOKEN"
 REDACTED = "[redacted]"
 #: 短于这个长度的值不做字符串替换（否则会把普通字符改坏）；真实令牌远长于此。
 _MIN_SECRET_LEN = 8
+#: :func:`doctor_payload` 替换自由文本时临时代替脱敏后 hub 地址的占位符。
+_URL_PLACEHOLDER = "\x00hub-url\x00"
 
 
 def redact_url(url: str | None) -> str | None:
@@ -42,23 +44,28 @@ def redact_url(url: str | None) -> str | None:
 
 
 def url_secrets(url: str | None) -> list[str]:
+    """URL 里可能是凭据的部分：用户名、口令、查询串的值（原样和解码后各一份）。"""
     if not url:
         return []
     try:
         parts = urlsplit(str(url))
     except ValueError:
         return []
-    found = [parts.password or ""]
+    found = [parts.username or "", parts.password or ""]
     if parts.query:
         found.extend(value for item in parts.query.split("&")
                      for value in item.split("=", 1)[1:])
+    found += [unquote(value) for value in found]
     return [value for value in found if value]
 
 
-def scrub(value, secrets) -> object:
-    """递归地把字符串里出现的秘密值替换成 :data:`REDACTED`。"""
+def scrub(value, secrets, *, min_len: int = _MIN_SECRET_LEN) -> object:
+    """递归地把字符串里出现的秘密值替换成 :data:`REDACTED`。
+
+    默认只替换不短于 :data:`_MIN_SECRET_LEN` 的值；``min_len=1`` 用于只含
+    自由文本的字段（见 :func:`doctor_payload`）。"""
     secrets = sorted({str(s).strip() for s in secrets
-                      if s and len(str(s).strip()) >= _MIN_SECRET_LEN},
+                      if s and len(str(s).strip()) >= max(min_len, 1)},
                      key=len, reverse=True)
     if not secrets:
         return value
@@ -107,7 +114,7 @@ def search_order(explicit: str | None = None) -> list[dict]:
                         "exists": path.exists()})
     for source, path in user_config_candidates():
         entries.append({"source": source, "path": str(path.resolve()),
-                        "exists": path.exists()})
+                        "exists": path.is_file()})
     return entries
 
 
@@ -168,10 +175,23 @@ def doctor_payload(result: dict, *, config: Config | None, explicit: str | None,
                    token_override: str | None = None) -> dict:
     """``ct doctor --json``：把 :func:`calltable.doctor.report` 的结果按契约输出。"""
     hub = dict(result["hub"])
-    secrets = [token, token_override or "", _env_token(), *url_secrets(hub["url"])]
+    raw_url = hub["url"]
+    shown_url = redact_url(raw_url)
+    hidden = url_secrets(raw_url)
+    secrets = [token, token_override or "", _env_token(), *hidden]
     if config is not None:
         secrets.append(str(config.raw.get("token") or ""))
-    hub["url"] = redact_url(hub["url"])
+    hub["url"] = shown_url
+
+    def free_text(text: str) -> str:
+        # 原因和明细里写的是原始 hub 地址：先整体换成脱敏后的地址（期间用占位符
+        # 护住它），再把 URL 里的用户名、口令、查询值不论长短都替换掉。
+        if raw_url and shown_url != raw_url:
+            text = text.replace(raw_url, _URL_PLACEHOLDER)
+        text = scrub(text, hidden, min_len=1)
+        return text.replace(_URL_PLACEHOLDER, shown_url or "")
+
+    hub["detail"] = free_text(hub["detail"])
     payload = {
         "schema_version": SCHEMA_VERSION,
         "kind": DOCTOR_KIND,
@@ -179,8 +199,8 @@ def doctor_payload(result: dict, *, config: Config | None, explicit: str | None,
         "mode": result["mode"],
         "ready": result["code"] == 0,
         "exit_code": result["code"],
-        "line": result["line"],
-        "reasons": list(result["reasons"]),
+        "line": free_text(result["line"]),
+        "reasons": [free_text(reason) for reason in result["reasons"]],
         "config": config_block(config, explicit, config_error),
         "token_present": bool(token),
         "token_source": token_source(config, token_override),
@@ -188,7 +208,7 @@ def doctor_payload(result: dict, *, config: Config | None, explicit: str | None,
         "checks": {"python": result["python"], "git": result["git"],
                    "tailscale": result["tailscale"]},
         "hosts": result["hosts"],
-        "hosts_error": result["hosts_error"] or None,
+        "hosts_error": free_text(result["hosts_error"]) or None,
         "groups": result["groups"],
     }
     return scrub(payload, secrets)

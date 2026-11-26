@@ -74,7 +74,11 @@ class HostSpec:
 MACHINE_PLATFORMS = ("linux", "windows", "macos")
 #: ``machines.<name>`` 允许的键（名字本身是对象的键）。
 MACHINE_FIELDS = ("ssh", "platform", "purpose")
-_MACHINE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_MACHINE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+#: ``machines.<name>.ssh``：一个 ssh 别名，或 ``user@host``；每段以字母、数字或
+#: ``_`` 开头（所以不能以 ``-`` 开头被 ssh 当成选项），只含字母、数字和 ``._-``。
+_MACHINE_SSH = re.compile(
+    r"(?:[A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*")
 
 
 def parse_machines(raw) -> list[dict[str, str]]:
@@ -93,7 +97,7 @@ def parse_machines(raw) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
     for name, spec in raw.items():
         name = str(name)
-        if not _MACHINE_NAME.match(name):
+        if not _MACHINE_NAME.fullmatch(name):
             raise ConfigError(f"machines: invalid name {name!r} (letters, digits, "
                               "'.', '_', '-'; must start with a letter or digit)")
         if spec is None:
@@ -114,9 +118,10 @@ def parse_machines(raw) -> list[dict[str, str]]:
             if not isinstance(value, str):
                 raise ConfigError(f"machines.{name}.{key} must be a string")
             entry[key] = value.strip()
-        if any(ch.isspace() for ch in entry["ssh"]):
+        if entry["ssh"] and not _MACHINE_SSH.fullmatch(entry["ssh"]):
             raise ConfigError(f"machines.{name}.ssh must be a single ssh alias "
-                              "(no spaces)")
+                              "or user@host (letters, digits, '.', '_', '-'; "
+                              "not starting with '-')")
         entry["platform"] = entry["platform"].lower()
         if entry["platform"] and entry["platform"] not in MACHINE_PLATFORMS:
             raise ConfigError(f"machines.{name}.platform must be one of "
@@ -519,8 +524,10 @@ def locate_config(explicit: str | None = None) -> ConfigLocation:
         if not path.exists():
             raise ConfigError(f"CALLTABLE_CONFIG points to a missing file: {path}")
         return ConfigLocation(path, SOURCE_ENV)
+    # 用 is_file()：新位置上是个目录之类时不算，继续用旧文件，而不是选中它再
+    # 处处报 "Is a directory"。空文件或坏文件仍是普通文件，照样选中并报错。
     found = [(source, path) for source, path in user_config_candidates()
-             if path.exists()]
+             if path.is_file()]
     if found:
         source, path = found[0]
         return ConfigLocation(path, source, [other for _, other in found[1:]])

@@ -429,7 +429,7 @@ hub 和执行器共用一个 JSON 文件（`config.example.json` 是完整的起
 | `idempotency_window_seconds` | 0.3：幂等 key 保留多久（默认 24 小时） |
 | `public_url` | 0.3：写进 webhook 载荷的看板基础 URL（不含 token） |
 
-配置文件的查找顺序：`--config` → `CALLTABLE_CONFIG` → `~/.calltable/config.json` → `~/.config/calltable/config.json`（Windows 上是 `%USERPROFILE%` 下的同名路径）。`ct setup` 在新机器上写 `~/.calltable/config.json`；已有 `~/.config/calltable/config.json` 的机器就地更新旧文件，老安装照常可用。两个用户级文件都在时用 `~/.calltable/config.json`，`ct config show` 和 `ct doctor` 会标出实际用的文件和被忽略的那个。
+配置文件的查找顺序：`--config` → `CALLTABLE_CONFIG` → `~/.calltable/config.json` → `~/.config/calltable/config.json`（Windows 上是 `%USERPROFILE%` 下的同名路径）。`ct setup` 在新机器上写 `~/.calltable/config.json`；已有 `~/.config/calltable/config.json` 的机器就地更新旧文件，老安装照常可用。Unix 上文件一创建就是 0600；`ct setup` 新建的目录是 0700，已有的 `~/.calltable` 不改权限。两个用户级文件都在时用 `~/.calltable/config.json`，`ct config show` 和 `ct doctor` 会标出实际用的文件和被忽略的那个。
 
 其他工具不要直接读配置文件（里面有 token），也不要解析 `MODE=...` 那一行：`ct config show --json` 输出实际使用的配置文件、hub 地址、有没有 token 和登记的 `machines`；`ct doctor --json` 输出模式、是否就绪、不就绪的原因和各主机在线情况，退出码不变。两条命令都不会输出 token。输出带版本号（`schema_version`），契约见 [spec/client-config.md](spec/client-config.md)。
 
@@ -443,7 +443,7 @@ hub 和执行器共用一个 JSON 文件（`config.example.json` 是完整的起
 }
 ```
 
-`machines.<name>` 只接受 `ssh`（ssh 配置里的别名）、`platform`（`linux`、`windows` 或 `macos`）和 `purpose`；地址和密钥路径留在 `~/.ssh/config` 里。
+`machines.<name>` 只接受 `ssh`（ssh 配置里的别名或 `user@别名`：字母、数字、`.`、`_`、`-`，不能以 `-` 开头）、`platform`（`linux`、`windows` 或 `macos`）和 `purpose`；地址和密钥路径留在 `~/.ssh/config` 里。
 
 profile 放在配置文件旁边，或者检出目录的 `profiles/` 目录里。只加载 profile 目录**顶层**的 `*.json` 文件，子目录不加载。
 

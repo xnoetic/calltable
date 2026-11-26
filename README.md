@@ -654,7 +654,9 @@ Config lookup order: `--config` → `CALLTABLE_CONFIG` →
 `~/.calltable/config.json` → `~/.config/calltable/config.json` (on Windows the
 same paths under `%USERPROFILE%`). `ct setup` writes `~/.calltable/config.json`
 on a new machine and updates an existing `~/.config/calltable/config.json` in
-place, so older installs keep working. If both user-level files exist,
+place, so older installs keep working. On Unix the file is created `0600`; a
+directory `ct setup` creates is `0700`, an existing `~/.calltable` keeps its
+mode. If both user-level files exist,
 `~/.calltable/config.json` wins; `ct config show` and `ct doctor` name the file
 in use and the one being ignored.
 
@@ -676,7 +678,8 @@ outputs are versioned (`schema_version`); the contract is
 }
 ```
 
-`machines.<name>` accepts only `ssh` (an alias from your ssh config),
+`machines.<name>` accepts only `ssh` (an alias from your ssh config, or
+`user@alias`: letters, digits, `.`, `_`, `-`, not starting with `-`),
 `platform` (`linux`, `windows` or `macos`) and `purpose`; keep addresses and key
 paths in `~/.ssh/config`.
 
