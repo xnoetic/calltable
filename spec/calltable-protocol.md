@@ -73,6 +73,21 @@ Clients must treat unknown capability strings as unsupported.
 Terminal states: `succeeded`, `failed`, `cancelled`, `timeout`, `error`.
 `cancelled` for a queued job uses exit code `-2`; a queued job whose queue hold
 expired is also `cancelled` with exit code `-2` and an explanatory `error`.
+
+Cancelling a `running` job sets `cancel_requested`; the executor kills the
+process tree (or aborts preparation before launching it) and reports
+`cancelled`. Cancel takes precedence: once `cancel_requested` is set, whatever
+terminal state is written next — an executor report (`error`, `succeeded`, ...)
+or the hub's own reconciliation (job missing from executor heartbeats, executor
+worker changed, host heartbeat lost, provider reconciliation) — is recorded as
+`cancelled`. The original status and message are kept in `error`
+(`cancel requested; reported <status>: <message>`); when there is no real exit
+code (none, or the `-1` that reconciliation uses) the exit code is `-2`; this
+also applies when the executor itself reports `cancelled` without an exit code
+(for example when it aborts during preparation). The
+`job.finished` event and webhook therefore report `cancelled`. This closes the
+race where a cancel lands between the claim and the executor registering the
+job.
 Terminal states are final; a repeated finish report (executor replay) does not
 change the state and does not emit a second `job.finished` event.
 

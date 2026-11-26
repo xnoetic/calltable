@@ -242,6 +242,28 @@ NOT_REQUEUED = "not_requeued"
 RUNNING = "running"
 QUEUED = "queued"
 TERMINAL = ("succeeded", "failed", "cancelled", "timeout", "error")
+#: 取消的任务没有真实退出码时用的退出码（与排队中直接取消一致）。
+CANCELLED_EXIT_CODE = -2
+
+
+def cancel_precedence(status: str, exit_code: int | None,
+                      error: str) -> tuple[str, int | None, str]:
+    """已请求取消的任务：任何终态都记为 ``cancelled``（取消优先）。
+
+    取消和领取/准备/对账几乎同时发生时，执行器可能报 ``error`` / ``succeeded``，
+    hub 的心跳对账或主机失联回收会写 ``error``（exit -1）——这些都不能让调用方
+    误以为是真故障。原来的状态和说明保留在 ``error`` 里；没有真实退出码
+    （``None`` 或对账用的 ``-1``）时退出码记 ``-2``。
+    """
+    if exit_code is None or exit_code == -1:
+        exit_code = CANCELLED_EXIT_CODE
+    # 执行器自己报的 cancelled（准备阶段中止时没有退出码）也按上面补 -2。
+    if status == "cancelled":
+        return status, exit_code, error
+    note = f"cancel requested; reported {status}"
+    if error:
+        note = f"{note}: {error}"
+    return "cancelled", exit_code, note
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -269,7 +291,15 @@ class IdempotencyConflict(ValueError):
 
 
 class Store:
-    """每个进程一个连接；hub 是 ThreadingHTTPServer，用一个锁串行化写事务。"""
+    """每个进程一个连接；hub 是 ThreadingHTTPServer，用一个锁串行化对连接的访问。
+
+    约定：``self.conn`` 上的每条语句（读、写、PRAGMA 都算）都要在 ``self.lock``
+    里执行，并且在放锁前把结果取完（``fetchone`` / ``fetchall``）。连接是整个
+    进程共用的，事务状态、「进行中的语句」和错误信息都挂在连接上：一个线程没走完
+    的写语句会让另一个线程的 COMMIT 报 ``cannot commit transaction - SQL
+    statements in progress``，报错文本也可能被别的线程覆盖。名字以 ``_locked``
+    结尾的方法由调用方持锁。
+    """
 
     def __init__(self, db_path: str | Path, log_cap: int = DEFAULT_LOG_CAP,
                  estimate_window: int = ESTIMATE_WINDOW,
@@ -1056,11 +1086,13 @@ class Store:
             (row["group_name"] or remaining[0], row["lock_templates"],
              json_dumps(remaining), merged[-2000:], now(), job_id))
         self._emit_locked(job_id, "job.requeued",
-                          webhook_urls=self._retract_started_webhooks(job_id))
+                          webhook_urls=self._retract_started_webhooks_locked(job_id))
         return REQUEUED
 
-    def _retract_started_webhooks(self, job_id: str) -> list[str]:
+    def _retract_started_webhooks_locked(self, job_id: str) -> list[str]:
         """放回队列时撤掉 ``job.started`` 投递；返回已经发出过的 URL。
+
+        调用方负责事务；``self.lock`` 必须已持有。
 
         还没尝试过的直接删掉（接收端从没见过「开始」）；已经发出或正在
         发的也删掉，让真正开跑时的 ``job.started`` 能再投一次（每个事件每个
@@ -1197,9 +1229,13 @@ class Store:
         return [self.job(job_id) for job_id in reaped]
 
     def finish(self, job_id: str, *, status: str, exit_code: int | None,
-               error: str = "", cleanup_at: float | None = None) -> dict | None:
+               error: str = "", cleanup_at: float | None = None,
+               failure_cleanup_at: float | None = None) -> dict | None:
+        """写终态。``failure_cleanup_at``：最终状态不是 ``succeeded``（例如取消
+        优先改写成了 ``cancelled``）时改用这个清理时间。"""
         with self.lock:
-            self._finish_locked(job_id, status, exit_code, error, cleanup_at)
+            self._finish_locked(job_id, status, exit_code, error, cleanup_at,
+                                failure_cleanup_at)
         return self.job(job_id)
 
     def finish_if_status(self, job_id: str, expected: tuple[str, ...], *,
@@ -1220,9 +1256,15 @@ class Store:
         return self.job(job_id)
 
     def _finish_locked(self, job_id: str, status: str, exit_code: int | None,
-                       error: str = "", cleanup_at: float | None = None) -> None:
+                       error: str = "", cleanup_at: float | None = None,
+                       failure_cleanup_at: float | None = None) -> None:
         previous = self.conn.execute(
-            "SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            "SELECT status, cancel_requested FROM jobs WHERE id=?",
+            (job_id,)).fetchone()
+        if previous is not None and previous["cancel_requested"]:
+            status, exit_code, error = cancel_precedence(status, exit_code, error)
+        if status != "succeeded" and failure_cleanup_at is not None:
+            cleanup_at = failure_cleanup_at
         self.conn.execute(
             "UPDATE jobs SET status=?, exit_code=?, finished=?, error=?, "
             "cleanup_at=COALESCE(?, cleanup_at), needs_reconcile=0 WHERE id=?",
@@ -1551,10 +1593,20 @@ class Store:
         return files
 
     def checkpoint(self) -> None:
-        try:
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.Error:
-            pass
+        """把 WAL 合并回主库并截断（janitor 每轮调用一次）；失败不算错，下一轮再来。
+
+        必须持锁，并且在锁里把结果行取完。``PRAGMA wal_checkpoint`` 是一条会返回
+        一行结果的写语句：从它返回到游标被释放之间一直算「进行中」，这期间同一
+        连接上的 COMMIT 会报 ``cannot commit transaction - SQL statements in
+        progress``。以前这里不持锁，janitor 线程拿到结果后只要晚一点被调度（机器
+        负载高时），请求线程的事务就会撞上；反过来别的线程事务没结束时这条 PRAGMA
+        也只会报 ``database table is locked``，白跑一轮。
+        """
+        with self.lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            except sqlite3.Error:
+                pass
 
     def stats(self) -> dict:
         with self.lock:

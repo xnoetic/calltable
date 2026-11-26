@@ -32,7 +32,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from . import __version__, disk, gitops, proc
+from . import __version__, disk, gitops, proc, proc_init
 from .client import HubClient, HubError
 from .config import Config
 from .util import now, parse_size, valid_project_name
@@ -223,11 +223,14 @@ class Executor:
             with self._lock:
                 jobs = list(self._active_jobs)
             for job_id in jobs:
+                # hub 重启时会直接断开连接（RemoteDisconnected）或迟迟不答
+                # （TimeoutError），这些不是 HubError；只跳过这一轮，不能让
+                # 轮询线程就此退出、之后再也看不到取消。
                 try:
                     state = self.client.get_json(f"/api/jobs/{job_id}")
-                except HubError:
+                except (HubError, OSError, ValueError):
                     continue
-                if state and state.get("cancel_requested"):
+                if isinstance(state, dict) and state.get("cancel_requested"):
                     self._cancel_flags[job_id] = True
 
     def _start_housekeeping(self) -> None:
@@ -392,6 +395,10 @@ class Executor:
             with self._lock:
                 self._active[job["id"]] = thread
                 self._active_jobs.add(job["id"])
+                # 领取和取消几乎同时发生：hub 返回的快照里已经带了取消请求，
+                # 不等取消轮询（3 秒一次），准备阶段第一个检查点就中止。
+                if job.get("cancel_requested"):
+                    self._cancel_flags[job["id"]] = True
             thread.start()
             if self.once:
                 thread.join()
@@ -583,6 +590,9 @@ class Executor:
             script = self._write_launcher(run_dir, job, profile, work)
             env = self._build_env(job, profile, tmp, work)
             argv = self._argv(script)
+            # 取消轮询 3 秒一次；拉起进程前直接问一次 hub，准备期间到达的
+            # 取消不会让进程再跑起来。
+            self._refresh_cancel(job_id)
             self._checkpoint(job_id, deadline, "before launch")
 
             tier = job.get("systemd") or {}
@@ -635,8 +645,14 @@ class Executor:
             if tree is not None:
                 tree.terminate(3)
         except Exception as exc:
-            outcome = {"status": "error", "exit_code": None,
-                       "error": f"{type(exc).__name__}: {exc}"}
+            # 已经收到取消请求时，准备阶段的失败（多半就是被取消打断的）
+            # 照样报 cancelled，原始错误留在说明里。
+            cancelled = bool(self._cancel_flags.get(job_id))
+            outcome = {"status": "cancelled" if cancelled else "error",
+                       "exit_code": None,
+                       "error": (f"cancel requested; {type(exc).__name__}: {exc}"
+                                 if cancelled
+                                 else f"{type(exc).__name__}: {exc}")}
             if tree is not None:
                 tree.terminate(3)
         finally:
@@ -645,6 +661,9 @@ class Executor:
                 with self._lock:
                     self._running_procs.pop(job_id, None)
             with self._lock:
+                # 先记「未上报」再移出 active：两者之间的心跳不能漏报这条任务，
+                # 否则 hub 会按「心跳里没有」把它回收成 error。
+                self._unreported.add(job_id)
                 self._active_jobs.discard(job_id)
                 self._cancel_flags.pop(job_id, None)
             try:
@@ -719,6 +738,22 @@ class Executor:
             print(f"[exec] {job_id}: git relay fetch failed, falling back to hub "
                   f"bundles: {type(exc).__name__}: {message[:500]}", flush=True)
             return False
+
+    def _refresh_cancel(self, job_id: str) -> None:
+        """向 hub 查一次这条任务是否已请求取消（查不到就沿用已知状态）。
+
+        这一步只是提前发现取消，hub 出任何问题（断开连接、超时、返回的
+        不是 JSON）都不能让没人取消的任务因此失败：照常拉起进程，之后的
+        取消交给轮询线程。超时取短，慢吞吞的 hub 不能把拉起拖一分钟。
+        """
+        if self._cancel_flags.get(job_id):
+            return
+        try:
+            state = self.client.get_json(f"/api/jobs/{job_id}", timeout=10)
+        except (HubError, OSError, ValueError):
+            return
+        if isinstance(state, dict) and state.get("cancel_requested"):
+            self._cancel_flags[job_id] = True
 
     def _checkpoint(self, job_id: str, deadline: float, stage: str = "") -> None:
         if self._cancel_flags.get(job_id):
@@ -1101,6 +1136,10 @@ class LogPump:
 
 def serve(config: Config, *, once: bool = False,
           job_id: str | None = None) -> int:
+    # 容器里没有 init 时执行器就是 PID 1（Cloud Run 镜像）：先拆出一个只管
+    # 回收孤儿进程的 init，否则任务留下的后台进程会变成僵尸越积越多。
+    # 必须在起任何线程之前做；不是 PID 1 时什么都不发生。
+    proc_init.split_if_pid1()
     executor = Executor(config, once=once, job_id=job_id)
     try:
         executor.run()

@@ -1143,13 +1143,17 @@ class Handler(BaseHTTPRequestHandler):
                 job = self.hub.store.job(match.group(1))
                 if not job:
                     return self._error(404, "no such job")
+                # 已请求取消的任务一律记 cancelled（见 Store._finish_locked），
+                # 保留期按最终状态算：取消可能在上面读快照之后才到，所以把
+                # 失败保留期一并交给 store，在写终态的同一把锁里选。
                 retention = (self.hub.config.retention_success
                              if status == "succeeded"
                              else self.hub.config.retention_failure)
                 finished = self.hub.store.finish(
                     job["id"], status=status, exit_code=body.get("exit_code"),
                     error=str(body.get("error") or ""),
-                    cleanup_at=now() + retention)
+                    cleanup_at=now() + retention,
+                    failure_cleanup_at=now() + self.hub.config.retention_failure)
                 return self._json(200, finished)
 
             match = re.fullmatch(r"/api/jobs/([^/]+)/logs", path)
