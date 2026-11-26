@@ -9,6 +9,7 @@ import http.client
 import http.server
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -74,7 +75,10 @@ class FakeAPI(cloudrun.CloudRunAPI):
 
     def complete(self, execution, failed=False):
         self.states[execution] = {"status": {
-            "completionTime": "2026-11-25T06:00:00.123456789Z",
+            # 用当前时间（保留纳秒小数的写法）：写死的日期过 24h 会让 git ref 清理
+            # 直接放弃重试，test_failed_deletion_is_retried_later 随日期失败。
+            "completionTime": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+                              + ".123456789Z",
             "succeededCount": 0 if failed else 1,
             "failedCount": 1 if failed else 0}}
 
@@ -1285,7 +1289,9 @@ class GitRelayBase(Base):
 
     def profile_git(self):
         self.remote = Path(self.tmp.name) / "remote.git"
-        return {"url": str(self.remote), "push_url": str(self.remote)}
+        # 用正斜杠写法：Windows 上 C:\... 的反斜杠过不了 URL 校验，C:/... 可以。
+        url = self.remote.as_posix()
+        return {"url": url, "push_url": url}
 
     def setUp(self):
         super().setUp()
@@ -1334,7 +1340,7 @@ class GitRelayHubTests(GitRelayBase):
         job, out = self.launch()
         prefix = f"refs/calltable/jobs/{job['id']}"
         env = self.api.runs[0]["env"]
-        self.assertEqual(env["CALLTABLE_GIT_URL"], str(self.remote))
+        self.assertEqual(env["CALLTABLE_GIT_URL"], self.remote.as_posix())
         self.assertEqual(env["CALLTABLE_GIT_REFS"], prefix)
         self.assertEqual(self.remote_refs(), {f"{prefix}/head": self.sha,
                                               f"{prefix}/base": self.base_sha})
@@ -2153,8 +2159,8 @@ class GitRelayCliTests(Base):
         call.assert_not_called()
         self.assertIn("will bake branch trunk of https://github.com/o/demo.git",
                       out)
-        self.assertIn(f"gcloud builds submit {context} "
-                      f"--config={context / 'cloudbuild.yaml'} "
+        self.assertIn(f"gcloud builds submit {shlex.quote(str(context))} "
+                      + shlex.quote(f"--config={context / 'cloudbuild.yaml'}") + " "
                       "--project=demo-project --region=us-central1 "
                       "--substitutions=_IMAGE=us-central1-docker.pkg.dev/"
                       "demo-project/calltable/demo:v1", out)
@@ -2233,7 +2239,7 @@ class GitRelayImageTests(unittest.TestCase):
         self.assertEqual(
             cloudrun_cli.image_commands(self.settings, "img", Path("/ctx"),
                                         "cloudbuild"),
-            [["gcloud", "builds", "submit", "/ctx", "--project=p",
+            [["gcloud", "builds", "submit", str(Path("/ctx")), "--project=p",
               "--region=us-central1", "--tag=img"]])
 
     def test_no_token_means_no_secret_section(self):
