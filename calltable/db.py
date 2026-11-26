@@ -239,6 +239,27 @@ NOT_REQUEUED = "not_requeued"
 RUNNING = "running"
 QUEUED = "queued"
 TERMINAL = ("succeeded", "failed", "cancelled", "timeout", "error")
+#: 取消的任务没有真实退出码时用的退出码（与排队中直接取消一致）。
+CANCELLED_EXIT_CODE = -2
+
+
+def cancel_precedence(status: str, exit_code: int | None,
+                      error: str) -> tuple[str, int | None, str]:
+    """已请求取消的任务：任何终态都记为 ``cancelled``（取消优先）。
+
+    取消和领取/准备/对账几乎同时发生时，执行器可能报 ``error`` / ``succeeded``，
+    hub 的心跳对账或主机失联回收会写 ``error``（exit -1）——这些都不能让调用方
+    误以为是真故障。原来的状态和说明保留在 ``error`` 里；没有真实退出码
+    （``None`` 或对账用的 ``-1``）时退出码记 ``-2``。
+    """
+    if status == "cancelled":
+        return status, exit_code, error
+    note = f"cancel requested; reported {status}"
+    if error:
+        note = f"{note}: {error}"
+    if exit_code is None or exit_code == -1:
+        exit_code = CANCELLED_EXIT_CODE
+    return "cancelled", exit_code, note
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -1214,7 +1235,10 @@ class Store:
     def _finish_locked(self, job_id: str, status: str, exit_code: int | None,
                        error: str = "", cleanup_at: float | None = None) -> None:
         previous = self.conn.execute(
-            "SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            "SELECT status, cancel_requested FROM jobs WHERE id=?",
+            (job_id,)).fetchone()
+        if previous is not None and previous["cancel_requested"]:
+            status, exit_code, error = cancel_precedence(status, exit_code, error)
         self.conn.execute(
             "UPDATE jobs SET status=?, exit_code=?, finished=?, error=?, "
             "cleanup_at=COALESCE(?, cleanup_at), needs_reconcile=0 WHERE id=?",
