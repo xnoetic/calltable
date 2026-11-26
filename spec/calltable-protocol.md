@@ -82,7 +82,9 @@ or the hub's own reconciliation (job missing from executor heartbeats, executor
 worker changed, host heartbeat lost, provider reconciliation) — is recorded as
 `cancelled`. The original status and message are kept in `error`
 (`cancel requested; reported <status>: <message>`); when there is no real exit
-code (none, or the `-1` that reconciliation uses) the exit code is `-2`. The
+code (none, or the `-1` that reconciliation uses) the exit code is `-2`; this
+also applies when the executor itself reports `cancelled` without an exit code
+(for example when it aborts during preparation). The
 `job.finished` event and webhook therefore report `cancelled`. This closes the
 race where a cancel lands between the claim and the executor registering the
 job.

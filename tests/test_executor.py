@@ -43,7 +43,7 @@ class FakeClient:
         self.posts.append((path, body))
         return {"ok": True}
 
-    def get_json(self, path, params=None):
+    def get_json(self, path, params=None, **kw):
         return {"cancel_requested": path.rstrip("/").split("/")[-1] in self.cancel_jobs}
 
     def download(self, path, dest, params=None):

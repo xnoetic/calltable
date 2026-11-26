@@ -223,11 +223,14 @@ class Executor:
             with self._lock:
                 jobs = list(self._active_jobs)
             for job_id in jobs:
+                # hub 重启时会直接断开连接（RemoteDisconnected）或迟迟不答
+                # （TimeoutError），这些不是 HubError；只跳过这一轮，不能让
+                # 轮询线程就此退出、之后再也看不到取消。
                 try:
                     state = self.client.get_json(f"/api/jobs/{job_id}")
-                except HubError:
+                except (HubError, OSError, ValueError):
                     continue
-                if state and state.get("cancel_requested"):
+                if isinstance(state, dict) and state.get("cancel_requested"):
                     self._cancel_flags[job_id] = True
 
     def _start_housekeeping(self) -> None:
@@ -737,14 +740,19 @@ class Executor:
             return False
 
     def _refresh_cancel(self, job_id: str) -> None:
-        """向 hub 查一次这条任务是否已请求取消（查不到就沿用已知状态）。"""
+        """向 hub 查一次这条任务是否已请求取消（查不到就沿用已知状态）。
+
+        这一步只是提前发现取消，hub 出任何问题（断开连接、超时、返回的
+        不是 JSON）都不能让没人取消的任务因此失败：照常拉起进程，之后的
+        取消交给轮询线程。超时取短，慢吞吞的 hub 不能把拉起拖一分钟。
+        """
         if self._cancel_flags.get(job_id):
             return
         try:
-            state = self.client.get_json(f"/api/jobs/{job_id}")
-        except HubError:
+            state = self.client.get_json(f"/api/jobs/{job_id}", timeout=10)
+        except (HubError, OSError, ValueError):
             return
-        if state and state.get("cancel_requested"):
+        if isinstance(state, dict) and state.get("cancel_requested"):
             self._cancel_flags[job_id] = True
 
     def _checkpoint(self, job_id: str, deadline: float, stage: str = "") -> None:

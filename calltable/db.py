@@ -252,13 +252,14 @@ def cancel_precedence(status: str, exit_code: int | None,
     误以为是真故障。原来的状态和说明保留在 ``error`` 里；没有真实退出码
     （``None`` 或对账用的 ``-1``）时退出码记 ``-2``。
     """
+    if exit_code is None or exit_code == -1:
+        exit_code = CANCELLED_EXIT_CODE
+    # 执行器自己报的 cancelled（准备阶段中止时没有退出码）也按上面补 -2。
     if status == "cancelled":
         return status, exit_code, error
     note = f"cancel requested; reported {status}"
     if error:
         note = f"{note}: {error}"
-    if exit_code is None or exit_code == -1:
-        exit_code = CANCELLED_EXIT_CODE
     return "cancelled", exit_code, note
 
 
@@ -1210,9 +1211,13 @@ class Store:
         return [self.job(job_id) for job_id in reaped]
 
     def finish(self, job_id: str, *, status: str, exit_code: int | None,
-               error: str = "", cleanup_at: float | None = None) -> dict | None:
+               error: str = "", cleanup_at: float | None = None,
+               failure_cleanup_at: float | None = None) -> dict | None:
+        """写终态。``failure_cleanup_at``：最终状态不是 ``succeeded``（例如取消
+        优先改写成了 ``cancelled``）时改用这个清理时间。"""
         with self.lock:
-            self._finish_locked(job_id, status, exit_code, error, cleanup_at)
+            self._finish_locked(job_id, status, exit_code, error, cleanup_at,
+                                failure_cleanup_at)
         return self.job(job_id)
 
     def finish_if_status(self, job_id: str, expected: tuple[str, ...], *,
@@ -1233,12 +1238,15 @@ class Store:
         return self.job(job_id)
 
     def _finish_locked(self, job_id: str, status: str, exit_code: int | None,
-                       error: str = "", cleanup_at: float | None = None) -> None:
+                       error: str = "", cleanup_at: float | None = None,
+                       failure_cleanup_at: float | None = None) -> None:
         previous = self.conn.execute(
             "SELECT status, cancel_requested FROM jobs WHERE id=?",
             (job_id,)).fetchone()
         if previous is not None and previous["cancel_requested"]:
             status, exit_code, error = cancel_precedence(status, exit_code, error)
+        if status != "succeeded" and failure_cleanup_at is not None:
+            cleanup_at = failure_cleanup_at
         self.conn.execute(
             "UPDATE jobs SET status=?, exit_code=?, finished=?, error=?, "
             "cleanup_at=COALESCE(?, cleanup_at), needs_reconcile=0 WHERE id=?",

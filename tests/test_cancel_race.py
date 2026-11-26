@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import contextlib
+import http.client
 import tempfile
 import unittest
 from pathlib import Path
@@ -110,6 +111,51 @@ class StoreCancelRaceTests(unittest.TestCase):
         job = self.store.job(job["id"])
         self.assertEqual((job["status"], job["exit_code"], job["error"]),
                          ("cancelled", -15, ""))
+
+    def test_executor_cancelled_report_without_exit_code_is_minus_two(self):
+        """执行器在准备阶段中止时报 cancelled、exit_code 为空：按规范记 -2。"""
+        job = self._claimed_then_cancelled()
+        self.store.finish(job["id"], status="cancelled", exit_code=None,
+                          error="aborted during preparation")
+        job = self.store.job(job["id"])
+        self.assertEqual((job["status"], job["exit_code"], job["error"]),
+                         ("cancelled", -2, "aborted during preparation"))
+
+    def test_executor_cancelled_report_with_minus_one_is_minus_two(self):
+        job = self._claimed_then_cancelled()
+        self.store.finish(job["id"], status="cancelled", exit_code=-1,
+                          error="cancel requested; GitError: x")
+        job = self.store.job(job["id"])
+        self.assertEqual((job["status"], job["exit_code"]), ("cancelled", -2))
+        self.assertEqual(job["error"], "cancel requested; GitError: x")
+
+    def test_cancelled_without_cancel_request_keeps_exit_code(self):
+        """没请求过取消的任务不走取消优先，退出码原样保存。"""
+        job = self._job()
+        self.store.claim("h1", "w1")
+        self.store.finish(job["id"], status="cancelled", exit_code=None)
+        job = self.store.job(job["id"])
+        self.assertEqual((job["status"], job["exit_code"]), ("cancelled", None))
+
+    def _cleanup_at(self, job_id):
+        return self.store.conn.execute(
+            "SELECT cleanup_at FROM jobs WHERE id=?", (job_id,)).fetchone()[0]
+
+    def test_retention_follows_final_status_when_cancel_wins(self):
+        """hub 按「succeeded」选了成功保留期，但取消先到：改用失败保留期。"""
+        job = self._claimed_then_cancelled()
+        self.store.finish(job["id"], status="succeeded", exit_code=0,
+                          cleanup_at=100.0, failure_cleanup_at=300.0)
+        self.assertEqual(self.store.job(job["id"])["status"], "cancelled")
+        self.assertEqual(self._cleanup_at(job["id"]), 300.0)
+
+    def test_retention_success_kept_without_cancel(self):
+        job = self._job()
+        self.store.claim("h1", "w1")
+        self.store.finish(job["id"], status="succeeded", exit_code=0,
+                          cleanup_at=100.0, failure_cleanup_at=300.0)
+        self.assertEqual(self.store.job(job["id"])["status"], "succeeded")
+        self.assertEqual(self._cleanup_at(job["id"]), 100.0)
 
     def test_without_cancel_error_stays_error(self):
         job = self._job()
@@ -233,6 +279,80 @@ class ExecutorCancelRaceTests(unittest.TestCase):
         finish = self._finish(client)
         self.assertEqual(finish["status"], "error")
         self.assertIn("clone failed", finish["error"])
+
+    def _launches_despite_lookup_failure(self, job_id, get_json):
+        """拉起前查取消失败（hub 断开、超时、非 JSON）：照常拉起，不报 error。"""
+        client = FakeClient()
+        client.get_json = get_json
+        exe = Executor(self.config, client=client)
+        self.addCleanup(exe.stop)
+        launched = AssertionError("launched")
+        with self._prepared(exe) as spawn:
+            # 拉起之后的监督不在本用例范围内：spawn 抛出哨兵异常即说明已拉起。
+            spawn.side_effect = launched
+            exe._run_job(self._job(job_id))
+        spawn.assert_called_once()
+        finish = self._finish(client)
+        # 唯一的失败来自哨兵（拉起之后），不是查取消那一步。
+        self.assertEqual(finish["status"], "error")
+        self.assertIn("launched", finish["error"])
+        self.assertNotIn(job_id, exe._cancel_flags)
+        return finish
+
+    def test_hub_disconnect_before_launch_still_launches(self):
+        calls = []
+
+        def get_json(path, params=None, **kw):
+            calls.append(kw)
+            raise http.client.RemoteDisconnected("closed without response")
+
+        finish = self._launches_despite_lookup_failure("job-rd", get_json)
+        self.assertNotIn("RemoteDisconnected", finish["error"])
+        # 拉起前那次查询带短超时。
+        self.assertEqual(calls, [{"timeout": 10}])
+
+    def test_hub_timeout_before_launch_still_launches(self):
+        def get_json(path, params=None, **kw):
+            raise TimeoutError("timed out")
+
+        finish = self._launches_despite_lookup_failure("job-to", get_json)
+        self.assertNotIn("TimeoutError", finish["error"])
+
+    def test_non_json_answer_before_launch_still_launches(self):
+        def get_json(path, params=None, **kw):
+            return b"<html>proxy page</html>"
+
+        finish = self._launches_despite_lookup_failure("job-bytes", get_json)
+        self.assertNotIn("AttributeError", finish["error"])
+
+    def test_watch_loop_survives_hub_disconnect(self):
+        """取消轮询遇到 RemoteDisconnected / 超时只跳过一轮，下一轮照常查。"""
+        client = FakeClient()
+        results = [http.client.RemoteDisconnected("closed"),
+                   TimeoutError("timed out"),
+                   b"not json",
+                   {"cancel_requested": True}]
+        calls = []
+
+        def get_json(path, params=None, **kw):
+            calls.append(path)
+            result = results[len(calls) - 1]
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        client.get_json = get_json
+        exe = Executor(self.config, client=client)
+        self.addCleanup(exe.stop)
+        with exe._lock:
+            exe._active_jobs.add("job-watch")
+        # 不真的等 3 秒：前四轮 wait 立即返回「未停止」，第五轮停止。
+        stop = mock.Mock()
+        stop.wait.side_effect = [False, False, False, False, True]
+        with mock.patch.object(exe, "_stop", stop):
+            exe._watch_loop()
+        self.assertEqual(calls, ["/api/jobs/job-watch"] * 4)
+        self.assertTrue(exe._cancel_flags.get("job-watch"))
 
     def test_finished_job_is_reported_until_finish_lands(self):
         """收尾时先记「未上报」再移出 active，心跳不会漏报这条任务。"""
