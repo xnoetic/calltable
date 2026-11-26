@@ -823,11 +823,35 @@ def cmd_doctor(config: Config | None, args) -> int:
                            os.environ.get("CALLTABLE_TOKEN", ""))
     owner = getattr(args, "tailnet", None) or (
         config.owner_tailnet if config else DEFAULT_OWNER_TAILNET)
+    if getattr(args, "json", False):
+        from .client_view import doctor_payload
+        result = doctor.report(hub_url=hub, token=token, owner_tailnet=owner)
+        print(json.dumps(doctor_payload(
+            result, config=config, explicit=getattr(args, "config", None),
+            config_error=getattr(args, "config_error", None), token=token,
+            token_override=args.token), ensure_ascii=False, indent=2))
+        return result["code"]
     code, line, details = doctor.run(hub_url=hub, token=token,
                                      owner_tailnet=owner)
+    if config is not None:
+        details.insert(0, f"config: {config.path} (source={config.source or '?'})")
+        for path in config.shadowed:
+            details.insert(1, f"config: ignoring {path} (lower priority)")
     for detail in details:
         print(detail, file=sys.stderr)
     print(line)
+    return code
+
+
+def cmd_config(config: Config | None, args) -> int:
+    from .client_view import config_show, format_config_text
+
+    code, payload = config_show(getattr(args, "config", None))
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        for line in format_config_text(payload):
+            print(line)
     return code
 
 
@@ -1083,7 +1107,20 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = csub.add_parser("doctor", help="check this machine can use calltable")
     _add_cli_options(doctor)
     doctor.add_argument("--tailnet", help="owner tailnet name")
+    doctor.add_argument("--json", action="store_true",
+                        help="print one JSON object (spec/client-config.md); "
+                             "same exit codes")
     doctor.set_defaults(func=cmd_doctor)
+
+    config_cmd = csub.add_parser("config", help="inspect the client config")
+    config_sub = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_show = config_sub.add_parser(
+        "show", help="which config file is in use, hub, token presence, machines "
+                     "(never prints the token)")
+    config_show.add_argument("--config")
+    config_show.add_argument("--json", action="store_true",
+                             help="print one JSON object (spec/client-config.md)")
+    config_show.set_defaults(func=cmd_config)
 
     setup = csub.add_parser("setup", help="write the client config")
     _add_cli_options(setup)
@@ -1156,12 +1193,16 @@ def main(argv: list[str] | None = None) -> int:
         return int(cmd_setup(None, args) or 0)
     if name == "self-update":
         return int(cmd_self_update(None, args) or 0)
+    if name == "config":
+        return int(cmd_config(None, args) or 0)
     try:
         config = load_config(getattr(args, "config", None),
                              require_token=(name not in ("doctor", "seed")))
     except ConfigError as exc:
         if name == "doctor":
-            print(f"config: {exc}", file=sys.stderr)
+            if not getattr(args, "json", False):
+                print(f"config: {exc}", file=sys.stderr)
+            args.config_error = str(exc)
             config = None
         else:
             print(f"config error: {exc}", file=sys.stderr)

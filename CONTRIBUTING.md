@@ -70,6 +70,7 @@ calltable/
   disk.py        disk watermarks and host resource snapshot
   dashboard.py   single-page dashboard (inline CSS/JS)
   doctor.py      `ct doctor` checks
+  client_view.py `ct config show --json` / `ct doctor --json` (spec/client-config.md)
   setup.py       `ct setup` / `ct self-update`
   seed.py        pre-fill a mirror from a local checkout
 tests/           unittest suite

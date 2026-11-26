@@ -25,7 +25,8 @@ class IsolationGuardTests(unittest.TestCase):
         self.assertNotEqual(isolation.TEST_HOME, isolation.REAL_HOME)
 
     def test_user_config_and_data_paths_are_isolated(self):
-        for path in (config.user_config_path(), config.user_data_dir()):
+        for path in (config.user_config_path(), config.legacy_user_config_path(),
+                     config.user_data_dir()):
             self.assertTrue(isolation.is_under(path, isolation.TEST_HOME),
                             f"{path} is not under the test home")
             self.assertFalse(
@@ -43,6 +44,8 @@ class IsolationGuardTests(unittest.TestCase):
         with mock.patch("pathlib.Path.home", return_value=isolation.REAL_HOME):
             with self.assertRaises(AssertionError):
                 config.user_config_path()
+            with self.assertRaises(AssertionError):
+                config.legacy_user_config_path()
             with self.assertRaises(AssertionError):
                 config.user_data_dir()
 
