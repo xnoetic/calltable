@@ -6,6 +6,7 @@ import argparse
 import getpass
 import json
 import os
+import shlex
 import shutil
 import socket
 import sys
@@ -486,6 +487,19 @@ def _prepare_run(args, argv: list[str]) -> int | None:
             print(f"note: {command[0]!r} is not a task in {decl.path} "
                   f"(tasks: {', '.join(sorted(decl.tasks))}); running it as "
                   "a command", file=sys.stderr)
+        elif not separator and len(command) > 1 and command[0] in decl.tasks:
+            # 任务名后面又跟了词：argparse 已把它们都收进命令。带 - 的词多半是
+            # 写错位置的选项（ct run verify --slot heavy），不能悄悄当命令提交。
+            if any(word.startswith("-") for word in command[1:]):
+                print(f"error: {command[0]!r} is a task in {decl.path}, but "
+                      f"options after a task name are not parsed: "
+                      f"`{shlex.join(command)}`. Put options before the task "
+                      f"name (ct run [options] {command[0]}), or use -- to run "
+                      "these words as a literal command", file=sys.stderr)
+                return 2
+            print(f"note: `{shlex.join(command)}` was not treated as the task "
+                  f"{command[0]!r} in {decl.path} (a task name must be the only "
+                  "word); running it as a command", file=sys.stderr)
         if not args.project and decl.project:
             args.project = decl.project
             args.value_sources["project"] = (

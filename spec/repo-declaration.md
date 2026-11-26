@@ -23,7 +23,8 @@ ct run -- ./build/verify.sh   # any command, project/host from the declaration
   for the snapshot that is submitted).
 * Outside a git repository, or without the file, `ct run` behaves exactly as
   before: `--project` is required and `--host` is inferred from profiles.
-* The file is UTF-8 JSON (a BOM is tolerated). It must be an object.
+* The file is UTF-8 JSON (a BOM is tolerated). It must be an object and at
+  most 1 MiB; a larger file is refused before it is read.
 
 ## 2. Fields
 
@@ -36,7 +37,7 @@ ct run -- ./build/verify.sh   # any command, project/host from the declaration
 | `slot` | string | default slot |
 | `locks` | array of strings | default locks. `[]` means "no locks" and drops the hub profile's locks; absent means "use the hub profile" |
 | `timeout` | duration | default timeout: `"90m"`, `"3h"`, or seconds; must be positive |
-| `artifacts` | array of strings | worktree-relative globs (`**` supported) collected after the job; replace the hub profile's `artifacts`. `..`, absolute paths and drive letters are rejected |
+| `artifacts` | array of strings | worktree-relative globs (`**` supported) collected after the job; replace the hub profile's `artifacts`. `..`, absolute paths and drive letters are rejected. Limits: at most 100 patterns, each at most 256 characters with at most 4 wildcard runs (see §5) |
 | `rules` | array of rule objects | command-matching defaults, see §3 |
 | `tasks` | object, name → array of strings | named commands for `ct run <task>`, see §4 |
 
@@ -94,6 +95,15 @@ submitted.
   always submits `<cmd...>` literally (use `ct run -- verify` to run a program
   that happens to share a task's name), and multi-word commands without `--`
   are commands as well.
+* Options go **before** the task name: `ct run --slot heavy verify`. Words after
+  the command are not parsed as options, so without `--`, when the first word is
+  a task name and any later word starts with `-` (`ct run verify --slot heavy`),
+  `ct run` stops with exit code 2 before anything is snapshotted, saying to put
+  the options before the task name or to use `--` to run the words as a literal
+  command (`ct run -- verify --slot heavy`).
+* Without `--`, a first word that is a task name followed by other words that
+  do not start with `-` (`ct run verify extra`) runs as a literal command and
+  prints a note on stderr that it was not treated as the task.
 * A single word that is not a task (with tasks declared) runs as a command and
   prints a note on stderr naming the declared tasks.
 
@@ -123,18 +133,36 @@ profile as before. Artifacts travel in a new `POST /api/jobs` member:
 | --- | --- | --- |
 | `artifact_patterns` | array of strings (≤ 100) | worktree-relative globs that replace the profile's `artifacts` for this job. Absent = use the profile |
 
-The hub validates the patterns (no `..`, no absolute paths), stores them on the
+Limits on `artifact_patterns` (the same on the client, which checks them before
+the snapshot, and on the hub, which answers `400`): at most **100** patterns;
+each pattern at most **256** characters and with at most **4** wildcard runs,
+where a run is a sequence of consecutive `*` (`**` is one run, `a*b*c` has two).
+The declaration is written by whoever writes the code under test and the
+executor matches every file against every pattern after the job has finished,
+so these limits bound that work. The executor also treats a run of three or
+more `*` like `**`, so a pattern cannot be made more expensive by repeating `*`.
+
+The hub validates the patterns (no `..`, no absolute paths, the limits above), stores them on the
 job (`jobs.artifact_patterns`, echoed on the job object; `null` when absent),
 includes them in the idempotency fingerprint when present, and puts them into
 `profile_data.artifacts` of the executor payload, so executors need no change.
 A hub that predates the field does not echo it; the client then warns that the
 declared artifacts are not collected.
 
+Idempotent retries across a hub upgrade: a hub that predates the field ignores
+it, so the fingerprint it stored for a submission with declared artifacts does
+not contain the patterns. After the hub is upgraded to a version that knows
+`artifact_patterns`, a retry of that submission with the same idempotency key
+computes a fingerprint that does include them, and is answered with `409
+Conflict` rather than as a replay of the original job. Use a new idempotency
+key in that case.
+
 ## 6. Errors
 
 A declaration problem stops `ct run` **before** anything is snapshotted or
 submitted, with exit code 2 and a message naming the file and the field path,
-for example:
+for example (this includes a file that is not valid UTF-8, nested too deeply
+to parse, larger than 1 MiB, or with a duration too large to represent):
 
 ```
 error: /src/demo/.calltable.json: field 'rules[1].timeout': invalid duration: 'zz'

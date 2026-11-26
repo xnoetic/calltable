@@ -30,7 +30,8 @@ from .dashboard import render_page
 from .db import QUEUED, TERMINAL, IdempotencyConflict, Store
 from .profiles import (Profile, find_profile, load_profiles, match_rule,
                        resolve_job)
-from .util import (iso, json_dumps, now, parse_duration, valid_project_name,
+from .util import (MAX_ARTIFACT_PATTERNS, artifact_pattern_problem, iso,
+                   json_dumps, now, parse_duration, valid_project_name,
                    version_tuple)
 from .webhooks import (WebhookDispatcher, deliveries_for_display,
                        validate_url)
@@ -443,20 +444,18 @@ class Hub:
         raw = body.get("artifact_patterns")
         if raw is None:
             return None
-        if not isinstance(raw, list) or len(raw) > 100:
+        if not isinstance(raw, list) or len(raw) > MAX_ARTIFACT_PATTERNS:
             raise ValueError("artifact_patterns must be an array of at most "
-                             "100 strings")
+                             f"{MAX_ARTIFACT_PATTERNS} strings")
         patterns: list[str] = []
-        for item in raw:
+        for index, item in enumerate(raw):
             if not isinstance(item, str) or not item.strip():
                 raise ValueError("artifact_patterns must be non-empty strings")
             pattern = item.strip()
-            # 与平台无关地判断：执行器可能在 Windows 上，hub 在 Linux 上。
-            if (".." in re.split(r"[\\/]+", pattern)
-                    or pattern.startswith(("/", "\\"))
-                    or re.match(r"[A-Za-z]:", pattern)):
-                raise ValueError(f"artifact pattern must be worktree-relative: "
-                                 f"{pattern!r}")
+            # 和客户端 repoconf 同一套检查（相对路径、长度、通配段数）。
+            problem = artifact_pattern_problem(pattern)
+            if problem:
+                raise ValueError(f"artifact_patterns[{index}] {problem}")
             patterns.append(pattern)
         return patterns
 

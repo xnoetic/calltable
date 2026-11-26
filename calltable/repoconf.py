@@ -20,6 +20,8 @@ hub 侧 profile 里，出现在声明中直接报错并说明原因。
 
 ``ct run <任务名>``：命令里没有 ``--``、只有一个词、且这个词是声明里的任务名
 时按任务展开；其余情况（包括 ``ct run -- <命令>``）都按命令原样提交。
+例外：没有 ``--``、第一个词是任务名、后面又有以 ``-`` 开头的词时，``ct run``
+报错（选项要写在任务名前面），见 ``cli._prepare_run``。
 """
 
 from __future__ import annotations
@@ -31,9 +33,12 @@ from pathlib import Path
 
 from . import gitops
 from .profiles import Profile, Resolution, Rule, match_rule
-from .util import parse_duration, valid_project_name
+from .util import (MAX_ARTIFACT_PATTERNS, artifact_pattern_problem,
+                   parse_duration, valid_project_name)
 
 DECLARATION_FILE = ".calltable.json"
+#: 声明文件的大小上限：先看大小再读，免得把超大文件整个读进内存。
+MAX_DECLARATION_BYTES = 1024 * 1024
 PLATFORMS = ("linux", "windows", "macos")
 #: 和 hub 校验锁名用的同一个模式（``hub.create_job``）。
 LOCK_RE = re.compile(r"[A-Za-z0-9._{}-]+(@[A-Za-z0-9._{}-]+)?")
@@ -129,7 +134,8 @@ def _timeout(path: Path, name: str, value) -> int:
         raise DeclarationError(path, name, "must be a duration like \"90m\", \"3h\" or seconds")
     try:
         seconds = parse_duration(value)
-    except ValueError as exc:
+    except (ValueError, OverflowError) as exc:
+        # OverflowError：JSON 里的 1e400 读成 inf，int() 转不了。
         raise DeclarationError(path, name, str(exc)) from None
     if seconds <= 0:
         raise DeclarationError(path, name, "must be positive")
@@ -201,12 +207,15 @@ def parse_declaration(data, path: Path) -> Declaration:
         decl.timeout = _timeout(path, "timeout", data["timeout"])
     if "artifacts" in data:
         artifacts = _string_list(path, "artifacts", data["artifacts"])
+        # 和 hub 同一套上限，免得快照、上传之后才被 hub 拒绝。
+        if len(artifacts) > MAX_ARTIFACT_PATTERNS:
+            raise DeclarationError(path, "artifacts",
+                                   f"at most {MAX_ARTIFACT_PATTERNS} patterns, "
+                                   f"got {len(artifacts)}")
         for index, pattern in enumerate(artifacts):
-            if (".." in re.split(r"[\\/]+", pattern)
-                    or pattern.startswith(("/", "\\"))
-                    or re.match(r"[A-Za-z]:", pattern)):
-                raise DeclarationError(path, f"artifacts[{index}]",
-                                       f"must be a worktree-relative glob: {pattern!r}")
+            problem = artifact_pattern_problem(pattern)
+            if problem:
+                raise DeclarationError(path, f"artifacts[{index}]", problem)
         decl.artifacts = artifacts
     if "rules" in data:
         if not isinstance(data["rules"], list):
@@ -244,11 +253,22 @@ def load_declaration(repo: str | Path = ".") -> Declaration | None:
     if path is None:
         return None
     try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise DeclarationError(path, "", f"cannot read: {exc}") from None
+    if size > MAX_DECLARATION_BYTES:
+        raise DeclarationError(path, "", f"file is too large ({size} bytes, "
+                                         f"at most {MAX_DECLARATION_BYTES})")
+    try:
         text = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise DeclarationError(path, "", f"not valid UTF-8: {exc}") from None
     except OSError as exc:
         raise DeclarationError(path, "", f"cannot read: {exc}") from None
     try:
         data = json.loads(text)
+    except RecursionError:
+        raise DeclarationError(path, "", "invalid JSON: nested too deeply") from None
     except ValueError as exc:
         raise DeclarationError(path, "", f"invalid JSON: {exc}") from None
     return parse_declaration(data, path)

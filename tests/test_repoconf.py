@@ -185,6 +185,29 @@ class ParseTests(unittest.TestCase):
             plain.mkdir()
             self.assertIsNone(repoconf.load_declaration(plain))
 
+    def load_text(self, content: bytes):
+        """写入任意字节的声明文件再读；返回 DeclarationError。"""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            repo = make_repo(Path(tmp))
+            (repo / repoconf.DECLARATION_FILE).write_bytes(content)
+            with self.assertRaises(repoconf.DeclarationError) as ctx:
+                repoconf.load_declaration(repo)
+            self.assertIn(repoconf.DECLARATION_FILE, str(ctx.exception))
+            return ctx.exception
+
+    def test_unreadable_files_are_declaration_errors(self):
+        error = self.load_text(b'{"project": "d\xffemo"}')
+        self.assertIn("not valid UTF-8", str(error))
+        error = self.load_text(b"[" * 200000 + b"]" * 200000)
+        self.assertIn("invalid JSON", str(error))
+        error = self.load_text(b'{"timeout": 1e400}')
+        self.assertEqual(error.field, "timeout")
+        error = self.load_text(b'{"rules": [{"match": "x", "timeout": 1e400}]}')
+        self.assertEqual(error.field, "rules[0].timeout")
+        big = b'{"project": "demo", "x": "' + b"x" * repoconf.MAX_DECLARATION_BYTES + b'"}'
+        error = self.load_text(big)
+        self.assertIn("too large", str(error))
+
     def test_this_repository_declares_the_calltable_project(self):
         """本仓库自带的声明：项目名与 bin/ci-local、hub profile 一致。"""
         path = REPO_ROOT / repoconf.DECLARATION_FILE
@@ -195,6 +218,64 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(decl.project, "calltable")
         ci_local = (REPO_ROOT / "bin" / "ci-local").read_text(encoding="utf-8")
         self.assertIn('DEFAULT_PROJECT = "calltable"', ci_local)
+
+
+class ArtifactLimitTests(unittest.TestCase):
+    """产物 glob 的上限：客户端（repoconf）与 hub 用同一套检查，边界一致。"""
+
+    def client_error(self, patterns):
+        try:
+            repoconf.parse_declaration({"artifacts": patterns}, Path("x"))
+        except repoconf.DeclarationError as exc:
+            return exc
+        return None
+
+    def hub_error(self, patterns):
+        try:
+            Hub._job_artifact_patterns({"artifact_patterns": patterns})
+        except ValueError as exc:
+            return exc
+        return None
+
+    def test_boundaries(self):
+        cases = [
+            (["a*b*c*d*e"], None),                    # 4 段
+            (["a*b*c*d*e*"], "artifacts[0]"),         # 5 段
+            (["**/x/**/y/**/z/**"], None),            # ** 也算一段
+            (["**/x/**/y/**/z/**/w/**"], "artifacts[0]"),
+            (["a***b"], None),                        # 连续的 * 只算一段
+            (["x" * 256], None),
+            (["x" * 257], "artifacts[0]"),
+            (["ok/*", "x" * 257], "artifacts[1]"),
+            (["p%d/*" % i for i in range(100)], None),
+            (["p%d/*" % i for i in range(101)], "artifacts"),
+        ]
+        for patterns, field in cases:
+            with self.subTest(first=patterns[0][:20], count=len(patterns)):
+                client, hub = self.client_error(patterns), self.hub_error(patterns)
+                if field is None:
+                    self.assertIsNone(client)
+                    self.assertIsNone(hub)
+                    continue
+                self.assertIsNotNone(client)
+                self.assertIsNotNone(hub)
+                self.assertEqual(client.field, field)
+                self.assertIn(repr(field), str(client))
+                hub_field = "artifact_patterns" + field[len("artifacts"):]
+                self.assertIn(hub_field, str(hub))
+
+    def test_client_and_hub_agree(self):
+        patterns = ["a/*", "**/b/*.xml", "*" * 300, "../x", "/abs", "C:x",
+                    "a*b*c*d*e", "a*b*c*d*e*f", "x" * 256, "x" * 257,
+                    "**a" * 4 + "!", "**a" * 5 + "!"]
+        for pattern in patterns:
+            with self.subTest(pattern=pattern[:30]):
+                self.assertEqual(self.client_error([pattern]) is None,
+                                 self.hub_error([pattern]) is None)
+        for count in (100, 101):
+            batch = ["a/*"] * count
+            self.assertEqual(self.client_error(batch) is None,
+                             self.hub_error(batch) is None)
 
 
 class TaskTests(unittest.TestCase):
@@ -330,6 +411,43 @@ class DryRunDeclarationTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("command=verfy", out)
         self.assertIn("not a task", err)
+
+    def test_options_after_a_task_name_are_refused(self):
+        # 不是 dry-run 也要在快照/提交之前停下（连 127.0.0.1:1 才会是别的退出码）
+        code, out, err = run_cli("--config", str(self.config.path), "--repo",
+                                 str(self.repo), "verify", "--slot", "heavy")
+        self.assertEqual(code, 2, out + err)
+        self.assertIn("before the task name", err)
+        self.assertIn("--", err)
+        self.assertNotIn("queued", out)
+
+    def test_separator_keeps_task_name_and_options_literal(self):
+        code, out, err = self.dry("--", "verify", "--slot", "heavy")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("command=verify --slot heavy", out)
+        self.assertNotIn("not treated as the task", err)
+
+    def test_task_name_with_extra_words_runs_as_a_command_with_a_note(self):
+        code, out, err = self.dry("verify", "extra")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn("command=verify extra", out)
+        self.assertIn("not treated as the task 'verify'", err)
+
+    def test_broken_files_exit_2_before_submitting(self):
+        cases = [
+            (b'{"project": "d\xffemo"}', "not valid UTF-8"),
+            (b'{"project": "demo", "timeout": 1e400}', "'timeout'"),
+            (b"[" * 200000 + b"]" * 200000, "invalid JSON"),
+            (b" " * (repoconf.MAX_DECLARATION_BYTES + 1) + b"{}", "too large"),
+        ]
+        for content, fragment in cases:
+            with self.subTest(fragment=fragment):
+                (self.repo / repoconf.DECLARATION_FILE).write_bytes(content)
+                code, out, err = self.dry("--", "true")
+                self.assertEqual(code, 2, out + err)
+                self.assertIn(repoconf.DECLARATION_FILE, err)
+                self.assertIn(fragment, err)
+                self.assertNotIn("Traceback", err)
 
     def test_cli_arguments_override_the_declaration(self):
         code, out, _ = self.dry("--project", "other", "--host", "h2",

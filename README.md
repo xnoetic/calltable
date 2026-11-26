@@ -741,6 +741,13 @@ ct run --dry-run verify        # every effective value and where it came from
   declaration does not set are still resolved from the hub profile.
 * `ct run <word>` is a task only when there is no `--` and the word is a
   declared task; `ct run -- <cmd>` is always a literal command.
+* Options go before the task name: `ct run --slot heavy verify`. Without `--`,
+  a task name followed by a word starting with `-` (`ct run verify --slot
+  heavy`) stops with exit code 2 before the snapshot, telling you to move the
+  options or to use `--` for a literal command. A task name followed by plain
+  words (`ct run verify extra`) runs as a literal command with a note on stderr.
+* `artifacts`: at most 100 patterns, each at most 256 characters with at most 4
+  wildcard runs (a run is consecutive `*`).
 * Host-specific fields (`env_files`, `env`, `setup`, `memory_max`,
   `cpu_weight`, `slice`, `cloudrun`, `unsupported`) stay in the hub profile and
   are rejected in the declaration with the reason. Unknown fields and malformed

@@ -491,6 +491,8 @@ ct run --dry-run verify        # 打印每个生效的值和它的来源
 * 字段：`project`、`host`（主机或主机组）或 `platform`，以及可选的 `slot`、`locks`、`timeout`、`artifacts`、`rules`（含义和 profile 相同）和 `tasks`（任务名 → 参数数组）。
 * 优先级：命令行 > `.calltable.json` > hub 侧 profile。声明里没写的字段仍按 hub profile 解析。
 * `ct run <词>` 只有在没有 `--`、且这个词是声明过的任务名时才算任务；`ct run -- <命令>` 永远按命令原样提交。
+* 选项要写在任务名前面：`ct run --slot heavy verify`。没有 `--` 时，第一个词是任务名、后面又有以 `-` 开头的词（`ct run verify --slot heavy`），`ct run` 在快照之前以退出码 2 报错，提示把选项挪到任务名前面，或者用 `--` 按命令原样提交。任务名后面跟的是普通词（`ct run verify extra`）时按命令原样提交，并在 stderr 提示没有当作任务。
+* `artifacts` 最多 100 条，每条最长 256 个字符、最多 4 段通配（连续的 `*` 算一段）。
 * 和主机有关的字段（`env_files`、`env`、`setup`、`memory_max`、`cpu_weight`、`slice`、`cloudrun`、`unsupported`）只能写在 hub 侧 profile 里，写进声明会被拒绝并说明原因。未知字段和格式错误在提交之前报错，并指出是哪个字段。
 * 没有这个文件时，行为和以前完全一样。
 
