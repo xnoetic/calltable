@@ -341,6 +341,8 @@ class Hub:
             raise ValueError(f"unknown host or group: {host} (configured hosts: "
                              f"{', '.join(sorted(self.config.hosts))}; groups: "
                              f"{', '.join(sorted(groups)) or '-'})")
+        if group_name:
+            targets = self._group_targets(group_name, project, targets)
         host_spec = self.config.hosts.get(targets[0])
         locks = [str(x) for x in (body.get("locks") or [])]
         # profile 由 hub 按「项目 + 组内首选主机」解析；执行时再按实际主机
@@ -425,6 +427,35 @@ class Hub:
             targets=targets, webhooks=webhooks, hold_seconds=hold_seconds,
             idempotency=idempotency)
         return job
+
+    def _group_targets(self, group: str, project: str,
+                       members: list[str]) -> list[str]:
+        """组任务的目标：provider 主机（Cloud Run）只有在项目为它单独写了
+        ``<project>@<该主机>`` profile（且不是 unsupported）时才保留。
+
+        没有镜像 / job 定义的项目溢出到 Cloud Run 只会拉起失败；通配 profile
+        （``<project>@*``、``*@<host>``）不算数。直接写 ``--host <provider 主机>``
+        的提交不经过这里，行为不变。
+        """
+        kept, dropped = [], []
+        for member in members:
+            spec = self.config.hosts.get(member)
+            if (spec is not None and spec.provider == "cloudrun"
+                    and not self._has_host_profile(project, member)):
+                dropped.append(member)
+            else:
+                kept.append(member)
+        if not kept:
+            raise ValueError(
+                f"no host of group {group!r} can run project {project!r}: "
+                f"{', '.join(dropped)} only take group jobs of projects with a "
+                f"{project}@<host> profile")
+        return kept
+
+    def _has_host_profile(self, project: str, host: str) -> bool:
+        profile = self.profiles.get(f"{project}@{host}")
+        return (profile is not None and not profile.unsupported
+                and profile.project == project and profile.host == host)
 
     # ------------------------------------------------------------ 0.3 提交扩展
     def _job_webhooks(self, body: dict) -> list[str]:
@@ -606,7 +637,8 @@ class Hub:
         payload = dict(job)
         payload["bundle_url"] = (f"/api/jobs/{job['id']}/bundle" if bundle else "")
         payload["profile_data"] = profile_to_dict(profile) if profile else {}
-        tier = self.config.resource_defaults.get(job["slot"], {})
+        # 按实际执行主机取档位（与 hub_profile 同一台）：主机级覆盖 hub 级。
+        tier = self.config.host_resource_tier(job["host"], job["slot"])
         rule, _ = match_rule(profile, job.get("cmd") or [])
         profile_memory = None
         if profile is not None and profile.slot == job["slot"]:

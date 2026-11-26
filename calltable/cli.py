@@ -630,6 +630,8 @@ def cmd_show(config: Config, args) -> int:
     print(f"peak      cpu={job.get('cpu_total_sec', 0):.3f}s "
           f"({job.get('cpu_peak_cores', 0):.2f} cores) "
           f"mem={_fmt_mem(job.get('mem_peak'))}")
+    if job.get("requeue_note"):
+        print(f"requeued  {job['requeue_note']}")
     if job.get("error"):
         print(f"error     {job['error']}")
     deliveries = job.get("webhook_deliveries") or []
