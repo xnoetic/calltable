@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -69,12 +70,77 @@ class HostSpec:
         return self.provider in EPHEMERAL_PROVIDERS
 
 
+#: ``machines.<name>.platform`` 的取值，与 ``ct run --platform`` 一致。
+MACHINE_PLATFORMS = ("linux", "windows", "macos")
+#: ``machines.<name>`` 允许的键（名字本身是对象的键）。
+MACHINE_FIELDS = ("ssh", "platform", "purpose")
+_MACHINE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def parse_machines(raw) -> list[dict[str, str]]:
+    """校验并规整客户端配置里的 ``machines``（本机登记的验证机）。
+
+    形如 ``{"runner-a": {"ssh": "runner-a", "platform": "linux", "purpose": "..."}}``；
+    缺省 / null 表示没有登记。calltable 排队不用它，只按契约
+    （``spec/client-config.md``）校验格式并在 ``ct config show --json`` 里输出。
+    返回按配置顺序排列的 ``[{name, ssh, platform, purpose}]``。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        raise ConfigError("machines must be an object of name -> "
+                          "{ssh, platform, purpose}")
+    result: list[dict[str, str]] = []
+    for name, spec in raw.items():
+        name = str(name)
+        if not _MACHINE_NAME.match(name):
+            raise ConfigError(f"machines: invalid name {name!r} (letters, digits, "
+                              "'.', '_', '-'; must start with a letter or digit)")
+        if spec is None:
+            spec = {}
+        if not isinstance(spec, dict):
+            raise ConfigError(f"machines.{name} must be an object such as "
+                              '{"ssh": "alias", "platform": "linux"}')
+        unknown = sorted(set(map(str, spec)) - set(MACHINE_FIELDS))
+        if unknown:
+            raise ConfigError(f"machines.{name}: unknown field(s) "
+                              f"{', '.join(unknown)}; allowed: "
+                              f"{', '.join(MACHINE_FIELDS)}")
+        entry = {"name": name}
+        for key in MACHINE_FIELDS:
+            value = spec.get(key)
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                raise ConfigError(f"machines.{name}.{key} must be a string")
+            entry[key] = value.strip()
+        if any(ch.isspace() for ch in entry["ssh"]):
+            raise ConfigError(f"machines.{name}.ssh must be a single ssh alias "
+                              "(no spaces)")
+        entry["platform"] = entry["platform"].lower()
+        if entry["platform"] and entry["platform"] not in MACHINE_PLATFORMS:
+            raise ConfigError(f"machines.{name}.platform must be one of "
+                              f"{', '.join(MACHINE_PLATFORMS)}")
+        result.append(entry)
+    return result
+
+
 @dataclass
 class Config:
     path: Path
     raw: dict
     token: str
     data_dir: Path
+    #: 配置文件是怎么选中的：``flag`` / ``env`` / ``home`` / ``legacy``；
+    #: 直接构造（测试、hub 进程内）时为空。
+    source: str = ""
+    #: 同时存在、但因为优先级更低而没有用上的用户级配置文件。
+    shadowed: list[Path] = field(default_factory=list)
+
+    @property
+    def machines(self) -> list[dict[str, str]]:
+        """本机登记的验证机（``machines``），见 :func:`parse_machines`。"""
+        return parse_machines(self.raw.get("machines"))
 
     # ---- 通用
     @property
@@ -397,8 +463,23 @@ def _which(name: str) -> str | None:
     return shutil.which(name)
 
 
+#: 配置文件的来源名（``ct config show --json`` 的 ``config.source``）。
+SOURCE_FLAG = "flag"
+SOURCE_ENV = "env"
+SOURCE_HOME = "home"
+SOURCE_LEGACY = "legacy"
+
+
 def user_config_path() -> Path:
-    """用户级配置：~/.config/calltable/config.json（Windows 同路径规则）。"""
+    """用户级配置的首选位置：``~/.calltable/config.json``（Windows 同规则）。
+
+    ``ct setup`` 新装时写这里，与安装目录（``~/.calltable/src``）放在一起。
+    """
+    return Path.home() / DEFAULT_DATA_SUBDIR / "config.json"
+
+
+def legacy_user_config_path() -> Path:
+    """旧的用户级配置位置：``~/.config/calltable/config.json``，继续可用。"""
     return Path.home() / ".config" / "calltable" / "config.json"
 
 
@@ -406,28 +487,55 @@ def user_data_dir() -> Path:
     return Path.home() / DEFAULT_DATA_SUBDIR
 
 
-def find_config(explicit: str | None = None) -> Path:
-    """--config → CALLTABLE_CONFIG → ~/.config/calltable/config.json（顺序固定）。"""
+@dataclass
+class ConfigLocation:
+    """:func:`locate_config` 的结果：用哪个文件、为什么选它、遮住了哪些。"""
+    path: Path
+    source: str
+    shadowed: list[Path] = field(default_factory=list)
+
+
+def user_config_candidates() -> list[tuple[str, Path]]:
+    """用户级配置的候选位置，按优先级：新位置在前，旧位置在后。"""
+    return [(SOURCE_HOME, user_config_path()),
+            (SOURCE_LEGACY, legacy_user_config_path())]
+
+
+def locate_config(explicit: str | None = None) -> ConfigLocation:
+    """--config → CALLTABLE_CONFIG → ~/.calltable/config.json →
+    ~/.config/calltable/config.json（顺序固定）。
+
+    两个用户级文件都在时用新位置 ``~/.calltable/config.json``，旧文件记进
+    ``shadowed``，由 ``ct config show`` / ``ct doctor`` 报告出来。
+    """
     if explicit:
         path = Path(explicit).expanduser()
         if not path.exists():
             raise ConfigError(f"config not found: {path}")
-        return path
+        return ConfigLocation(path, SOURCE_FLAG)
     env = os.environ.get("CALLTABLE_CONFIG")
     if env:
         path = Path(env).expanduser()
         if not path.exists():
             raise ConfigError(f"CALLTABLE_CONFIG points to a missing file: {path}")
-        return path
-    path = user_config_path()
-    if path.exists():
-        return path
+        return ConfigLocation(path, SOURCE_ENV)
+    found = [(source, path) for source, path in user_config_candidates()
+             if path.exists()]
+    if found:
+        source, path = found[0]
+        return ConfigLocation(path, source, [other for _, other in found[1:]])
     raise ConfigError(
         f"no config file; run `ct setup --hub {DEFAULT_HUB_URL}` or pass --config")
 
 
+def find_config(explicit: str | None = None) -> Path:
+    """只要路径时用这个；查找顺序见 :func:`locate_config`。"""
+    return locate_config(explicit).path
+
+
 def load_config(explicit: str | None = None, *, require_token: bool = True) -> Config:
-    path = find_config(explicit).resolve()
+    location = locate_config(explicit)
+    path = location.path.resolve()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -445,4 +553,9 @@ def load_config(explicit: str | None = None, *, require_token: bool = True) -> C
     for name, spec in (raw.get("hosts") or {}).items():
         if isinstance(spec, dict):
             _host_tiers(str(name), spec.get("resource_defaults"))
-    return Config(path=path, raw=raw, token=token, data_dir=data_dir)
+    try:
+        parse_machines(raw.get("machines"))
+    except ConfigError as exc:
+        raise ConfigError(f"config {path}: {exc}") from exc
+    return Config(path=path, raw=raw, token=token, data_dir=data_dir,
+                  source=location.source, shadowed=list(location.shadowed))

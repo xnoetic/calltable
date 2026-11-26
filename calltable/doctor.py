@@ -10,6 +10,9 @@
 tailscale 只是**可选**的组网方式：装了、并且配置了 owner_tailnet 且当前
 tailnet 匹配时按 tailscale 模式检查；否则按 direct 模式检查，普通
 HTTP/HTTPS + token 照样可用。两种模式都会检查 python/git/hub/auth。
+
+``ct doctor --json`` 把同一份探测结果（:func:`report`）按契约
+``spec/client-config.md`` 输出成一个 JSON 对象，退出码不变。
 """
 
 from __future__ import annotations
@@ -179,6 +182,24 @@ def evaluate(*, owner_tailnet: str = "", tailscale_installed: bool = False,
     ``owner_tailnet`` 为空或 tailscale 不可用时走 direct 模式；tailscale
     不是硬依赖，缺省安装不影响使用。
     """
+    mode, reasons = assess(
+        owner_tailnet=owner_tailnet, tailscale_installed=tailscale_installed,
+        tailnet=tailnet, online=online, python_ok=python_ok, git_ok=git_ok,
+        git_version_text=git_version_text, hub_ok=hub_ok, auth_ok=auth_ok,
+        hub_url=hub_url, detail=detail, client_version=client_version,
+        hub_version=hub_version)
+    if reasons:
+        return 3, f"MODE={mode} NOT-READY: " + "; ".join(reasons)
+    return 0, f"MODE={mode} READY"
+
+
+def assess(*, owner_tailnet: str = "", tailscale_installed: bool = False,
+           tailnet: str = "", online: bool = False,
+           python_ok: bool, git_ok: bool, git_version_text: str,
+           hub_ok: bool, auth_ok: bool, hub_url: str,
+           detail: str = "", client_version: str = __version__,
+           hub_version: str = "") -> tuple[str, list[str]]:
+    """纯函数：(模式, 不就绪原因列表)；原因为空即就绪。见 :func:`evaluate`。"""
     tailscale_mode = bool(
         tailscale_installed and owner_tailnet
         and tailnet.strip().lower() == owner_tailnet.strip().lower())
@@ -204,19 +225,34 @@ def evaluate(*, owner_tailnet: str = "", tailscale_installed: bool = False,
             and version_tuple(client_version) < version_tuple(hub_version)):
         reasons.append(f"client {client_version} older than hub {hub_version}; "
                        f"run ct self-update")
-    if reasons:
-        return 3, f"MODE={mode} NOT-READY: " + "; ".join(reasons)
-    return 0, f"MODE={mode} READY"
+    return mode, reasons
+
+
+def fetch_state(hub_url: str, token: str,
+                timeout: float = 5.0) -> tuple[dict | None, str]:
+    """取 hub 的 ``/api/state``；返回 (state 或 None, 失败说明)。"""
+    if not token:
+        return None, "no token configured"
+    try:
+        state = HubClient(hub_url, token, timeout=timeout).get_json("/api/state")
+    except HubError as exc:
+        return None, _ascii(exc)
+    if not isinstance(state, dict):
+        return None, "unexpected /api/state payload"
+    return state, ""
 
 
 def host_disk_details(hub_url: str, token: str, timeout: float = 5.0) -> list[str]:
     """hub 上各执行主机的磁盘/内存/排队信息（``ct doctor`` 明细用）。"""
     if not token:
         return []
-    try:
-        state = HubClient(hub_url, token, timeout=timeout).get_json("/api/state")
-    except HubError as exc:
-        return [f"hosts: unavailable ({_ascii(exc)})"]
+    state, error = fetch_state(hub_url, token, timeout=timeout)
+    if state is None:
+        return [f"hosts: unavailable ({error})"]
+    return host_lines(state)
+
+
+def host_lines(state: dict) -> list[str]:
     lines: list[str] = []
     for host in state.get("hosts") or []:
         system = host.get("system") or {}
@@ -241,15 +277,45 @@ def host_disk_details(hub_url: str, token: str, timeout: float = 5.0) -> list[st
 def run(*, hub_url: str, token: str, owner_tailnet: str = DEFAULT_OWNER_TAILNET,
         json_config: dict | None = None) -> tuple[int, str, list[str]]:
     """执行全部探测，返回 (退出码, 输出行, 明细行)。"""
+    result = report(hub_url=hub_url, token=token, owner_tailnet=owner_tailnet)
+    return result["code"], result["line"], result["details"]
+
+
+def _host_entry(host: dict) -> dict:
+    """``ct doctor --json`` 里一台主机的在线情况（字段见 spec/client-config.md）。"""
+    try:
+        queue = int(host.get("queue") or 0)
+    except (TypeError, ValueError):
+        queue = 0
+    return {
+        "name": str(host.get("name") or ""),
+        "online": bool(host.get("online")),
+        "draining": bool(host.get("draining")),
+        "disk_low": bool(host.get("disk_low")),
+        "queue": queue,
+        "os": str(host.get("os") or ""),
+        "labels": [str(label) for label in (host.get("labels") or [])],
+    }
+
+
+def report(*, hub_url: str, token: str,
+           owner_tailnet: str = DEFAULT_OWNER_TAILNET) -> dict:
+    """执行全部探测，返回结构化结果（``ct doctor`` 文本行和 ``--json`` 都用它）。
+
+    键：``code`` / ``line`` / ``mode`` / ``reasons`` / ``details``（stderr 明细）/
+    ``tailscale`` / ``python`` / ``git`` / ``hub`` / ``hosts``（取不到为 None）/
+    ``hosts_error`` / ``groups``。不含 token。
+    """
     details: list[str] = []
     exe = find_tailscale()
     installed = exe is not None
-    tailnet, online = "", False
+    tailnet, online, ts_error = "", False, ""
     if exe:
         status = tailscale_status(exe)
         installed = status["ok"]
         tailnet = status["tailnet"]
         online = status["online"]
+        ts_error = status["error"]
         details.append(f"tailscale: {exe}")
         details.append(f"tailnet: {tailnet or '(unknown)'} "
                        f"online={online} {status['error']}".rstrip())
@@ -267,13 +333,45 @@ def run(*, hub_url: str, token: str, owner_tailnet: str = DEFAULT_OWNER_TAILNET,
     details.append(f"hub: {hub_url} health={hub_ok} auth={auth_ok} "
                    f"version={hub_version or '?'} {hub_detail}".rstrip())
     details.append(f"client: {__version__}")
+    hosts: list[dict] | None = None
+    groups: dict[str, list[str]] = {}
+    hosts_error = ""
     if hub_ok and auth_ok:
-        details.extend(host_disk_details(hub_url, token))
+        state, hosts_error = fetch_state(hub_url, token)
+        if state is None:
+            details.append(f"hosts: unavailable ({hosts_error})")
+        else:
+            details.extend(host_lines(state))
+            hosts = [_host_entry(host) for host in state.get("hosts") or []
+                     if isinstance(host, dict)]
+            raw_groups = state.get("groups") or {}
+            if isinstance(raw_groups, dict):
+                groups = {str(name): [str(m) for m in (members or [])]
+                          for name, members in raw_groups.items()}
+    else:
+        hosts_error = "hub not reachable or not authorised"
 
-    code, line = evaluate(
+    git_text = ".".join(map(str, sv))
+    mode, reasons = assess(
         owner_tailnet=owner_tailnet, tailscale_installed=installed,
         tailnet=tailnet, online=online, python_ok=python_ok, git_ok=git_ok,
-        git_version_text=".".join(map(str, sv)), hub_ok=hub_ok,
+        git_version_text=git_text, hub_ok=hub_ok,
         auth_ok=auth_ok, hub_url=hub_url, detail=hub_detail,
         client_version=__version__, hub_version=hub_version)
-    return code, line, details
+    if reasons:
+        code, line = 3, f"MODE={mode} NOT-READY: " + "; ".join(reasons)
+    else:
+        code, line = 0, f"MODE={mode} READY"
+    return {
+        "code": code, "line": line, "mode": mode, "reasons": reasons,
+        "details": details,
+        "tailscale": {"found": exe is not None, "ok": bool(exe) and installed,
+                      "tailnet": tailnet, "online": online,
+                      "owner_tailnet": owner_tailnet or "",
+                      "error": _ascii(ts_error)},
+        "python": {"version": sys.version.split()[0], "ok": python_ok},
+        "git": {"version": git_text, "ok": git_ok},
+        "hub": {"url": hub_url, "reachable": hub_ok, "auth_ok": auth_ok,
+                "version": hub_version, "detail": _ascii(hub_detail)},
+        "hosts": hosts, "hosts_error": hosts_error, "groups": groups,
+    }

@@ -4,8 +4,10 @@ token 获取顺序：``--token`` → ``--token-file <path>`` → 环境变量
 ``CALLTABLE_TOKEN`` → 报错并提示。没有任何隐式的远端读取：token 必须由用户
 显式提供（文件本机读取），这样安装脚本不依赖 ssh 别名或固定路径。
 
-写入 ``~/.config/calltable/config.json``：Unix 0600，Windows 用 icacls
-把继承权限去掉、只留当前用户。
+写到哪里：``--config`` 给了就写那里；否则新装写 ``~/.calltable/config.json``，
+已经只有旧位置 ``~/.config/calltable/config.json`` 的机器就地更新旧文件（不
+悄悄多出一份新文件把它遮住）。见 :func:`default_target`。
+文件权限：Unix 0600（目录 0700），Windows 用 icacls 把继承权限去掉、只留当前用户。
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ import subprocess
 from pathlib import Path
 
 from .config import (DEFAULT_HUB_URL, DEFAULT_OWNER_TAILNET, ConfigError,
-                     user_config_path)
+                     legacy_user_config_path, user_config_path)
 
 TOKEN_ENV = "CALLTABLE_TOKEN"
 
@@ -95,6 +97,19 @@ def merge_config(path: Path, updates: dict) -> dict:
     return data
 
 
+def default_target() -> Path:
+    """``ct setup`` 不带 ``--config`` 时写的文件。
+
+    新位置已存在、或两处都没有（新装）→ ``~/.calltable/config.json``；
+    只有旧位置 → 就地更新 ``~/.config/calltable/config.json``，行为与以前一致。
+    """
+    preferred = user_config_path()
+    legacy = legacy_user_config_path()
+    if not preferred.exists() and legacy.exists():
+        return legacy
+    return preferred
+
+
 def setup(*, hub: str | None = None, token: str | None = None,
           owner_tailnet: str | None = None,
           path: str | Path | None = None,
@@ -106,7 +121,7 @@ def setup(*, hub: str | None = None, token: str | None = None,
                              token_file=token_file)
     if not resolved:
         raise SetupError("empty token")
-    target = Path(path).expanduser() if path else user_config_path()
+    target = Path(path).expanduser() if path else default_target()
     updates = {"hub_url": hub_url, "token": resolved}
     if owner_tailnet or DEFAULT_OWNER_TAILNET:
         updates["owner_tailnet"] = owner_tailnet or DEFAULT_OWNER_TAILNET
@@ -136,4 +151,4 @@ def self_update(root: str | Path | None = None,
 
 
 __all__ = ["SetupError", "resolve_token", "write_config", "merge_config",
-           "setup", "self_update", "repo_root", "ConfigError", "TOKEN_ENV"]
+           "default_target", "setup", "self_update", "repo_root", "ConfigError", "TOKEN_ENV"]
