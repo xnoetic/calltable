@@ -402,6 +402,27 @@ class DispatcherTests(unittest.TestCase):
             hub.close()
             hub.store.close()
 
+    def test_cancel_racing_claim_finishes_as_cancelled(self):
+        """issue #1：领取后马上取消，执行器还没登记就被心跳对账回收——
+        ``job.finished`` 报的是 ``cancelled``，不是 ``error``。"""
+        hub = self._hub()
+        try:
+            job = self._job(hub, webhooks=[self.receiver.url])
+            dispatcher = WebhookDispatcher(hub.store, hub.config)
+            hub.store.claim("h1", "w1")
+            hub.store.request_cancel(job["id"])
+            hub.store.heartbeat("h1", "w2", [])
+            self.assertEqual(dispatcher.run_once(), 2)
+            events = [json.loads(request["body"])
+                      for request in self.receiver.requests]
+            self.assertEqual([event["type"] for event in events],
+                             ["job.started", "job.finished"])
+            self.assertEqual(events[1]["job"]["status"], "cancelled")
+            self.assertEqual(events[1]["job"]["exit_code"], -2)
+        finally:
+            hub.close()
+            hub.store.close()
+
     def test_hub_rejects_webhooks_without_a_signing_secret(self):
         hub = Hub(make_config(self.root / "nocfg"))
         try:
