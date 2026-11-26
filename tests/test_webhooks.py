@@ -257,6 +257,41 @@ class DispatcherTests(unittest.TestCase):
             hub.close()
             hub.store.close()
 
+    def test_started_retracted_after_the_batch_was_fetched_is_not_posted(self):
+        # 组任务被 provider 主机 cr 预留后又放回队列：dispatcher 已经取到
+        # job.started 那一批，轮到它时记录已经撤掉，不能再发出去。
+        hub = self._hub()
+        try:
+            hub.store.seed_host("cr", {"light": 1}, [])
+            hub.store.touch_host("cr")
+            hub.store.set_draining("h1", True)
+            job = hub.store.create_job(
+                project="demo", host="pool", slot="light", locks=[],
+                cmd=["true"], group_name="pool", targets=["h1", "cr"],
+                webhooks=[self.receiver.url])
+            dispatcher = WebhookDispatcher(hub.store, hub.config)
+            self.assertEqual(hub.store.claim("cr", "pending:abc")["host"], "cr")
+            batch = hub.store.due_webhook_deliveries()
+            self.assertEqual([row["event"] for row in batch], ["job.started"])
+            outcome, _ = hub.store.requeue_unattached(job["id"], "cr", note="x")
+            self.assertEqual(outcome, "requeued")
+            self.assertFalse(dispatcher.deliver(batch[0]))
+            self.assertEqual(self.receiver.requests, [])
+            # 结果回写碰到已删除的记录也不会把它写回来。
+            hub.store.webhook_delivered(batch[0]["id"], 200)
+            self.assertEqual(hub.store.webhook_deliveries(job["id"]), [])
+            # 真正开跑时只发一次 job.started（主机是 h1）。
+            hub.store.set_draining("h1", False)
+            self.assertEqual(hub.store.claim("h1", "w1")["id"], job["id"])
+            self.assertEqual(dispatcher.run_once(), 1)
+            bodies = [json.loads(request["body"])
+                      for request in self.receiver.requests]
+            self.assertEqual([(body["type"], body["job"]["host"]) for body in bodies],
+                             [("job.started", "h1")])
+        finally:
+            hub.close()
+            hub.store.close()
+
     def test_global_hub_webhooks_are_added_to_job_webhooks(self):
         hub = self._hub(webhook_urls=[self.receiver.url])
         try:

@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from calltable import __version__, gitops
 from calltable.hub import Hub
@@ -139,6 +140,86 @@ class HubTests(unittest.TestCase):
                                    "cmd": ["true"]})
         self.assertEqual(job["group_name"], "linux")
         self.assertEqual(job["targets"], ["h1", "h2"])
+
+    def _overflow_group(self):
+        """h1 + 排在最后的 provider 主机 cr（溢出组）。"""
+        self.hub.config.raw["hosts"]["cr"] = {
+            "slots": {"light": 2}, "provider": "cloudrun",
+            "cloudrun": {"project": "demo-cloud"}}
+        self.hub.config.raw["groups"] = {"pool": ["h1", "cr"],
+                                         "cloud-only": ["cr"]}
+
+    def _write_profile(self, name: str, **data):
+        (self.root / "profiles" / f"{name}.json").write_text(
+            json.dumps({"name": name, "slot": "light", **data}), encoding="utf-8")
+        self.hub.profiles = load_profiles(self.root / "profiles")
+
+    def _submit(self, host: str, project: str = "demo") -> dict:
+        return self.hub.create_job({"project": project, "host": host,
+                                    "cmd": ["true"],
+                                    "client_version": __version__})
+
+    def test_provider_host_joins_a_group_only_with_its_own_profile(self):
+        self._overflow_group()
+        self.assertEqual(self._submit("pool")["targets"], ["h1"])
+        # 通配 profile 不算数。
+        self._write_profile("demo@*")
+        self._write_profile("*@cr")
+        self.assertEqual(self._submit("pool")["targets"], ["h1"])
+        self._write_profile("demo@cr", unsupported=True, note="no image")
+        self.assertEqual(self._submit("pool")["targets"], ["h1"])
+        self._write_profile("demo@cr")
+        job = self._submit("pool")
+        self.assertEqual(job["targets"], ["h1", "cr"])
+        self.assertEqual(job["group_name"], "pool")
+        # 别的项目照样只发给 h1。
+        self.assertEqual(self._submit("pool", project="other")["targets"], ["h1"])
+
+    def test_profile_file_named_for_another_project_does_not_count(self):
+        self._overflow_group()
+        self._write_profile("demo@cr", project="other", host="cr")
+        self.assertEqual(self._submit("pool")["targets"], ["h1"])
+
+    def test_group_job_keeps_only_the_first_eligible_provider_host(self):
+        self._overflow_group()
+        self.hub.config.raw["hosts"]["cr2"] = {
+            "slots": {"light": 2}, "provider": "cloudrun",
+            "cloudrun": {"project": "demo-cloud"}}
+        self.hub.config.raw["groups"]["pool"] = ["h1", "cr", "cr2"]
+        self._write_profile("demo@cr2")
+        # cr 没有 profile：第一台符合条件的是 cr2。
+        self.assertEqual(self._submit("pool")["targets"], ["h1", "cr2"])
+        self._write_profile("demo@cr")
+        self.assertEqual(self._submit("pool")["targets"], ["h1", "cr"])
+
+    def test_group_with_several_provider_hosts_warns_at_start(self):
+        self._overflow_group()
+        self.hub.config.raw["hosts"]["cr2"] = {
+            "slots": {"light": 2}, "provider": "cloudrun",
+            "cloudrun": {"project": "demo-cloud"}}
+        self.hub.config.raw["groups"]["pool"] = ["h1", "cr", "cr2"]
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            hub = Hub(self.hub.config, cloudrun_api=mock.Mock())
+        try:
+            self.assertIn("group pool lists several cloudrun hosts (cr, cr2)",
+                          buffer.getvalue())
+            self.assertNotIn("group cloud-only lists several", buffer.getvalue())
+        finally:
+            hub.close()
+            hub.store.close()
+
+    def test_group_without_an_eligible_host_is_rejected(self):
+        self._overflow_group()
+        with self.assertRaises(ValueError) as ctx:
+            self._submit("cloud-only")
+        self.assertIn("demo@<host> profile", str(ctx.exception))
+
+    def test_direct_submission_to_a_provider_host_needs_no_profile(self):
+        self._overflow_group()
+        job = self._submit("cr")
+        self.assertEqual(job["targets"], ["cr"])
+        self.assertEqual(job["group_name"], "")
 
     def test_unknown_group_or_host_is_rejected(self):
         with self.assertRaises(ValueError):
@@ -291,6 +372,93 @@ class HubTests(unittest.TestCase):
         self.assertEqual(claimed["id"], gate["id"])
         # heavy 走 resource_defaults，不继承 light 的 6G
         self.assertEqual(payload["systemd"]["memory_max"], "20G")
+
+    # ------------------------------------------------------------ 主机级资源档位
+    def _host_tiers(self):
+        """h1 只覆盖 light.memory_max；h2 覆盖 heavy 的三个键。"""
+        hosts = self.hub.config.raw["hosts"]
+        hosts["h1"]["resource_defaults"] = {"light": {"memory_max": "14G"}}
+        hosts["h2"] = {"slots": {"heavy": 1, "light": 2},
+                       "resource_defaults": {"heavy": {
+                           "memory_max": "28G", "cpu_weight": "800",
+                           "slice": "big.slice"}}}
+        self.hub.store.seed_host("h2", {"heavy": 1, "light": 2}, [])
+
+    def _payload_on(self, host: str, cmd=("true",), project="demo",
+                    slot=None) -> dict:
+        body = {"project": project, "host": host, "cmd": list(cmd),
+                "client_version": __version__}
+        if slot:
+            body["slot"] = slot
+        job = self.hub.create_job(body)
+        claimer = host if host in self.hub.config.hosts else "h2"
+        self.hub.store.heartbeat(claimer, "w", [])
+        claimed = self.hub.store.claim(claimer, "w")
+        self.assertEqual(claimed["id"], job["id"])
+        payload = self.hub._exec_payload(claimed)["systemd"]
+        self.hub.store.finish(job["id"], status="succeeded", exit_code=0)
+        return payload
+
+    def test_host_tier_overrides_the_hub_tier_for_that_host_only(self):
+        self._host_tiers()
+        self.assertEqual(self._payload_on("h2", slot="heavy"),
+                         {"memory_max": "28G", "cpu_weight": "800",
+                          "slice": "big.slice"})
+        # h1 的 heavy 没覆盖：仍是 hub 级档位。
+        self.assertEqual(self._payload_on("h1", slot="heavy"),
+                         {"memory_max": "20G", "cpu_weight": "400",
+                          "slice": "calltable-heavy.slice"})
+
+    def test_partial_host_tier_merges_per_key(self):
+        self._host_tiers()
+        self.assertEqual(self._payload_on("h1", slot="light"),
+                         {"memory_max": "14G", "cpu_weight": "200",
+                          "slice": "calltable-light.slice"})
+
+    def test_rule_and_profile_still_win_over_the_host_tier(self):
+        self._host_tiers()
+        self._rule_profile("tiered", {
+            "slot": "light", "memory_max": "6G", "cpu_weight": "50",
+            "rules": [{"match": "gate", "slot": "heavy", "locks": [],
+                       "memory_max": "16G"}]})
+        hosts = self.hub.config.raw["hosts"]
+        hosts["h1"]["resource_defaults"]["heavy"] = {"memory_max": "30G"}
+        light = self._payload_on("h1", project="tiered")
+        self.assertEqual(light["memory_max"], "6G")   # profile 自己的 slot
+        self.assertEqual(light["cpu_weight"], "50")
+        heavy = self._payload_on("h1", cmd=("bash", "gate.sh"), project="tiered")
+        self.assertEqual(heavy["memory_max"], "16G")  # 规则
+        plain = self._payload_on("h1", cmd=("bash", "other.sh"), project="tiered",
+                                 slot="heavy")
+        self.assertEqual(plain["memory_max"], "30G")  # 不是 profile 的 slot → 主机档位
+
+    def test_group_job_gets_the_tier_of_the_host_that_claimed_it(self):
+        self._host_tiers()
+        self.hub.config.raw["groups"] = {"linux": ["h1", "h2"]}
+        with self.hub.store.lock:
+            self.hub.store.conn.execute(
+                "UPDATE hosts SET last_seen=? WHERE name='h1'", (time.time() - 1000,))
+        tier = self._payload_on("linux", slot="heavy")
+        self.assertEqual(tier["memory_max"], "28G")
+
+    def test_bad_host_tiers_are_rejected(self):
+        from calltable.config import ConfigError, load_config
+        for bad in ("8G", ["light"], {"light": "8G"}):
+            raw = json.loads((self.root / "config.json").read_text(encoding="utf-8"))
+            raw["hosts"]["h1"]["resource_defaults"] = bad
+            path = self.root / "bad.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaises(ConfigError) as ctx:
+                load_config(str(path))
+            self.assertIn("host h1", str(ctx.exception))
+            self.hub.config.raw["hosts"]["h1"]["resource_defaults"] = bad
+            with self.assertRaises(ConfigError):
+                Hub(self.hub.config)
+        # 与 hub 级一致：未知 slot / 键照收，值转成字符串，null 表示不覆盖。
+        self.hub.config.raw["hosts"]["h1"]["resource_defaults"] = {
+            "gpu": {"memory_max": 64, "extra": "x"}, "light": None}
+        self.assertEqual(self.hub.config.hosts["h1"].resource_defaults,
+                         {"gpu": {"memory_max": "64", "extra": "x"}})
 
     def test_heartbeat_stores_system_metrics_for_hosts_view(self):
         self.hub.heartbeat("h1", "w1", [], system={

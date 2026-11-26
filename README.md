@@ -311,7 +311,8 @@ Tailscale.
 
 * **Same scheduler.** Slots, locks and drain apply exactly as for any host;
   `slots` caps how many Cloud Run executions run at once. Target it with
-  `--host cloudrun` (it is not meant to be mixed into a group with static hosts).
+  `--host cloudrun`, or put it last in a host group so it only takes the
+  overflow (see [Overflow groups](#overflow-groups-cloud-run-as-the-last-resort)).
 * **Reserve, execute, attach.** A dedicated hub thread (separate from the
   janitor, so a slow `gcloud` never delays housekeeping for other hosts)
   reserves a queued job for the host (the job turns `running` with a
@@ -326,7 +327,8 @@ Tailscale.
   job `error`; an execution that outlives its finished job is cancelled; an
   execution nobody attaches to within `attach_timeout` (15 min) or whose
   executor stops heartbeating for `heartbeat_timeout` (15 min) is cancelled and
-  its job fails. A reservation whose launch the hub never finished recording
+  its job fails (a group job that never attached goes back to the queue
+  instead, see below). A reservation whose launch the hub never finished recording
   (for example the hub restarted mid-launch) gets the same attach and heartbeat
   timeouts, without a cancel call, so it cannot hold a slot or accrue estimated
   spend forever. Job definitions use `--max-retries=0`, so Cloud Run never
@@ -351,6 +353,48 @@ Tailscale.
   (plus an optional git read token, see `cloudrun.git` below). The executor
   removes them (`CALLTABLE_TOKEN`, `TS_AUTHKEY`, `CALLTABLE_GIT_TOKEN`) from
   the environment it gives the job command.
+
+### Overflow groups: Cloud Run as the last resort
+
+List the Cloud Run host **last** in a group, after the dedicated hosts:
+
+```json
+"groups": {"linux": ["host-a", "host-b", "cloudrun"]}
+```
+
+A job sent to `--host linux` runs on `host-a` or `host-b` when one has a free
+slot and only goes to Cloud Run when both are full or offline.
+
+* **Which jobs overflow.** Only projects with their own `<project>@cloudrun`
+  profile (not `unsupported`) keep the Cloud Run host in the job's targets; a
+  `<project>@*` or `*@cloudrun` fallback does not count. Every other project's
+  group job simply waits for a dedicated host. Jobs sent with
+  `--host cloudrun` need no profile, as before. A job keeps at most one Cloud
+  Run host: if a group lists several, only the first one the project has a
+  profile for is used (the hub warns about such groups at start-up).
+* **Failures before the job starts.** If the launch fails, the execution ends
+  before an executor attaches, or nobody attaches within `attach_timeout`, the
+  hub cancels the execution (if any) and puts the job back in the queue
+  without the Cloud Run host: same place in the queue, locks as submitted, and a
+  `job.requeued` event (SSE; also sent to webhooks that already got
+  `job.started`). `ct show` prints the reason on a `requeued` line. Jobs
+  whose only target is the Cloud Run host still end as `error`, and so does
+  anything that fails after the executor attached.
+* **Cooldown.** After a group job was put back in the queue this way, the hub
+  stops reserving jobs for that host for `launch_cooldown` (5 min, `0`
+  disables). A failed job sent directly to the Cloud Run host ends as `error`
+  without a cooldown, as before. During a cooldown the scheduler treats the
+  host as unavailable: group jobs go to the next free dedicated host and jobs
+  sent directly to it wait. `ct cloudrun status` shows an active cooldown and
+  its reason.
+* **Known limitations.** A webhook receiver may see deliveries out of order
+  when one is retried, and `ct wait --until started` returns once the job is
+  reserved for Cloud Run, before the container has attached.
+* **Resource tiers.** The hub-wide `resource_defaults` are sized for shared
+  dedicated hosts. A job on Cloud Run has its container to itself, so give the
+  Cloud Run host its own `hosts.cloudrun.resource_defaults`, with `memory_max`
+  a little below the container memory of each slot (for example `28G` for a
+  32 GiB `heavy` container).
 
 ### Fetching code through GitHub (`cloudrun.git`)
 
@@ -459,6 +503,7 @@ All keys live under `hosts.<name>.cloudrun`. Only `project` is required.
 | `cpu_price`, `memory_price` | `0.000018`, `0.000002` | USD per vCPU-second and per GiB-second |
 | `max_task_timeout`, `timeout_grace` | `3h`, `5m` | execution timeout cap and the grace added to the job timeout |
 | `attach_timeout`, `heartbeat_timeout` | `15m`, `15m` | when an unattached or silent execution is cancelled |
+| `launch_cooldown` | `5m` | pause in new reservations after a launch failure or an attach timeout; `0` disables |
 | `reconcile_interval` | `60s` | how often executions are reconciled |
 | `job_prefix` | `ct` | job definitions are named `<prefix>-<project>-<slot>` |
 | `repository`, `registry` | `calltable`, `<region>-docker.pkg.dev/<project>/<repository>` | where project images are pushed |
@@ -588,6 +633,7 @@ complete starting point). Keys include:
 | `exec_host`, `runs_root`, `mirror_root` | executor identity and storage |
 | `profiles_dir` | where `*.json` profiles are loaded from |
 | `resource_defaults` | per-slot `memory_max` / `cpu_weight` / systemd `slice` |
+| `hosts.<name>.resource_defaults` | same shape, for jobs that run on that host; merged per slot and key over the hub-wide tiers (rule and profile own-slot `memory_max` still win) |
 | `min_free_gb`, `runs_max_gb` | disk watermarks before claiming new jobs |
 | `retention_*`, `log_cap_bytes`, `keep_ref_days` | retention and hard caps |
 | `upstreams`, `upstream_interval` | optional read-only upstream fetch by the hub |

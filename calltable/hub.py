@@ -94,6 +94,13 @@ class Hub:
                 if member not in config.hosts:
                     self._warn(f"group {group} lists {member}, but it is not in "
                                "hosts; it will never receive jobs")
+            providers = [member for member in members
+                         if member in config.hosts
+                         and config.hosts[member].provider == "cloudrun"]
+            if len(providers) > 1:
+                self._warn(f"group {group} lists several cloudrun hosts "
+                           f"({', '.join(providers)}); a job keeps only the first "
+                           "one its project has a profile for")
         # hub 重启：遗留 running 任务进入「待对账」，由心跳或超时回收。
         self.store.mark_running_for_reconcile()
         # 按需拉起的 provider 主机（Cloud Run）。没有配置就完全不加载。
@@ -341,6 +348,8 @@ class Hub:
             raise ValueError(f"unknown host or group: {host} (configured hosts: "
                              f"{', '.join(sorted(self.config.hosts))}; groups: "
                              f"{', '.join(sorted(groups)) or '-'})")
+        if group_name:
+            targets = self._group_targets(group_name, project, targets)
         host_spec = self.config.hosts.get(targets[0])
         locks = [str(x) for x in (body.get("locks") or [])]
         # profile 由 hub 按「项目 + 组内首选主机」解析；执行时再按实际主机
@@ -425,6 +434,41 @@ class Hub:
             targets=targets, webhooks=webhooks, hold_seconds=hold_seconds,
             idempotency=idempotency)
         return job
+
+    def _group_targets(self, group: str, project: str,
+                       members: list[str]) -> list[str]:
+        """组任务的目标：provider 主机（Cloud Run）只有在项目为它单独写了
+        ``<project>@<该主机>`` profile（且不是 unsupported）时才保留。
+
+        没有镜像 / job 定义的项目溢出到 Cloud Run 只会拉起失败；通配 profile
+        （``<project>@*``、``*@<host>``）不算数。直接写 ``--host <provider 主机>``
+        的提交不经过这里，行为不变。
+
+        一个组任务最多保留**一台** provider 主机（第一台符合条件的）：
+        ``cloud_executions`` 按任务 id 记一条，第二台的拉起会覆盖第一台的
+        花费和待删 git ref 记录。
+        """
+        kept, dropped = [], []
+        provider_kept = False
+        for member in members:
+            spec = self.config.hosts.get(member)
+            if spec is not None and spec.provider == "cloudrun":
+                if provider_kept or not self._has_host_profile(project, member):
+                    dropped.append(member)
+                    continue
+                provider_kept = True
+            kept.append(member)
+        if not kept:
+            raise ValueError(
+                f"no host of group {group!r} can run project {project!r}: "
+                f"{', '.join(dropped)} only take group jobs of projects with a "
+                f"{project}@<host> profile")
+        return kept
+
+    def _has_host_profile(self, project: str, host: str) -> bool:
+        profile = self.profiles.get(f"{project}@{host}")
+        return (profile is not None and not profile.unsupported
+                and profile.project == project and profile.host == host)
 
     # ------------------------------------------------------------ 0.3 提交扩展
     def _job_webhooks(self, body: dict) -> list[str]:
@@ -606,7 +650,8 @@ class Hub:
         payload = dict(job)
         payload["bundle_url"] = (f"/api/jobs/{job['id']}/bundle" if bundle else "")
         payload["profile_data"] = profile_to_dict(profile) if profile else {}
-        tier = self.config.resource_defaults.get(job["slot"], {})
+        # 按实际执行主机取档位（与 hub_profile 同一台）：主机级覆盖 hub 级。
+        tier = self.config.host_resource_tier(job["host"], job["slot"])
         rule, _ = match_rule(profile, job.get("cmd") or [])
         profile_memory = None
         if profile is not None and profile.slot == job["slot"]:

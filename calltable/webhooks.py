@@ -138,6 +138,9 @@ class WebhookDispatcher(threading.Thread):
 
     def deliver(self, delivery: dict) -> bool:
         attempts = self.store.webhook_attempt(delivery["id"])
+        if attempts is None:
+            # 取批之后记录被撤掉了（任务放回队列）：不再发这条旧载荷。
+            return False
         payload = str(delivery["payload"]).encode("utf-8")
         ok, status_code, error, retryable = self._post(
             delivery["url"], delivery["msg_id"], payload)

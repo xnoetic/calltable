@@ -15,6 +15,12 @@
 * 对账：execution 结束但任务还在 running → 记 error；任务已终结但 execution
   还在跑 → 取消 execution；拉起后 ``attach_timeout`` 内没人认领 → 取消并记
   error；认领后超过 ``heartbeat_timeout`` 没心跳 → 同上。
+* 溢出组：这台主机排在主机组最后时，组任务只有在项目写了
+  ``<project>@<这台主机>`` profile 时才会溢出过来（见 ``Hub.create_job``）。
+  还没有执行器 attach 就失败（拉起报错、execution 提前结束、attach 超时、
+  ``pending:`` 占位超时）的组任务放回队列、去掉这台主机，由其余成员领取；
+  之后 ``launch_cooldown`` 内不再为这台主机预留新任务（只有真的放回了
+  队列才冷却；只发给这台主机的任务失败照旧记 error，不触发冷却）。
 * 花费封顶：按 execution 的存活时间 × (vCPU 单价 × vCPU + 内存单价 × GiB) 估算
   本自然月（UTC）花费，最少按 60 秒计；达到 ``monthly_budget_usd`` 后不再拉起
   新 execution，任务继续排队（``on_budget_exceeded: "queue"``，默认）或直接
@@ -40,7 +46,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import gitops
-from .db import PENDING_WORKER_PREFIX, QUEUED, RUNNING, TERMINAL
+from .db import (ALREADY_ATTACHED, PENDING_WORKER_PREFIX, QUEUED, REQUEUED,
+                 RUNNING, TERMINAL)
 from .util import now, parse_duration
 
 PROVIDER = "cloudrun"
@@ -66,6 +73,7 @@ DEFAULTS = {
     "max_task_timeout": "3h",
     "timeout_grace": "5m",
     "attach_timeout": "15m",
+    "launch_cooldown": "5m",
     "heartbeat_timeout": "15m",
     "reconcile_interval": "60s",
     "job_prefix": "ct",
@@ -128,6 +136,8 @@ class CloudRunSettings:
     max_task_timeout: int = 3 * 3600
     timeout_grace: int = 300
     attach_timeout: int = 900
+    #: 拉起失败 / 没人 attach 之后，这么久（秒）不再为这台主机预留新任务；0 关闭。
+    launch_cooldown: int = 300
     heartbeat_timeout: int = 900
     reconcile_interval: int = 60
     hub_token_secret: str = "calltable-hub-token"
@@ -174,6 +184,7 @@ class CloudRunSettings:
             max_task_timeout=parse_duration(data.get("max_task_timeout")),
             timeout_grace=parse_duration(data.get("timeout_grace")),
             attach_timeout=parse_duration(data.get("attach_timeout")),
+            launch_cooldown=max(0, parse_duration(data.get("launch_cooldown"))),
             heartbeat_timeout=parse_duration(data.get("heartbeat_timeout")),
             reconcile_interval=parse_duration(data.get("reconcile_interval")),
             hub_token_secret=str(data.get("hub_token_secret")),
@@ -660,6 +671,8 @@ class Provisioner:
         self._visibility: dict[str, tuple[str, str, float]] = {}
         #: push_url → 删除远端临时 ref 失败后，下一次允许碰这个远端的时间。
         self._git_retry_at: dict[str, float] = {}
+        #: 主机 → (冷却截止时间, 原因)：拉起失败 / 没人 attach 之后暂停预留。
+        self._cooldowns: dict[str, tuple[float, str]] = {}
         self.settings: dict[str, CloudRunSettings] = {}
         for name, spec in hub.config.hosts.items():
             if spec.provider != PROVIDER:
@@ -697,6 +710,8 @@ class Provisioner:
             active = [row for row in self.store.cloud_executions(active_only=True)
                       if row["host"] == host]
             spend = self.month_spend(host, at)
+            until, reason = self._cooldowns.get(host, (0.0, ""))
+            cooling = until > at
             result[host] = {
                 "project": settings.project,
                 "region": settings.region,
@@ -708,6 +723,10 @@ class Provisioner:
                 "on_budget_exceeded": settings.on_budget_exceeded,
                 "active_executions": len(active),
                 "executions": active,
+                "launch_cooldown": settings.launch_cooldown,
+                "cooling_down": cooling,
+                "cooldown_until": until if cooling else None,
+                "cooldown_reason": reason if cooling else "",
             }
         return result
 
@@ -735,6 +754,8 @@ class Provisioner:
                           f"{exc}", flush=True)
 
     def _provision(self, host: str, settings: CloudRunSettings) -> None:
+        if self._cooling_down(host):
+            return
         if not self._has_queued(host):
             return
         spend = self.month_spend(host)
@@ -754,6 +775,8 @@ class Provisioner:
             if job is None:
                 return
             self._launch(host, settings, job)
+            if self._cooling_down(host):
+                return
             if self.month_spend(host) >= settings.monthly_budget_usd:
                 return
 
@@ -799,7 +822,10 @@ class Provisioner:
             note = f"cloud run launch failed ({cloud_job}): {exc}"
             self.store.cloud_update(job["id"], state="failed", ended=now(),
                                     note=note[:500])
-            self._fail(job["id"], note[:1000])
+            if self._requeue(job["id"], host, note[:1000]) == REQUEUED:
+                self._start_cooldown(host, settings, note)
+            else:
+                self._fail(job["id"], note[:1000])
             return
         self.store.cloud_update(job["id"], execution=execution, state="launched")
         # 不打印镜像：实际跑哪个镜像由 Cloud Run 上的 job 定义决定，hub 这边
@@ -1001,10 +1027,19 @@ class Provisioner:
                         seen = row["last_seen"] or row["attached"]
                         reason = (f"executor heartbeat lost for "
                                   f"{int(current - seen)}s")
+                    message = ("cloud run execution name was never recorded "
+                               f"(hub restarted?): {reason}")
+                    outcome = ""
+                    if timeout == "attach":
+                        outcome = self._requeue(row["job_id"], host, message)
+                        if outcome == ALREADY_ATTACHED:
+                            continue
+                        if outcome == REQUEUED:
+                            self._start_cooldown(host, settings, message)
                     self.store.cloud_update(row["job_id"], state="failed",
                                             ended=current, note=reason[:500])
-                    self._fail(row["job_id"], "cloud run execution name was never "
-                                              f"recorded (hub restarted?): {reason}")
+                    if outcome != REQUEUED:
+                        self._fail(row["job_id"], message)
                 continue
             finished, detail, ended_at = False, "", None
             if describe or job_done:
@@ -1020,8 +1055,17 @@ class Provisioner:
                                         ended=ended_at or current,
                                         note=detail[:500])
                 if not job_done and job.get("status") == RUNNING:
-                    self._fail(job["id"], f"cloud run execution {execution} ended "
-                                          f"before the job reported ({detail})")
+                    message = (f"cloud run execution {execution} ended before "
+                               f"the job reported ({detail})")
+                    # 没 attach 就结束（容器起不来 / 连不上 hub）：组任务放回队列。
+                    # 已经 attach 的（用户代码跑过）照旧记 error。
+                    outcome = ""
+                    if not row["attached"]:
+                        outcome = self._requeue(job["id"], host, message)
+                        if outcome == REQUEUED:
+                            self._start_cooldown(host, settings, message)
+                    if outcome != REQUEUED:
+                        self._fail(job["id"], message)
                 continue
             if job_done:
                 finished_at = float(job.get("finished") or current) if job else current
@@ -1030,10 +1074,19 @@ class Provisioner:
                 continue
             timeout = self._timed_out(row, settings, current)
             if timeout == "attach":
+                message = (f"cloud run execution {execution} never attached "
+                           f"within {settings.attach_timeout}s")
+                # 先放回队列再取消：放回之后容器就 attach 不上了。期间已经有
+                # 执行器 attach 的组任务不动（也不取消它的 execution）。
+                outcome = self._requeue(job["id"], host, message)
+                if outcome == ALREADY_ATTACHED:
+                    continue
+                if outcome == REQUEUED:
+                    self._start_cooldown(host, settings, message)
                 self._cancel(row, settings, "no executor attached within "
                              f"{settings.attach_timeout}s")
-                self._fail(job["id"], f"cloud run execution {execution} never "
-                                      f"attached within {settings.attach_timeout}s")
+                if outcome != REQUEUED:
+                    self._fail(job["id"], message)
             elif timeout == "heartbeat":
                 seen = row["last_seen"] or row["attached"]
                 self._cancel(row, settings, "executor heartbeat lost")
@@ -1049,9 +1102,15 @@ class Provisioner:
                 continue
             started = float(job.get("started") or current)
             if current - started >= settings.attach_timeout:
-                self._fail(job["id"], "cloud run launch was never recorded "
-                                      "(hub restarted?): no executor attached "
-                                      f"within {settings.attach_timeout}s")
+                message = ("cloud run launch was never recorded (hub restarted?): "
+                           f"no executor attached within {settings.attach_timeout}s")
+                outcome = self._requeue(job["id"], host, message)
+                if outcome == ALREADY_ATTACHED:
+                    continue
+                if outcome == REQUEUED:
+                    self._start_cooldown(host, settings, message)
+                else:
+                    self._fail(job["id"], message)
 
     @staticmethod
     def _timed_out(row: dict, settings: CloudRunSettings,
@@ -1072,6 +1131,43 @@ class Provisioner:
             print(f"[cloudrun] cancel {row['execution']}: {exc}", flush=True)
         self.store.cloud_update(row["job_id"], state="cancelled", ended=now(),
                                 note=reason[:500])
+
+    # ---- 溢出组：拉起失败放回队列 + 冷却
+    def _requeue(self, job_id: str, host: str, message: str) -> str:
+        """任务还有别的目标主机、且还没有执行器 attach：放回队列（去掉本主机）。
+
+        返回 :meth:`Store.requeue_unattached` 的结果；``NOT_REQUEUED`` 时由调用方
+        照旧 :meth:`_fail`，``ALREADY_ATTACHED`` 时任务不动。
+        """
+        outcome, job = self.store.requeue_unattached(
+            job_id, host, note=f"{host}: {message}"[:1000])
+        if outcome == REQUEUED and job is not None:
+            print(f"[cloudrun] {job_id}: {message}; back in the queue for "
+                  f"{', '.join(job.get('targets') or [])}", flush=True)
+        return outcome
+
+    def _cooling_down(self, host: str) -> bool:
+        return self._cooldowns.get(host, (0.0, ""))[0] > now()
+
+    def _start_cooldown(self, host: str, settings: CloudRunSettings,
+                        reason: str) -> None:
+        """组任务拉起失败 / 没人 attach 并已放回队列：``launch_cooldown`` 内
+        不再给这台主机预留任务。
+
+        claim 里冷却中的主机按不可用处理，组任务由其余成员照常领取。
+        冷却期间再出错只延长截止时间，不重复打日志。
+        """
+        if settings.launch_cooldown <= 0:
+            return
+        current = now()
+        active = self._cooling_down(host)
+        until = current + settings.launch_cooldown
+        self._cooldowns[host] = (until, reason[:500])
+        self.store.set_host_cooldown(host, until)
+        if not active:
+            print(f"[cloudrun] {host}: not reserving new jobs for "
+                  f"{settings.launch_cooldown}s after: {' '.join(reason.split())[:300]}",
+                  flush=True)
 
     def _fail(self, job_id: str, message: str) -> None:
         # 「还在 running 吗」与写 error 在 store 的同一把锁里完成：慢速 gcloud

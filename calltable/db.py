@@ -218,10 +218,23 @@ MIGRATIONS = [
     ("jobs", "idempotency_key", "TEXT NOT NULL DEFAULT ''"),
     # Cloud Run 经 git 中转：hub 推到远端仓库、待任务结束后删除的临时 ref（JSON）。
     ("cloud_executions", "git_refs", "TEXT NOT NULL DEFAULT ''"),
+    # 溢出组：claim 前的锁模板（JSON，``{host}`` 未展开）；空串表示没记录。
+    # provider 主机拉起失败把任务放回队列时用它还原锁。
+    ("jobs", "lock_templates", "TEXT NOT NULL DEFAULT ''"),
+    # 任务被放回队列的原因（人看的说明，不算错误）。
+    ("jobs", "requeue_note", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 #: provider 预留任务时写进 ``jobs.worker`` 的占位前缀；执行器 attach 后替换。
 PENDING_WORKER_PREFIX = "pending:"
+
+#: :meth:`Store.requeue_unattached` 的结果。
+REQUEUED = "requeued"
+#: 执行器已经 attach（用户代码可能已经开始跑）：任务不动。
+ALREADY_ATTACHED = "attached"
+#: 不符合放回队列的条件（只有这一台目标、已不在 running、没记录锁模板、
+#: 已请求取消……）：调用方按原来的方式处理。
+NOT_REQUEUED = "not_requeued"
 
 RUNNING = "running"
 QUEUED = "queued"
@@ -266,6 +279,9 @@ class Store:
         self.webhook_urls: list[str] = []
         self.dashboard_base_url = ""
         self.idempotency_window = 86400
+        #: provider 注入：主机名 → 冷却截止时间。冷却中的主机在 claim 里按
+        #: 「不可用」处理（与 drain 相同），组任务交给其余成员。
+        self.host_cooldowns: dict[str, float] = {}
         self.lock = threading.RLock()
         self.conn = connect(db_path)
         # 状态变化通知：长轮询与 SSE 用条件变量等待，不短间隔轮询。
@@ -624,8 +640,10 @@ class Store:
         data["cancel_requested"] = bool(data["cancel_requested"])
         data["needs_reconcile"] = bool(data.get("needs_reconcile"))
         data["purged"] = bool(data.get("purged"))
+        data["requeue_note"] = data.get("requeue_note") or ""
         data.pop("bundle_id", None)
         data.pop("misses", None)
+        data.pop("lock_templates", None)
         return data
 
     @staticmethod
@@ -870,6 +888,10 @@ class Store:
                     # 磁盘/ runs 超水位的主机不接新任务，先把空间清出来。
                     self.conn.execute("COMMIT")
                     return None
+                now_ts = now()
+                if self._cooling_down(host, now_ts):
+                    self.conn.execute("COMMIT")
+                    return None
                 running = self.conn.execute(
                     "SELECT * FROM jobs WHERE status='running'").fetchall()
                 used: dict[str, dict[str, int]] = {}
@@ -877,7 +899,6 @@ class Store:
                     bucket = used.setdefault(job["host"], {})
                     bucket[job["slot"]] = bucket.get(job["slot"], 0) + 1
                 held_locks = self._held_lock_keys(running)
-                now_ts = now()
 
                 candidates = self.conn.execute(
                     "SELECT * FROM jobs WHERE status='queued' "
@@ -900,6 +921,10 @@ class Store:
                             continue
                         if (json_loads(row["system"], {}) or {}).get("disk_low"):
                             continue
+                        # 冷却中的 provider 主机不能当「首选成员」，否则它会
+                        # 挡住排在后面、已经有空位的成员。
+                        if self._cooling_down(member, now_ts):
+                            continue
                         limits = json_loads(row["slots"], {})
                         limit = int(limits.get(job["slot"], 0))
                         if used.get(member, {}).get(job["slot"], 0) >= limit:
@@ -920,12 +945,14 @@ class Store:
                     return None
                 locks = self.expand_locks(json_loads(chosen["locks"], []),
                                           selected_host)
+                # lock_templates 留住展开前的锁：provider 主机没拉起来时
+                # （requeue_unattached）要原样放回队列，展开是不可逆的。
                 self.conn.execute(
                     "UPDATE jobs SET status='running', started=?, worker=?, "
-                    "host=?, locks=?, misses=0, needs_reconcile=0 "
-                    "WHERE id=? AND status='queued'",
+                    "host=?, locks=?, lock_templates=?, misses=0, "
+                    "needs_reconcile=0 WHERE id=? AND status='queued'",
                     (now(), worker, selected_host, json_dumps(locks),
-                     chosen["id"]))
+                     chosen["locks"], chosen["id"]))
                 self._emit_locked(chosen["id"], "job.started")
                 self.conn.execute("COMMIT")
             except Exception:
@@ -957,6 +984,90 @@ class Store:
         return self.job(job_id)
 
     # ------------------------------------------------------------ Cloud Run
+    def _cooling_down(self, host: str, now_ts: float) -> bool:
+        return float(self.host_cooldowns.get(host) or 0.0) > now_ts
+
+    def set_host_cooldown(self, host: str, until: float) -> None:
+        """provider 主机冷却到 ``until``（0 表示取消）。只在内存里，hub 重启即清空。"""
+        with self.lock:
+            if until > 0:
+                self.host_cooldowns[host] = float(until)
+            else:
+                self.host_cooldowns.pop(host, None)
+
+    def requeue_unattached(self, job_id: str, host: str, *,
+                           note: str) -> tuple[str, dict | None]:
+        """provider 主机拉起失败（还没有执行器 attach）：把组任务放回队列。
+
+        条件检查与写入在同一个事务里（与 :meth:`finish_if_status` 同理）：
+
+        * 任务仍是 ``running``、在 ``host`` 上，且 ``targets`` 里除了 ``host``
+          还有别的主机、claim 时记下了锁模板、没有请求取消——否则返回
+          ``NOT_REQUEUED``，调用方按原来的方式处理（记 error）；
+        * worker 已经不是 ``pending:`` 占位（执行器 attach 了）：返回
+          ``ALREADY_ATTACHED``，任务不动。
+
+        放回队列时：``targets`` 去掉 ``host``（不会再弹回这台主机），
+        ``host`` / ``worker`` / ``started`` / 对账标记 / 锁还原成 claim 之前的样子，
+        ``created`` 不变（排队位置不变），原因追加到 ``requeue_note``；发一条
+        ``job.requeued`` 事件。
+        """
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                outcome = self._requeue_locked(job_id, host, note)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        job = self.job(job_id) if outcome == REQUEUED else None
+        return outcome, job
+
+    def _requeue_locked(self, job_id: str, host: str, note: str) -> str:
+        row = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None or row["status"] != RUNNING or row["host"] != host:
+            return NOT_REQUEUED
+        targets = json_loads(row["targets"], []) or [row["host"]]
+        remaining = [member for member in targets if member != host]
+        # 只有这一台目标的任务保持原样（记 error），不看它有没有 attach。
+        if not remaining:
+            return NOT_REQUEUED
+        if not (row["worker"] or "").startswith(PENDING_WORKER_PREFIX):
+            return ALREADY_ATTACHED
+        if not row["lock_templates"] or row["cancel_requested"]:
+            return NOT_REQUEUED
+        existing = row["requeue_note"] or ""
+        merged = (existing + "; " + note) if existing else note
+        # 号码绑定（hold_seconds）按重新入队的时间重新起算：预留期间客户端
+        # 不发排队心跳，旧的 last_hold 会让 reap_queue_holds 立刻把它取消。
+        self.conn.execute(
+            "UPDATE jobs SET status='queued', host=?, worker='', started=NULL, "
+            "locks=?, lock_templates='', targets=?, misses=0, needs_reconcile=0, "
+            "requeue_note=?, last_hold=CASE WHEN hold_seconds>0 THEN ? "
+            "ELSE last_hold END WHERE id=?",
+            (row["group_name"] or remaining[0], row["lock_templates"],
+             json_dumps(remaining), merged[-2000:], now(), job_id))
+        self._emit_locked(job_id, "job.requeued",
+                          webhook_urls=self._retract_started_webhooks(job_id))
+        return REQUEUED
+
+    def _retract_started_webhooks(self, job_id: str) -> list[str]:
+        """放回队列时撤掉 ``job.started`` 投递；返回已经发出过的 URL。
+
+        还没尝试过的直接删掉（接收端从没见过「开始」）；已经发出或正在
+        发的也删掉，让真正开跑时的 ``job.started`` 能再投一次（每个事件每个
+        URL 只有一条记录），并给这些 URL 补一条 ``job.requeued``。
+        """
+        rows = self.conn.execute(
+            "SELECT url, status, attempts FROM webhook_deliveries "
+            "WHERE job_id=? AND event='job.started'", (job_id,)).fetchall()
+        sent = [row["url"] for row in rows
+                if row["status"] != "pending" or int(row["attempts"] or 0) > 0]
+        self.conn.execute(
+            "DELETE FROM webhook_deliveries WHERE job_id=? "
+            "AND event IN ('job.started', 'job.requeued')", (job_id,))
+        return sent
+
     def attach_job(self, job_id: str, host: str, worker: str) -> dict | None:
         """一次性执行器（``exec --once --job-id``）认领 provider 预留的任务。
 
@@ -1128,8 +1239,12 @@ class Store:
                                 (job_id,)).fetchone()
         return self._job_row(row) if row is not None else None
 
-    def _emit_locked(self, job_id: str, event_type: str) -> int | None:
+    def _emit_locked(self, job_id: str, event_type: str, *,
+                     webhook_urls: list[str] | None = None) -> int | None:
         """写一条事件（并给 job.started/finished 排 webhook 投递）。
+
+        ``webhook_urls``：其余事件类型也投递，只投给这些 URL（``job.requeued``
+        只发给已经收到过 ``job.started`` 的接收端）。
 
         调用方负责事务；``self.lock`` 必须已持有。返回事件序号。
         """
@@ -1154,16 +1269,19 @@ class Store:
         payload["event_id"] = seq
         data = json_dumps(payload)
         self.conn.execute("UPDATE events SET data=? WHERE seq=?", (data, seq))
+        urls: list[str] = []
         if event_type in ("job.started", "job.finished"):
             urls = list(dict.fromkeys(
                 list(self.webhook_urls) + list(job.get("webhooks") or [])))
-            for url in urls:
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO webhook_deliveries(job_id, event, url, "
-                    "msg_id, payload, status, attempts, next_attempt, created, "
-                    "updated) VALUES(?,?,?,?,?,'pending',0,0,?,?)",
-                    (job_id, event_type, url, f"msg_{uuid.uuid4().hex}", data,
-                     now(), now()))
+        elif webhook_urls:
+            urls = list(dict.fromkeys(webhook_urls))
+        for url in urls:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO webhook_deliveries(job_id, event, url, "
+                "msg_id, payload, status, attempts, next_attempt, created, "
+                "updated) VALUES(?,?,?,?,?,'pending',0,0,?,?)",
+                (job_id, event_type, url, f"msg_{uuid.uuid4().hex}", data,
+                 now(), now()))
         self._bump()
         return seq
 
@@ -1206,16 +1324,22 @@ class Store:
                 (now_ts if now_ts is not None else now(), int(limit))).fetchall()
         return [dict(row) for row in rows]
 
-    def webhook_attempt(self, delivery_id: int) -> int:
-        """投递前先落库 attempts+1；返回新的 attempts。"""
+    def webhook_attempt(self, delivery_id: int) -> int | None:
+        """投递前先落库 attempts+1；返回新的 attempts。
+
+        记录已经不在（取批之后被撤掉，例如任务放回队列时撤回 job.started）
+        返回 None：调用方不能再发送这条旧载荷。
+        """
         with self.lock:
-            self.conn.execute(
+            cursor = self.conn.execute(
                 "UPDATE webhook_deliveries SET attempts=attempts+1, updated=? "
-                "WHERE id=?", (now(), delivery_id))
+                "WHERE id=? AND status='pending'", (now(), delivery_id))
+            if cursor.rowcount == 0:
+                return None
             row = self.conn.execute(
                 "SELECT attempts FROM webhook_deliveries WHERE id=?",
                 (delivery_id,)).fetchone()
-        return int(row["attempts"]) if row else 0
+        return int(row["attempts"]) if row else None
 
     def webhook_delivered(self, delivery_id: int, status_code: int | None) -> None:
         with self.lock:

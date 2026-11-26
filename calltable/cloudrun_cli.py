@@ -21,7 +21,7 @@ from .cloudrun import (BAKED_MIRROR_ROOT, PROVIDER, CloudRunSettings,
                        GitRelay, project_image, sanitize_name)
 from .config import Config
 from .profiles import find_profile, load_profiles
-from .util import valid_project_name
+from .util import iso, valid_project_name
 
 ASSETS = Path(__file__).resolve().parent / "cloudrun_assets"
 PACKAGE = Path(__file__).resolve().parent
@@ -324,6 +324,9 @@ def cmd_cloudrun(config: Config, args) -> int:
                       f"${info['monthly_budget_usd']:.2f} this month"
                       f"{' (OVER BUDGET)' if info.get('over_budget') else ''} "
                       f"active={info['active_executions']}")
+                if info.get("cooling_down"):
+                    print(f"  cooling down until {iso(info['cooldown_until'])}: "
+                          f"{info.get('cooldown_reason') or '-'}")
                 for row in info.get("executions") or []:
                     print(f"  {row['job_id']}  {row['cloud_job']}  "
                           f"{row['execution'] or '-'}  {row['state']}")

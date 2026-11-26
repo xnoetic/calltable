@@ -574,6 +574,267 @@ class UnrecordedLaunchTests(Base):
         self.assertIn("never recorded", failed["error"])
 
 
+class OverflowGroupTests(Base):
+    """溢出组 ``pool = [h1, cloudrun]``：还没 attach 就失败的组任务放回队列，
+    之后冷却一段时间；h1 有空位就能领走。"""
+
+    def setUp(self):
+        super().setUp()
+        self.config.raw["groups"] = {"pool": ["h1", "cloudrun"]}
+
+    def fill_h1(self) -> list[dict]:
+        """h1 在线但 light 槽位占满：组任务溢出到 cloudrun。"""
+        self.store.heartbeat("h1", "w-h1", [])
+        busy = []
+        for _ in range(2):
+            job = self.submit(host="h1")
+            self.assertEqual(self.store.claim("h1", "w-h1")["id"], job["id"])
+            busy.append(job)
+        return busy
+
+    def submit_group(self, **extra):
+        return self.submit(host="pool", locks=["gate@{host}"], **extra)
+
+    def tick(self) -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.provisioner.tick()
+        return out.getvalue()
+
+    def assert_requeued(self, job: dict, reason: str) -> dict:
+        current = self.store.job(job["id"])
+        self.assertEqual(current["status"], "queued")
+        self.assertEqual(current["host"], "pool")
+        self.assertEqual(current["targets"], ["h1"])
+        self.assertEqual(current["locks"], ["gate@{host}"])
+        self.assertEqual(current["worker"], "")
+        self.assertIsNone(current["started"])
+        self.assertEqual(current["created"], job["created"])
+        self.assertEqual(current["error"], "")
+        self.assertIn(reason, current["requeue_note"])
+        self.assertTrue(current["requeue_note"].startswith("cloudrun: "))
+        types = [event["type"] for event in self.store.events_after(0, job["id"])]
+        self.assertEqual(types[-1], "job.requeued")
+        return current
+
+    def assert_claimed_by_h1(self, job: dict, busy: list[dict]) -> None:
+        self.store.finish(busy[0]["id"], status="succeeded", exit_code=0)
+        claimed = self.store.claim("h1", "w-h1")
+        self.assertEqual(claimed["id"], job["id"])
+        self.assertEqual(claimed["host"], "h1")
+        self.assertEqual(claimed["locks"], ["gate@h1"])
+
+    def test_group_job_overflows_to_cloudrun_when_h1_is_full(self):
+        self.fill_h1()
+        job = self.submit_group()
+        self.assertEqual(job["targets"], ["h1", "cloudrun"])
+        self.tick()
+        reserved = self.store.job(job["id"])
+        self.assertEqual(reserved["host"], "cloudrun")
+        self.assertEqual(reserved["locks"], ["gate@cloudrun"])
+        self.assertEqual(len(self.api.runs), 1)
+
+    def test_project_without_a_cloudrun_profile_never_overflows(self):
+        self.fill_h1()
+        job = self.hub.create_job({"project": "other", "host": "pool",
+                                   "cmd": ["true"], "client_version": "9.9.9"})
+        self.assertEqual(job["targets"], ["h1"])
+        self.tick()
+        self.assertEqual(self.api.runs, [])
+        self.assertEqual(self.store.job(job["id"])["status"], "queued")
+
+    def test_launch_failure_requeues_the_group_job(self):
+        busy = self.fill_h1()
+        self.api.fail_run = True
+        job = self.submit_group()
+        out = self.tick()
+        self.assert_requeued(job, "quota exceeded")
+        self.assertIn("back in the queue for h1", out)
+        row = self.store.cloud_executions()[0]
+        self.assertEqual(row["state"], "failed")
+        self.assertIsNotNone(row["ended"])
+        self.assertIn("quota exceeded", row["note"])
+        self.assert_claimed_by_h1(job, busy)
+
+    def test_attach_timeout_requeues_and_cancels_the_execution(self):
+        busy = self.fill_h1()
+        job = self.submit_group()
+        self.tick()
+        execution = self.api.runs[0]["execution"]
+        self.store.conn.execute("UPDATE cloud_executions SET launched=?",
+                                (now() - 3600,))
+        self.tick()
+        self.assertEqual(self.api.cancelled, [execution])
+        self.assert_requeued(job, "never attached")
+        row = self.store.cloud_executions()[0]
+        self.assertEqual(row["state"], "cancelled")
+        # 放回队列之后，迟到的容器 attach 不上。
+        self.assertIsNone(self.hub.attach(job["id"], "cloudrun", "late"))
+        self.assert_claimed_by_h1(job, busy)
+
+    def test_execution_ending_without_attach_requeues(self):
+        busy = self.fill_h1()
+        job = self.submit_group()
+        self.tick()
+        self.api.complete(self.api.runs[0]["execution"], failed=True)
+        self.tick()
+        self.assert_requeued(job, "ended before the job reported")
+        self.assertEqual(self.store.cloud_executions()[0]["state"], "ended")
+        self.assert_claimed_by_h1(job, busy)
+
+    def test_execution_ending_after_attach_still_fails(self):
+        self.fill_h1()
+        job = self.submit_group()
+        self.tick()
+        self.hub.attach(job["id"], "cloudrun", "w1")
+        self.api.complete(self.api.runs[0]["execution"], failed=True)
+        self.tick()
+        failed = self.store.job(job["id"])
+        self.assertEqual(failed["status"], "error")
+        self.assertIn("ended before the job reported", failed["error"])
+
+    def test_pending_placeholder_timeout_requeues(self):
+        busy = self.fill_h1()
+        job = self.submit_group()
+        self.store.touch_host("cloudrun")
+        self.assertEqual(self.store.claim("cloudrun", f"{PENDING_WORKER_PREFIX}abc")
+                         ["id"], job["id"])
+        self.store.conn.execute("UPDATE jobs SET started=? WHERE id=?",
+                                (now() - 3600, job["id"]))
+        self.tick()
+        self.assert_requeued(job, "launch was never recorded")
+        self.assert_claimed_by_h1(job, busy)
+
+    def test_unrecorded_execution_name_timeout_requeues(self):
+        busy = self.fill_h1()
+        job = self.submit_group()
+        self.store.touch_host("cloudrun")
+        self.store.claim("cloudrun", f"{PENDING_WORKER_PREFIX}abc")
+        self.store.cloud_record_launch(job["id"], "cloudrun", cloud_job="ct-demo-light",
+                                       vcpu=2, memory_gib=8, launched=now() - 3600)
+        self.tick()
+        self.assert_requeued(job, "execution name was never recorded")
+        self.assertEqual(self.store.cloud_executions()[0]["state"], "failed")
+        self.assert_claimed_by_h1(job, busy)
+
+    def test_single_target_job_still_errors(self):
+        self.api.fail_run = True
+        job = self.submit(host="cloudrun")
+        self.tick()
+        failed = self.store.job(job["id"])
+        self.assertEqual(failed["status"], "error")
+        self.assertEqual(failed["requeue_note"], "")
+
+    def assert_not_cooling_and_other_project_launches(self):
+        self.assertFalse(self.provisioner.summary()["cloudrun"]["cooling_down"])
+        self.assertEqual(self.store.host_cooldowns, {})
+        healthy = self.hub.create_job({"project": "other", "host": "cloudrun",
+                                       "cmd": ["true"], "client_version": "9.9.9"})
+        self.api.fail_run = False
+        self.tick()
+        self.assertEqual(self.api.runs[-1]["env"]["CALLTABLE_JOB_ID"], healthy["id"])
+
+    def test_single_target_launch_failure_starts_no_cooldown(self):
+        self.api.fail_run = True
+        job = self.submit(host="cloudrun")
+        out = self.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "error")
+        self.assertNotIn("not reserving new jobs", out)
+        self.assert_not_cooling_and_other_project_launches()
+
+    def test_single_target_attach_timeout_starts_no_cooldown(self):
+        job = self.submit(host="cloudrun")
+        self.tick()
+        self.store.conn.execute("UPDATE cloud_executions SET launched=?",
+                                (now() - 3600,))
+        out = self.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "error")
+        self.assertNotIn("not reserving new jobs", out)
+        self.assert_not_cooling_and_other_project_launches()
+
+    def test_group_job_failure_starts_the_cooldown(self):
+        self.fill_h1()
+        self.api.fail_run = True
+        self.submit_group()
+        out = self.tick()
+        self.assertIn("not reserving new jobs", out)
+        self.assertTrue(self.provisioner.summary()["cloudrun"]["cooling_down"])
+
+    def test_attach_racing_the_timeout_leaves_the_job_alone(self):
+        self.fill_h1()
+        job = self.submit_group()
+        self.tick()
+        self.hub.attach(job["id"], "cloudrun", "w1")
+        # provisioner 读到的是 attach 之前的 execution 快照。
+        self.store.conn.execute(
+            "UPDATE cloud_executions SET attached=NULL, launched=?", (now() - 3600,))
+        self.tick()
+        current = self.store.job(job["id"])
+        self.assertEqual((current["status"], current["host"], current["worker"]),
+                         ("running", "cloudrun", "w1"))
+        self.assertEqual(self.api.cancelled, [])
+        self.assertFalse(self.provisioner.summary()["cloudrun"]["cooling_down"])
+
+    def test_cooldown_pauses_reservations_without_starving_group_jobs(self):
+        busy = self.fill_h1()
+        self.api.fail_run = True
+        first = self.submit_group()
+        out = self.tick()
+        self.assertEqual(out.count("not reserving new jobs for 300s"), 1)
+        self.api.fail_run = False
+        second = self.submit(host="pool")  # 不加锁：不和 first 抢 gate@h1
+        direct = self.submit(host="cloudrun")
+        self.tick()
+        self.assertEqual(self.api.runs, [])  # 冷却中：不预留、不拉起
+        summary = self.provisioner.summary()["cloudrun"]
+        self.assertTrue(summary["cooling_down"])
+        self.assertEqual(summary["launch_cooldown"], 300)
+        self.assertIn("quota exceeded", summary["cooldown_reason"])
+        self.assertGreater(summary["cooldown_until"], now())
+        # cloudrun 在线、有空位，但冷却中不能挡住 h1：h1 一有空位就领走。
+        self.store.touch_host("cloudrun")
+        for job, done in ((first, busy[0]), (second, busy[1])):
+            self.store.finish(done["id"], status="succeeded", exit_code=0)
+            self.assertEqual(self.store.claim("h1", "w-h1")["id"], job["id"])
+        self.assertEqual(self.store.job(direct["id"])["status"], "queued")
+        # 冷却结束：直接发给 cloudrun 的任务照常拉起。
+        self.provisioner._cooldowns["cloudrun"] = (now() - 1, "")
+        self.store.set_host_cooldown("cloudrun", now() - 1)
+        self.tick()
+        self.assertEqual(len(self.api.runs), 1)
+        self.assertEqual(self.api.runs[0]["env"]["CALLTABLE_JOB_ID"], direct["id"])
+        self.assertFalse(self.provisioner.summary()["cloudrun"]["cooling_down"])
+
+    def test_repeated_failures_log_the_cooldown_once(self):
+        settings = self.provisioner.settings["cloudrun"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.provisioner._start_cooldown("cloudrun", settings, "first")
+            self.provisioner._start_cooldown("cloudrun", settings, "second")
+        self.assertEqual(out.getvalue().count("not reserving new jobs"), 1)
+        self.assertEqual(self.provisioner.summary()["cloudrun"]["cooldown_reason"],
+                         "second")
+
+
+class NoCooldownTests(Base):
+    hosts_overrides = {"launch_cooldown": "0"}
+
+    def test_zero_disables_the_cooldown(self):
+        self.config.raw["groups"] = {"pool": ["h1", "cloudrun"]}
+        self.api.fail_run = True
+        first = self.submit(host="pool")  # h1 离线：溢出到 cloudrun
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(self.store.job(first["id"])["status"], "queued")
+        self.api.fail_run = False
+        self.submit(host="pool")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(len(self.api.runs), 1)
+        self.assertFalse(self.provisioner.summary()["cloudrun"]["cooling_down"])
+        self.assertEqual(self.store.host_cooldowns, {})
+
+
 class StaleSnapshotTests(Base):
     """慢速 gcloud 调用期间执行器上报了成功：provisioner 不能把它改成 error。"""
 
@@ -1153,6 +1414,19 @@ class GitRelayHubTests(GitRelayBase):
         self.api.fail_run = True
         job, _ = self.launch()
         self.assertEqual(self.store.job(job["id"])["status"], "error")
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(self.remote_refs(), {})
+
+    def test_requeued_group_job_still_cleans_up_the_refs(self):
+        self.config.raw["groups"] = {"pool": ["h1", "cloudrun"]}
+        self.api.fail_run = True
+        job = self.submit(host="pool", sha=self.sha, base_ref="origin/main",
+                          base_ref_sha=self.base_sha)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.provisioner.tick()
+        self.assertEqual(self.store.job(job["id"])["status"], "queued")
+        self.assertEqual(len(self.remote_refs()), 2)
         with contextlib.redirect_stdout(io.StringIO()):
             self.provisioner.tick()
         self.assertEqual(self.remote_refs(), {})

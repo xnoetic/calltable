@@ -8,7 +8,8 @@ import time
 import unittest
 from pathlib import Path
 
-from calltable.db import MISSING_STRIKES, Store
+from calltable.db import (ALREADY_ATTACHED, MISSING_STRIKES, NOT_REQUEUED,
+                          PENDING_WORKER_PREFIX, REQUEUED, Store)
 from calltable.hub import Hub
 from tests.helpers import make_config
 
@@ -407,6 +408,173 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(hosts["h1"]["used"], {"light": 2})
         self.assertEqual(hosts["h1"]["locks"], ["x", "y"])
         self.assertEqual(hosts["h2"]["running"], [])
+
+
+class RequeueTests(unittest.TestCase):
+    """溢出组：provider 主机（这里叫 cr）没拉起来时把任务放回队列。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.store = Store(Path(self.tmp.name) / "hub.sqlite3")
+        self.store.seed_host("h1", {"light": 1}, [])
+        self.store.seed_host("cr", {"light": 2}, [])
+        self.store.heartbeat("h1", "seed", [])
+        self.store.touch_host("cr")
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _fill_h1(self) -> dict:
+        busy = self.store.create_job(project="p", host="h1", slot="light",
+                                     locks=[], cmd=["true"])
+        self.assertEqual(self.store.claim("h1", "w1")["id"], busy["id"])
+        return busy
+
+    def _group_job(self, targets=("h1", "cr"), locks=("gate@{host}", "db")):
+        return self.store.create_job(
+            project="p", host="pool", slot="light", locks=list(locks),
+            cmd=["true"], group_name="pool", targets=list(targets))
+
+    def _reserve(self, job: dict) -> dict:
+        claimed = self.store.claim("cr", f"{PENDING_WORKER_PREFIX}abc")
+        self.assertEqual(claimed["id"], job["id"])
+        self.assertEqual(claimed["locks"], ["gate@cr", "db"])
+        return claimed
+
+    def test_requeue_restores_the_pre_claim_state(self):
+        busy = self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+        outcome, requeued = self.store.requeue_unattached(
+            job["id"], "cr", note="cr: launch failed")
+        self.assertEqual(outcome, REQUEUED)
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["host"], "pool")
+        self.assertEqual(requeued["worker"], "")
+        self.assertIsNone(requeued["started"])
+        self.assertFalse(requeued["needs_reconcile"])
+        self.assertEqual(requeued["targets"], ["h1"])
+        self.assertEqual(requeued["locks"], ["gate@{host}", "db"])
+        self.assertEqual(requeued["created"], job["created"])
+        self.assertEqual(requeued["requeue_note"], "cr: launch failed")
+        self.assertEqual(requeued["error"], "")
+        self.assertNotIn("lock_templates", requeued)
+        types = [event["type"] for event in self.store.events_after(0, job["id"])]
+        self.assertEqual(types, ["job.queued", "job.started", "job.requeued"])
+        # 专用主机有空位就领走，锁按它展开。
+        self.store.finish(busy["id"], status="succeeded", exit_code=0)
+        claimed = self.store.claim("h1", "w1")
+        self.assertEqual(claimed["id"], job["id"])
+        self.assertEqual(claimed["host"], "h1")
+        self.assertEqual(claimed["locks"], ["gate@h1", "db"])
+
+    def test_requeued_job_keeps_its_place_in_the_queue(self):
+        busy = self._fill_h1()
+        first = self._group_job()
+        self._reserve(first)
+        later = self.store.create_job(project="p", host="h1", slot="light",
+                                      locks=[], cmd=["true"])
+        self.store.requeue_unattached(first["id"], "cr", note="x")
+        self.store.finish(busy["id"], status="succeeded", exit_code=0)
+        self.assertEqual(self.store.claim("h1", "w1")["id"], first["id"])
+        self.assertEqual(self.store.job(later["id"])["status"], "queued")
+
+    def test_attached_job_is_left_alone(self):
+        self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+        self.assertIsNotNone(self.store.attach_job(job["id"], "cr", "exec-1"))
+        outcome, requeued = self.store.requeue_unattached(job["id"], "cr", note="x")
+        self.assertEqual((outcome, requeued), (ALREADY_ATTACHED, None))
+        current = self.store.job(job["id"])
+        self.assertEqual((current["status"], current["host"], current["worker"]),
+                         ("running", "cr", "exec-1"))
+
+    def test_single_target_job_is_not_requeued(self):
+        job = self.store.create_job(project="p", host="cr", slot="light",
+                                    locks=[], cmd=["true"])
+        self.assertEqual(self.store.claim("cr", "pending:abc")["id"], job["id"])
+        outcome, _ = self.store.requeue_unattached(job["id"], "cr", note="x")
+        self.assertEqual(outcome, NOT_REQUEUED)
+        self.assertEqual(self.store.job(job["id"])["status"], "running")
+
+    def test_cancel_requested_or_unrecorded_templates_are_not_requeued(self):
+        self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+        self.store.request_cancel(job["id"])
+        self.assertEqual(self.store.requeue_unattached(job["id"], "cr", note="x")[0],
+                         NOT_REQUEUED)
+        # 升级前 claim 的任务没有锁模板：还原不了，不放回队列。
+        self.store.conn.execute(
+            "UPDATE jobs SET cancel_requested=0, lock_templates='' WHERE id=?",
+            (job["id"],))
+        self.assertEqual(self.store.requeue_unattached(job["id"], "cr", note="x")[0],
+                         NOT_REQUEUED)
+
+    def test_requeue_retracts_the_started_webhook(self):
+        self.store.webhook_urls = ["http://hooks.example/a"]
+        self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+
+        def events():
+            return sorted((row["event"], row["status"]) for row in
+                          self.store.webhook_deliveries(job["id"]))
+
+        # job.started 已经投递出去：撤掉它，补一条 job.requeued。
+        self.store.conn.execute(
+            "UPDATE webhook_deliveries SET status='delivered', attempts=1 "
+            "WHERE job_id=? AND event='job.started'", (job["id"],))
+        self.store.requeue_unattached(job["id"], "cr", note="x")
+        self.assertEqual(events(), [("job.requeued", "pending")])
+        # 真正开跑时 job.started 能再投一次。
+        self.store.conn.execute("UPDATE jobs SET status='succeeded' "
+                                "WHERE host='h1' AND status='running'")
+        self.assertEqual(self.store.claim("h1", "w1")["id"], job["id"])
+        self.assertEqual(events(), [("job.requeued", "pending"),
+                                    ("job.started", "pending")])
+
+    def test_unsent_started_webhook_is_dropped_without_a_requeued_one(self):
+        self.store.webhook_urls = ["http://hooks.example/a"]
+        self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+        self.store.requeue_unattached(job["id"], "cr", note="x")
+        self.assertEqual(self.store.webhook_deliveries(job["id"]), [])
+
+    def test_requeue_restarts_the_queue_hold(self):
+        self._fill_h1()
+        job = self.store.create_job(
+            project="p", host="pool", slot="light", locks=[], cmd=["true"],
+            group_name="pool", targets=["h1", "cr"], hold_seconds=60)
+        self.store.claim("cr", f"{PENDING_WORKER_PREFIX}abc")
+        # 预留期间客户端不发排队心跳：last_hold 早就过期了。
+        self.store.conn.execute("UPDATE jobs SET last_hold=? WHERE id=?",
+                                (time.time() - 3600, job["id"]))
+        self.assertEqual(self.store.requeue_unattached(job["id"], "cr", note="x")[0],
+                         REQUEUED)
+        self.assertEqual(self.store.reap_queue_holds(), [])
+        self.assertEqual(self.store.job(job["id"])["status"], "queued")
+
+    def test_requeue_leaves_last_hold_alone_without_a_hold(self):
+        self._fill_h1()
+        job = self._group_job()
+        self._reserve(job)
+        self.store.requeue_unattached(job["id"], "cr", note="x")
+        self.assertIsNone(self.store.job(job["id"])["last_hold"])
+
+    def test_cooling_down_member_does_not_block_the_next_member(self):
+        # cr 在线、有空位、排在前面：不冷却时 h1 领不到。
+        job = self._group_job(targets=("cr", "h1"), locks=())
+        self.assertIsNone(self.store.claim("h1", "w1"))
+        self.store.set_host_cooldown("cr", time.time() + 300)
+        self.assertIsNone(self.store.claim("cr", "pending:abc"))
+        claimed = self.store.claim("h1", "w1")
+        self.assertEqual(claimed["id"], job["id"])
+        self.store.set_host_cooldown("cr", 0)
+        self.assertEqual(self.store.host_cooldowns, {})
 
 
 class HubSlotsTests(unittest.TestCase):
