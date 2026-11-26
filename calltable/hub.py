@@ -412,13 +412,15 @@ class Hub:
                 raise ValueError("bundle path rejected")
         webhooks = self._job_webhooks(body)
         hold_seconds = self._job_hold_seconds(body)
+        artifact_patterns = self._job_artifact_patterns(body)
         idempotency = self._job_idempotency(
             body, project=project, host=host, cmd=cmd,
             sha=str(body.get("sha") or ""),
             tree_sha=str(body.get("tree_sha") or "").strip(),
             base_ref=str(body.get("base_ref") or ""),
             dirty=bool(body.get("dirty")), slot=slot, locks=locks,
-            timeout=timeout, label=str(body.get("label") or ""))
+            timeout=timeout, label=str(body.get("label") or ""),
+            artifact_patterns=artifact_patterns)
         job = self.store.create_job(
             project=project, host=host, slot=slot, locks=locks, cmd=cmd,
             profile=(profile.name if profile else ""),
@@ -432,8 +434,31 @@ class Hub:
             dirty=bool(body.get("dirty")),
             timeout=timeout, bundle_id=bundle_id, group_name=group_name,
             targets=targets, webhooks=webhooks, hold_seconds=hold_seconds,
-            idempotency=idempotency)
+            idempotency=idempotency, artifact_patterns=artifact_patterns)
         return job
+
+    @staticmethod
+    def _job_artifact_patterns(body: dict) -> list[str] | None:
+        """仓库声明的产物 glob：缺省（None）表示沿用 hub profile。"""
+        raw = body.get("artifact_patterns")
+        if raw is None:
+            return None
+        if not isinstance(raw, list) or len(raw) > 100:
+            raise ValueError("artifact_patterns must be an array of at most "
+                             "100 strings")
+        patterns: list[str] = []
+        for item in raw:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("artifact_patterns must be non-empty strings")
+            pattern = item.strip()
+            # 与平台无关地判断：执行器可能在 Windows 上，hub 在 Linux 上。
+            if (".." in re.split(r"[\\/]+", pattern)
+                    or pattern.startswith(("/", "\\"))
+                    or re.match(r"[A-Za-z]:", pattern)):
+                raise ValueError(f"artifact pattern must be worktree-relative: "
+                                 f"{pattern!r}")
+            patterns.append(pattern)
+        return patterns
 
     def _group_targets(self, group: str, project: str,
                        members: list[str]) -> list[str]:
@@ -503,7 +528,9 @@ class Hub:
                          cmd: list[str], sha: str, tree_sha: str,
                          base_ref: str, dirty: bool,
                          slot: str, locks: list[str], timeout: int,
-                         label: str) -> dict | None:
+                         label: str,
+                         artifact_patterns: list[str] | None = None
+                         ) -> dict | None:
         key = str(body.get("idempotency_key") or "").strip()
         if not key:
             return None
@@ -518,10 +545,12 @@ class Hub:
             code_identity = "tree:" + tree_sha
         else:
             code_identity = "commit:" + sha
+        extra = ({} if artifact_patterns is None
+                 else {"artifact_patterns": list(artifact_patterns)})
         fingerprint = submission_fingerprint(
             project=project, host=host, cmd=list(cmd), base_ref=base_ref,
             dirty=bool(dirty), code_identity=code_identity, slot=slot,
-            locks=list(locks), timeout=timeout, label=label)
+            locks=list(locks), timeout=timeout, label=label, **extra)
         return {"key": key, "fingerprint": fingerprint,
                 "window": self.config.idempotency_window_seconds}
 
@@ -650,6 +679,9 @@ class Hub:
         payload = dict(job)
         payload["bundle_url"] = (f"/api/jobs/{job['id']}/bundle" if bundle else "")
         payload["profile_data"] = profile_to_dict(profile) if profile else {}
+        if job.get("artifact_patterns") is not None:
+            # 仓库声明的产物 glob 取代 hub profile 的（命令行 > 声明 > profile）。
+            payload["profile_data"]["artifacts"] = list(job["artifact_patterns"])
         # 按实际执行主机取档位（与 hub_profile 同一台）：主机级覆盖 hub 级。
         tier = self.config.host_resource_tier(job["host"], job["slot"])
         rule, _ = match_rule(profile, job.get("cmd") or [])

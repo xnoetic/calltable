@@ -58,6 +58,7 @@ Only the Python 3.12+ standard library, SQLite and the `git` CLI are required.
 * [For AI agents](#for-ai-agents)
 * [Configuration](#configuration)
 * [Profiles](#profiles)
+* [Repository declaration (`.calltable.json`)](#repository-declaration-calltablejson)
 * [Security](#security)
 * [Tests](#tests)
 * [Documentation](#documentation)
@@ -516,7 +517,9 @@ All keys live under `hosts.<name>.cloudrun`. Only `project` is required.
 
 ```
 ct run    snapshot the worktree and submit a job
+          ct run [options] -- <command...> | ct run [options] <task>
           --project P --host H|--platform linux|windows|macos
+            (both optional inside a repo with .calltable.json)
           --slot S --lock L (repeatable) --no-lock
           --timeout 3h --label TEXT --agent NAME
           --base-ref origin/main | --no-base-ref
@@ -524,7 +527,7 @@ ct run    snapshot the worktree and submit a job
           --idempotency-key KEY (0.3: retries reuse one ticket)
           --hold-while-alive [--hold-timeout 180s] (0.3: cancel if the
             client stops heartbeating while queued)
-          --dry-run (print effective slot/locks/timeout, submit nothing)
+          --dry-run (print every effective value and its source, submit nothing)
           --wait (stream logs, exit with the job exit code) | --detach (default)
 ct ls [--running|--queued] [--json]
 ct show <id> | ct logs <id> -f | ct cancel <id>
@@ -617,6 +620,9 @@ Notes:
   `TEMP` and build defaults (`MSBUILDDISABLENODEREUSE=1`, …).
 * `--host` can be omitted when the project has exactly one profile (or only one
   profile whose host name contains the `--platform` keyword).
+* Inside a repository with a [`.calltable.json`](#repository-declaration-calltablejson)
+  `--project` and `--host` can both be omitted, and `ct run verify` runs a
+  named task.
 
 ## Configuration
 
@@ -692,6 +698,47 @@ with exit code 97. `artifacts` are worktree-relative globs (`**` supported). A
 profile for a Cloud Run host adds a `cloudrun` block that describes the
 project's image; see [Set it up](#set-it-up).
 
+## Repository declaration (`.calltable.json`)
+
+A project can declare its calltable defaults in its own repository, at the git
+root, so agents do not have to remember the project and host names:
+
+```json
+{
+  "project": "demo",
+  "host": "linux",
+  "timeout": "30m",
+  "artifacts": ["reports/**/*.xml"],
+  "rules": [{"match": "integration", "slot": "heavy", "timeout": "2h"}],
+  "tasks": {"verify": ["./build/verify.sh"]}
+}
+```
+
+```bash
+ct run verify                  # task: no --, exactly one word, a declared task name
+ct run -- ./build/verify.sh    # command: project/host from the declaration
+ct run --host h2 verify        # command-line flags still win
+ct run --dry-run verify        # every effective value and where it came from
+```
+
+* Fields: `project`, `host` (a host or group) or `platform`, and optional
+  `slot`, `locks`, `timeout`, `artifacts`, `rules` (same meaning as in a
+  profile) and `tasks` (name → argv array).
+* Precedence: command line > `.calltable.json` > hub-side profile. Fields the
+  declaration does not set are still resolved from the hub profile.
+* `ct run <word>` is a task only when there is no `--` and the word is a
+  declared task; `ct run -- <cmd>` is always a literal command.
+* Host-specific fields (`env_files`, `env`, `setup`, `memory_max`,
+  `cpu_weight`, `slice`, `cloudrun`, `unsupported`) stay in the hub profile and
+  are rejected in the declaration with the reason. Unknown fields and malformed
+  values fail before anything is submitted, naming the field.
+* Without the file nothing changes.
+
+The full format is in [`spec/repo-declaration.md`](spec/repo-declaration.md).
+This repository ships one that only declares `"project": "calltable"` (the name
+`bin/ci-local` uses); hosts stay on the command line because the Linux and
+Windows executors need different Python commands.
+
 ## Security
 
 The hub has **one shared bearer token, no user accounts and no TLS**. Bind it to
@@ -736,6 +783,8 @@ start real git repositories, so an executor needs a git identity and
 * [`spec/calltable-protocol.md`](spec/calltable-protocol.md): the protocol.
   State machine, HTTP API, event payloads, webhook signing, retries,
   idempotency, the ETA algorithm and provider hosts.
+* [`spec/repo-declaration.md`](spec/repo-declaration.md): the
+  `.calltable.json` repository declaration, task syntax and precedence.
 * [`integrations/AGENTS.snippet.md`](integrations/AGENTS.snippet.md): a
   ready-to-paste discipline template for agent instruction files.
 * [`integrations/`](integrations/): a minimal webhook verifier and a

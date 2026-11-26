@@ -50,6 +50,7 @@
 * [给 AI agent 用](#给-ai-agent-用)
 * [配置](#配置)
 * [Profile](#profile)
+* [仓库声明（`.calltable.json`）](#仓库声明calltablejson)
 * [安全](#安全)
 * [测试](#测试)
 * [文档](#文档)
@@ -343,7 +344,9 @@ Cloud Run 的文件系统在内存里：检出的代码会占用内存配额。�
 
 ```
 ct run    给工作区做快照并提交任务
+          ct run [选项] -- <命令...> | ct run [选项] <任务名>
           --project P --host H|--platform linux|windows|macos
+            （仓库里有 .calltable.json 时两者都可省略）
           --slot S --lock L（可重复） --no-lock
           --timeout 3h --label TEXT --agent NAME
           --base-ref origin/main | --no-base-ref
@@ -351,7 +354,7 @@ ct run    给工作区做快照并提交任务
           --idempotency-key KEY（0.3：重试复用同一个号）
           --hold-while-alive [--hold-timeout 180s]（0.3：排队期间客户端
             停止心跳就取消）
-          --dry-run（打印生效的 slot/locks/timeout，不提交）
+          --dry-run（打印每个生效的值和它的来源，不提交）
           --wait（实时输出日志，以任务的退出码退出）| --detach（默认）
 ct ls [--running|--queued] [--json]
 ct show <id> | ct logs <id> -f | ct cancel <id>
@@ -398,6 +401,7 @@ ct cloudrun status | bootstrap | image --project P | jobs --project P   (--apply
 * `ct run` 只读你的工作区：它用临时的 `GIT_INDEX_FILE` 生成快照，`.git/index`、`HEAD` 和工作树都保持原样。
 * 任务会拿到 `CALLTABLE_JOB_ID`、`CALLTABLE_PROJECT`、`CALLTABLE_HOST`、`CALLTABLE_SHA`、`CALLTABLE_BASE_SHA`、`CALLTABLE_DIRTY`、`CALLTABLE_BASE_REF_SHA`、`CALLTABLE_SUBMITTER`，外加隔离的 `TMPDIR`/`TMP`/`TEMP` 和构建默认值（`MSBUILDDISABLENODEREUSE=1`，…）。
 * 项目只有一个 profile 时（或者只有一个 profile 的主机名包含 `--platform` 关键字时），可以省略 `--host`。
+* 仓库里有 [`.calltable.json`](#仓库声明calltablejson) 时，`--project` 和 `--host` 都可以省略，`ct run verify` 直接跑声明里的命名任务。
 
 ## 配置
 
@@ -458,6 +462,36 @@ cp profiles/examples/dotnet@runner-a.json profiles/dotnet@runner-a.json
 
 `env_files` 在 Linux 上用 `. <file>` 加载；文件不存在时任务失败，退出码 97。`artifacts` 是相对工作区的 glob（支持 `**`）。Cloud Run 主机的 profile 还要加一个 `cloudrun` 块，描述项目的镜像；见[配置步骤](#配置步骤)。
 
+## 仓库声明（`.calltable.json`）
+
+项目可以在自己仓库的 git 根目录里声明 calltable 默认值，agent 不用再记项目名和主机名：
+
+```json
+{
+  "project": "demo",
+  "host": "linux",
+  "timeout": "30m",
+  "artifacts": ["reports/**/*.xml"],
+  "rules": [{"match": "integration", "slot": "heavy", "timeout": "2h"}],
+  "tasks": {"verify": ["./build/verify.sh"]}
+}
+```
+
+```bash
+ct run verify                  # 任务：没有 --、只有一个词、且是声明里的任务名
+ct run -- ./build/verify.sh    # 命令：项目和主机取自声明
+ct run --host h2 verify        # 命令行参数仍然优先
+ct run --dry-run verify        # 打印每个生效的值和它的来源
+```
+
+* 字段：`project`、`host`（主机或主机组）或 `platform`，以及可选的 `slot`、`locks`、`timeout`、`artifacts`、`rules`（含义和 profile 相同）和 `tasks`（任务名 → 参数数组）。
+* 优先级：命令行 > `.calltable.json` > hub 侧 profile。声明里没写的字段仍按 hub profile 解析。
+* `ct run <词>` 只有在没有 `--`、且这个词是声明过的任务名时才算任务；`ct run -- <命令>` 永远按命令原样提交。
+* 和主机有关的字段（`env_files`、`env`、`setup`、`memory_max`、`cpu_weight`、`slice`、`cloudrun`、`unsupported`）只能写在 hub 侧 profile 里，写进声明会被拒绝并说明原因。未知字段和格式错误在提交之前报错，并指出是哪个字段。
+* 没有这个文件时，行为和以前完全一样。
+
+完整格式见 [`spec/repo-declaration.md`](spec/repo-declaration.md)。本仓库自带一个，只声明了 `"project": "calltable"`（与 `bin/ci-local` 用的名字一致）；主机仍在命令行上给，因为 Linux 和 Windows 执行器要用不同的 Python 命令。
+
 ## 安全
 
 hub 只有**一个共享的 bearer token，没有用户账号，也没有 TLS**。把它绑定在回环地址、私有网络或 tailnet 上，不要直接暴露到公网。产物下载之所以接受 `?token=`，只是因为 `<a download>` 发不了请求头；其他接口都要求 `Authorization` 头。见 `SECURITY.md`。
@@ -476,6 +510,7 @@ python bin/ci-local                              # 真实的执行器
 ## 文档
 
 * [`spec/calltable-protocol.md`](spec/calltable-protocol.md)：协议。状态机、HTTP API、事件载荷、webhook 签名、重试、幂等、预计时间算法和 provider 主机。
+* [`spec/repo-declaration.md`](spec/repo-declaration.md)：仓库声明 `.calltable.json`、任务语法和优先级。
 * [`integrations/AGENTS.snippet.md`](integrations/AGENTS.snippet.md)：可以直接粘贴进 agent 指令文件的纪律模板。
 * [`integrations/`](integrations/)：最小的 webhook 验签程序，以及 Slack/飞书转发。
 * [`config.example.json`](config.example.json) 和 [`profiles/examples/`](profiles/examples/)：完整的起点。

@@ -223,6 +223,9 @@ MIGRATIONS = [
     ("jobs", "lock_templates", "TEXT NOT NULL DEFAULT ''"),
     # 任务被放回队列的原因（人看的说明，不算错误）。
     ("jobs", "requeue_note", "TEXT NOT NULL DEFAULT ''"),
+    # 仓库声明 .calltable.json 的产物 glob（JSON 数组）；空串表示没声明，
+    # 沿用 hub profile 的 artifacts。
+    ("jobs", "artifact_patterns", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 #: provider 预留任务时写进 ``jobs.worker`` 的占位前缀；执行器 attach 后替换。
@@ -544,7 +547,8 @@ class Store:
                    group_name: str = "", targets: list[str] | None = None,
                    webhooks: list[str] | None = None,
                    hold_seconds: int = 0,
-                   idempotency: dict | None = None) -> dict:
+                   idempotency: dict | None = None,
+                   artifact_patterns: list[str] | None = None) -> dict:
         """创建任务；``idempotency`` = {key, fingerprint, window} 时原子去重。"""
         job_id = new_id()
         replay_id = ""
@@ -565,15 +569,17 @@ class Store:
                            submitter, agent, label, sha, base_ref, base_ref_sha,
                            base_sha, dirty, status, created, timeout, bundle_id,
                            group_name, targets, webhooks, hold_seconds,
-                           last_hold, idempotency_key)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                           last_hold, idempotency_key, artifact_patterns)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (job_id, project, host, slot, json_dumps(locks), json_dumps(cmd),
                      profile, submitter, agent, label, sha, base_ref, base_ref_sha,
                      base_sha, 1 if dirty else 0, QUEUED, now(), timeout, bundle_id,
                      group_name, json_dumps(targets or [host]),
                      json_dumps(webhooks or []), int(hold_seconds or 0),
                      (now() if hold_seconds else None),
-                     (idempotency or {}).get("key", "")))
+                     (idempotency or {}).get("key", ""),
+                     ("" if artifact_patterns is None
+                      else json_dumps(list(artifact_patterns)))))
                 if bundle_id:
                     self.conn.execute("UPDATE bundles SET job_id=? WHERE id=?",
                                       (job_id, bundle_id))
@@ -641,6 +647,8 @@ class Store:
         data["needs_reconcile"] = bool(data.get("needs_reconcile"))
         data["purged"] = bool(data.get("purged"))
         data["requeue_note"] = data.get("requeue_note") or ""
+        patterns = data.get("artifact_patterns") or ""
+        data["artifact_patterns"] = json_loads(patterns, None) if patterns else None
         data.pop("bundle_id", None)
         data.pop("misses", None)
         data.pop("lock_templates", None)

@@ -160,6 +160,7 @@ Request gains three optional members plus one header:
 | `hold_seconds` | integer | queue hold: if > 0 the job is cancelled when no heartbeat arrives for this long while queued; `0` disables it (default) |
 | `idempotency_key` | string | alternative to the `Idempotency-Key` header (§8) |
 | `Idempotency-Key` | header | preferred way to send the key |
+| `artifact_patterns` | array of strings | worktree-relative artifact globs from the repository declaration; replace the profile's `artifacts` for this job, echoed on the job (`null` when absent). See [`repo-declaration.md`](repo-declaration.md) |
 
 Response is `201 Created` for a new job and `200 OK` for an idempotent replay,
 with `X-Calltable-Idempotent-Replay: true` in the replay case. The body is the
@@ -393,6 +394,8 @@ makes ticket taking safe to retry.
     present, otherwise `unknown` for ETA.
   * `webhooks`, `hold_seconds`, `idempotency_key`: not echoed by the hub →
     print a warning and continue (the old hub ignores the fields).
+  * `artifact_patterns` (repository declaration): not echoed → the client
+    warns that the declared artifacts are not collected.
 * 0.2 client against a 0.3 hub: extra response fields are ignored by the old
   client; `slot`/`locks`/`timeout` handling is unchanged.
 
