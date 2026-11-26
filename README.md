@@ -487,6 +487,19 @@ Cloud Run's filesystem is in memory: checkouts count against the memory
 limit. Give heavy jobs a `disk` (ephemeral disk mounted at `/work`, 10 GiB per
 instance by default) when builds are large.
 
+### Orphaned processes in the container
+
+The image has no init system: the entrypoint `exec`s the executor, so it starts
+as PID 1 and inherits every process a job orphans (a background process whose
+parent exited first). When the executor finds itself running as PID 1 it forks
+once: the parent stays behind as a minimal init that forwards signals, reaps
+every exited child and exits with the executor's exit code, and the child
+carries on as the executor. Orphans are reaped as soon as they exit instead of
+piling up as zombies for the rest of the execution. On static hosts the
+executor is never PID 1 and nothing changes. The image does not need `tini` or
+`--init`; if you add one anyway, the executor is no longer PID 1 and leaves
+reaping to it.
+
 ### Settings reference
 
 All keys live under `hosts.<name>.cloudrun`. Only `project` is required.
