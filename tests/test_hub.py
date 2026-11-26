@@ -150,7 +150,9 @@ class HubTests(unittest.TestCase):
                                          "cloud-only": ["cr"]}
 
     def _write_profile(self, name: str, **data):
-        (self.root / "profiles" / f"{name}.json").write_text(
+        # Windows 文件名不能含 *：通配 profile 靠 JSON 里的 name 生效，文件名换个写法。
+        stem = name.replace("*", "_any_")
+        (self.root / "profiles" / f"{stem}.json").write_text(
             json.dumps({"name": name, "slot": "light", **data}), encoding="utf-8")
         self.hub.profiles = load_profiles(self.root / "profiles")
 
