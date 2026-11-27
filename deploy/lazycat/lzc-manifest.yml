@@ -1,0 +1,34 @@
+# 纯反向代理：没有容器。lzcinit 把请求转给 hub，转发前由 injects 脚本
+# 校验访问者是盒子管理员，并把 Authorization 换成 hub token。
+application:
+  subdomain: calltable
+  upstreams:
+    - location: /
+      backend: {{ index .U "hub_url" | quote }}
+      disable_auto_health_checking: true
+  injects:
+    - id: admin-only-and-hub-token
+      on: request
+      auth_required: true
+      when:
+        - "/*"
+      do:
+        - src: |
+            if (ctx.headers.get("X-HC-User-Role") !== "ADMIN") {
+              ctx.response.send(403, "calltable 看板只对盒子管理员开放", {
+                content_type: "text/plain; charset=utf-8",
+              });
+              return;
+            }
+            const token = String((ctx.params && ctx.params.token) || "").trim();
+            if (!token) {
+              ctx.response.send(503, "还没有配置 hub token：在应用设置里填写后重试", {
+                content_type: "text/plain; charset=utf-8",
+              });
+              return;
+            }
+            // 不信任浏览器带来的任何 Authorization，一律换成服务端的 token。
+            ctx.headers.del("Authorization");
+            ctx.headers.set("Authorization", "Bearer " + token);
+          params:
+            token: {{ index .U "hub_token" | quote }}

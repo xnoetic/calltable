@@ -2619,7 +2619,8 @@ window.addEventListener('hashchange', route);
       if (event.key === 'Enter') saveToken();
     });
   }
-  if (!tok()) showTokenBox();
+  /* 不预先弹 token 框：经反向代理（例如懒猫微服 app）访问时由代理补
+     Authorization，页面本身不持有 token；真缺 token 时 api() 收到 401 再弹。 */
   route();
   watchChartSize();
   timer = setInterval(function () {

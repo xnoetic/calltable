@@ -650,6 +650,7 @@ complete starting point). Keys include:
 |---|---|
 | `token` | shared bearer token; also `CALLTABLE_TOKEN` |
 | `hub_url`, `hub_bind`, `hub_port` | where clients connect / what the hub binds (default `127.0.0.1`) |
+| `hub_extra_binds` | extra addresses to listen on with the same port, e.g. the interface the [LazyCat dashboard app](deploy/lazycat/README.md) proxies to; auth is unchanged |
 | `hosts` | `{name: {slots: {heavy: n, light: m}, labels: [...], note}}` |
 | `hosts.<name>.provider`, `hosts.<name>.cloudrun` | `"cloudrun"` makes the host on-demand; see [settings reference](#settings-reference) |
 | `groups` | `{group: [host, ...]}`, order is priority |

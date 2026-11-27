@@ -1,0 +1,11 @@
+package: io.github.xnoetic.calltable.dashboard
+version: 0.1.0
+name: calltable 看板
+description: 在懒猫微服里打开 calltable hub 的看板；由本应用在服务端带上 hub token，浏览器拿不到 token。
+license: https://www.apache.org/licenses/LICENSE-2.0
+homepage: https://github.com/xnoetic/calltable
+admin_only: true
+min_os_version: 1.5.0
+permissions:
+  required:
+    - net.lan

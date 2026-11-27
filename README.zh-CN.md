@@ -418,6 +418,7 @@ hub 和执行器共用一个 JSON 文件（`config.example.json` 是完整的起
 |---|---|
 | `token` | 共享的 bearer token；也可以用 `CALLTABLE_TOKEN` |
 | `hub_url`、`hub_bind`、`hub_port` | 客户端连接的地址 / hub 绑定的地址（默认 `127.0.0.1`） |
+| `hub_extra_binds` | 同一端口上额外监听的地址列表，例如给[懒猫微服看板 app](deploy/lazycat/README.md) 反代用的网卡；鉴权不变 |
 | `hosts` | `{name: {slots: {heavy: n, light: m}, labels: [...], note}}` |
 | `hosts.<name>.provider`、`hosts.<name>.cloudrun` | 设为 `"cloudrun"` 时主机按需拉起；见[配置项参考](#配置项参考) |
 | `groups` | `{group: [host, ...]}`，顺序即优先级 |
