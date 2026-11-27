@@ -1424,12 +1424,27 @@ def serve(config: Config) -> None:
     hub.start_upstreams()
     server = HubServer((config.hub_bind, config.hub_port), Handler)
     server.hub = hub  # type: ignore[attr-defined]
-    print(f"calltable hub listening on {config.hub_bind}:{config.hub_port} "
+    extras = []
+    for addr in config.hub_extra_binds:
+        extra = HubServer((addr, config.hub_port), Handler)
+        extra.hub = hub  # type: ignore[attr-defined]
+        extras.append(extra)
+    listening = ", ".join(f"{a}:{config.hub_port}"
+                          for a in [config.hub_bind, *config.hub_extra_binds])
+    print(f"calltable hub listening on {listening} "
           f"(version {__version__}, data {config.data_dir})", flush=True)
+    threads = [threading.Thread(target=extra.serve_forever, daemon=True,
+                                name=f"hub-listen-{extra.server_name}")
+               for extra in extras]
+    for thread in threads:
+        thread.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        for extra in extras:
+            extra.shutdown()
+            extra.server_close()
         hub.close()
         server.server_close()

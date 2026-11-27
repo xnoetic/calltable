@@ -1,0 +1,11 @@
+params:
+  - id: hub_url
+    type: string
+    name: "hub 地址"
+    description: "盒子能连到的 hub 地址，指向 hub 的 hub_extra_binds 监听，例如 http://100.64.0.10:8092"
+    default_value: "http://100.64.0.10:8092"
+
+  - id: hub_token
+    type: secret
+    name: "hub token"
+    description: "hub 配置里的 token。只在服务端注入 Authorization 头，不进 lpk、不发给浏览器。"

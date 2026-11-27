@@ -618,6 +618,21 @@ class HubServerTests(unittest.TestCase):
             finally:
                 server.server_close()
 
+    def test_extra_binds_drop_blanks_and_duplicates(self):
+        from calltable.config import Config
+
+        def make(raw):
+            return Config(path=Path("c.json"), raw=raw, token="t",
+                          data_dir=Path("data"))
+
+        config = make({"hub_bind": "192.0.2.1",
+                       "hub_extra_binds": ["100.64.0.10", "", "192.0.2.1",
+                                           "100.64.0.10"]})
+        self.assertEqual(config.hub_extra_binds, ["100.64.0.10"])
+        self.assertEqual(make({"hub_extra_binds": "10.0.0.5"}).hub_extra_binds,
+                         ["10.0.0.5"])
+        self.assertEqual(make({}).hub_extra_binds, [])
+
 
 if __name__ == "__main__":
     unittest.main()

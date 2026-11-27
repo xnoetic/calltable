@@ -253,6 +253,24 @@ class Config:
         return self.raw.get("hub_bind", "127.0.0.1")
 
     @property
+    def hub_extra_binds(self) -> list[str]:
+        """同一端口上额外监听的地址（例如给懒猫微服 app 反代用的虚拟机网卡）。
+
+        与 ``hub_bind`` 相同的地址会被去掉；鉴权不变，所有 /api/* 仍要 token。
+        """
+        extra = self.raw.get("hub_extra_binds") or []
+        if isinstance(extra, str):
+            extra = [extra]
+        seen = {self.hub_bind}
+        result = []
+        for addr in extra:
+            addr = str(addr).strip()
+            if addr and addr not in seen:
+                seen.add(addr)
+                result.append(addr)
+        return result
+
+    @property
     def hub_port(self) -> int:
         return int(self.raw.get("hub_port", 8091))
 
