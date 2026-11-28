@@ -1211,6 +1211,17 @@ class UploadProxyTests(unittest.TestCase):
         sent = b"".join(call.args[0] for call in conn.send.call_args_list)
         self.assertEqual(sent, self.data)
 
+    def test_direct_https_upload_preserves_query(self):
+        for authority, port in (("hub.example", 443), ("hub.example:9443", 9443)):
+            with self.subTest(authority=authority), mock.patch.object(
+                    http.client, "HTTPSConnection") as connection:
+                client = HubClient("https://" + authority, "t")
+                conn = connection.return_value
+                conn.getresponse.return_value = mock.Mock(status=200, read=lambda: b"")
+                client.upload_file("/artifacts?path=a%2Fb#ignored", self.file)
+                self.assertEqual(connection.call_args.args[:2], ("hub.example", port))
+                conn.putrequest.assert_called_once_with("POST", "/artifacts?path=a%2Fb")
+
 
 GIT_ENV = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
            "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"}
