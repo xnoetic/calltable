@@ -289,6 +289,122 @@ class HubTests(unittest.TestCase):
         self.assertEqual(payload["systemd"]["slice"], "custom.slice")
         self.assertEqual(payload["cpu_rate_percent"], 70)
 
+    # ------------------------------------------------------------ 通配 profile（H11）
+    def _wildcard_profile(self, filename: str, data: dict) -> None:
+        # Windows 文件名不能含 `*`：通配写在 JSON 的 name 字段里，文件名随意。
+        (self.root / "profiles" / filename).write_text(
+            json.dumps({"artifacts": [], **data}), encoding="utf-8")
+        self.hub.profiles = load_profiles(self.root / "profiles")
+
+    def test_host_wildcard_profile_applies_to_projects_without_their_own(self):
+        self._wildcard_profile("any@h1.json", {
+            "name": "*@h1", "slot": "heavy", "locks": ["box@{host}"],
+            "timeout": "5m", "env": {"WHERE": "h1-any"}})
+        job = self.hub.create_job({"project": "wild", "host": "h1",
+                                   "cmd": ["true"]})
+        self.assertEqual(job["profile"], "*@h1")
+        self.assertEqual(job["slot"], "heavy")
+        self.assertEqual(job["locks"], ["box@{host}"])
+        self.assertEqual(job["timeout"], 300)
+        # 有专属 profile 的项目仍然用自己的（project@host 优先于 *@host）。
+        own = self.hub.create_job({"project": "demo", "host": "h1",
+                                   "cmd": ["true"]})
+        self.assertEqual(own["profile"], "demo@h1")
+        self.assertEqual(own["slot"], "light")
+
+    def test_global_wildcard_profile_applies_to_any_project(self):
+        self._wildcard_profile("any@any.json", {
+            "name": "*@*", "slot": "heavy", "timeout": "7m"})
+        job = self.hub.create_job({"project": "wild", "host": "h1",
+                                   "cmd": ["true"]})
+        self.assertEqual(job["profile"], "*@*")
+        self.assertEqual(job["slot"], "heavy")
+        self.assertEqual(job["timeout"], 420)
+
+    def test_project_wildcard_is_used_only_where_no_host_profile_exists(self):
+        self.hub.config.raw["hosts"]["h2"] = {"slots": {"heavy": 1, "light": 2}}
+        self._wildcard_profile("p@h1.json", {
+            "name": "p@h1", "slot": "light", "timeout": "1m"})
+        self._wildcard_profile("p@any.json", {
+            "name": "p@*", "slot": "heavy", "timeout": "2m"})
+        self._wildcard_profile("any@h2.json", {
+            "name": "*@h2", "slot": "light", "timeout": "3m"})
+        self._wildcard_profile("any@any.json", {
+            "name": "*@*", "slot": "light", "timeout": "4m"})
+        on_h1 = self.hub.create_job({"project": "p", "host": "h1",
+                                     "cmd": ["true"]})
+        on_h2 = self.hub.create_job({"project": "p", "host": "h2",
+                                     "cmd": ["true"]})
+        other_h1 = self.hub.create_job({"project": "other", "host": "h1",
+                                        "cmd": ["true"]})
+        other_h2 = self.hub.create_job({"project": "other", "host": "h2",
+                                        "cmd": ["true"]})
+        # 优先级：project@host > project@* > *@host > *@*
+        self.assertEqual((on_h1["profile"], on_h1["slot"], on_h1["timeout"]),
+                         ("p@h1", "light", 60))
+        self.assertEqual((on_h2["profile"], on_h2["slot"], on_h2["timeout"]),
+                         ("p@*", "heavy", 120))
+        self.assertEqual((other_h2["profile"], other_h2["timeout"]),
+                         ("*@h2", 180))
+        self.assertEqual((other_h1["profile"], other_h1["timeout"]),
+                         ("*@*", 240))
+
+    def _claim_on_h2(self, job: dict) -> dict:
+        """h1 离线 → 组任务由 h2 领取。"""
+        with self.hub.store.lock:
+            self.hub.store.conn.execute(
+                "UPDATE hosts SET last_seen=? WHERE name='h1'",
+                (time.time() - 1000,))
+        self.hub.store.seed_host("h2", {"heavy": 1, "light": 2}, [])
+        self.hub.store.heartbeat("h2", "w2", [])
+        claimed = self.hub.store.claim("h2", "w2")
+        self.assertEqual(claimed["id"], job["id"])
+        return claimed
+
+    def test_wildcard_profile_is_re_resolved_for_the_executing_host(self):
+        # 执行器只用 hub 下发的 profile_data；hub 在领取时按实际主机重新解析
+        # env/env_files/setup/artifacts，通配 profile 在这一步也必须生效。
+        # slot/locks/timeout 在提交时按组内首成员定死，这里不断言它们。
+        self.hub.config.raw["groups"] = {"linux": ["h1", "h2"]}
+        self.hub.config.raw["hosts"]["h2"] = {"slots": {"heavy": 1, "light": 2}}
+        for host, lock in (("h1", "box@{host}"), ("h2", "gpu@{host}")):
+            self._wildcard_profile(f"any@{host}.json", {
+                "name": f"*@{host}", "slot": "light", "locks": [lock],
+                "env": {"WHERE": host}, "env_files": [f"/etc/{host}.sh"],
+                "setup": [f"echo {host}"]})
+        job = self.hub.create_job({"project": "wild", "host": "linux",
+                                   "cmd": ["true"]})
+        self.assertEqual(job["profile"], "*@h1")
+        payload = self.hub._exec_payload(self._claim_on_h2(job))
+        data = payload["profile_data"]
+        self.assertEqual(data["name"], "*@h2")
+        self.assertEqual(data["env"], {"WHERE": "h2"})
+        self.assertEqual(data["env_files"], ["/etc/h2.sh"])
+        self.assertEqual(data["setup"], ["echo h2"])
+
+    def test_host_wildcard_is_not_carried_over_to_another_host(self):
+        # *@h1 只管 h1：组任务落到没有任何 profile 的 h2 时，不能把 h1 的
+        # env_files（只在 h1 上存在）套过去，否则任务会以 97 失败。
+        self.hub.config.raw["groups"] = {"linux": ["h1", "h2"]}
+        self.hub.config.raw["hosts"]["h2"] = {"slots": {"heavy": 1, "light": 2}}
+        self._wildcard_profile("any@h1.json", {
+            "name": "*@h1", "slot": "light",
+            "env": {"WHERE": "h1"}, "env_files": ["/etc/h1.sh"]})
+        job = self.hub.create_job({"project": "wild", "host": "linux",
+                                   "cmd": ["true"]})
+        self.assertEqual(job["profile"], "*@h1")
+        payload = self.hub._exec_payload(self._claim_on_h2(job))
+        self.assertEqual(payload["profile_data"], {})
+
+    def test_profile_named_for_another_project_is_still_rejected(self):
+        # 归属校验只放行通配：name 指向本项目、project 却是别的项目仍然 400。
+        self._wildcard_profile("mixup@h1.json", {
+            "name": "mixup@h1", "project": "someone-else", "host": "h1"})
+        with self.assertRaises(ValueError) as ctx:
+            self.hub.create_job({"project": "mixup", "host": "h1",
+                                 "cmd": ["true"]})
+        self.assertIn("does not belong", str(ctx.exception))
+
     # ------------------------------------------------------------ A/B 规则
     def _rule_profile(self, name: str, data: dict) -> None:
         (self.root / "profiles" / f"{name}@h1.json").write_text(

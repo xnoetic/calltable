@@ -96,6 +96,16 @@ class EstimateTests(unittest.TestCase):
         self.assertIsNone(self.store.duration_estimate(other_profile))
         self.assertIsNone(self.store.duration_estimate(other_slot))
 
+    def test_shared_wildcard_profile_is_sampled_per_project(self):
+        # *@h1 / *@* 被多个项目共用：样本仍按项目分开，否则 A 的快任务和
+        # B 的慢任务会混进同一个中位数。
+        self._history([10, 10, 10], project="fast", profile="*@h1")
+        self._history([500, 500, 500], project="slow", profile="*@h1")
+        fast = self.store.duration_estimate(self._job(project="fast", profile="*@h1"))
+        slow = self.store.duration_estimate(self._job(project="slow", profile="*@h1"))
+        self.assertEqual((fast["seconds"], fast["samples"]), (10, 3))
+        self.assertEqual((slow["seconds"], slow["samples"]), (500, 3))
+
     def test_projects_without_profiles_fall_back_to_project_and_slot(self):
         self._history([12, 12, 12], profile="")
         no_profile = self._job(profile="")
