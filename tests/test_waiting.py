@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import http.client
+import io
 import json
+import socket
 import tempfile
 import threading
 import time
@@ -13,6 +17,8 @@ from pathlib import Path
 from unittest import mock
 
 from calltable import cli
+from calltable import hub as hub_module
+from calltable.client import HubClient, HubError
 from calltable.db import Store
 from calltable.hub import Hub, HubServer
 from tests.helpers import make_config
@@ -409,6 +415,385 @@ class CliWaitFallbackTests(unittest.TestCase):
         self.assertEqual(code, cli.EXIT_WAIT_TIMEOUT)
         self.assertEqual(code, 75)
         self.assertLess(time.time() - started, 5)
+
+
+class ClientErrorTests(unittest.TestCase):
+    """读响应阶段的中断（socket 超时、对端不回就断开）统一成 status=None 的 HubError。"""
+
+    def _client(self) -> HubClient:
+        return HubClient("http://127.0.0.1:1", "t", timeout=5)
+
+    def test_socket_timeout_is_a_hub_error(self):
+        client = self._client()
+        with mock.patch.object(client, "_open",
+                               side_effect=socket.timeout("timed out")):
+            with self.assertRaises(HubError) as ctx:
+                client.request("GET", "/api/jobs/job-1", params={"wait": 60})
+        self.assertIsNone(ctx.exception.status)
+        # socket.timeout 就是 TimeoutError：消息里带类型名和原始说明。
+        self.assertIn("TimeoutError", str(ctx.exception))
+        self.assertIn("timed out", str(ctx.exception))
+
+    def test_remote_disconnect_is_a_hub_error(self):
+        client = self._client()
+        with mock.patch.object(
+                client, "_open",
+                side_effect=http.client.RemoteDisconnected("closed")):
+            with self.assertRaises(HubError) as ctx:
+                client.request("GET", "/api/jobs/job-1")
+        self.assertIsNone(ctx.exception.status)
+
+    def test_long_poll_socket_timeout_leaves_room_for_the_hub(self):
+        # WAIT_CHUNK 与 HubClient 的默认 timeout 都是 60s：不发明确超时的话，
+        # 服务端整块等满的那一刻客户端正好抢跑。
+        class Recorder:
+            timeout = 60
+
+            def __init__(self):
+                self.calls = []
+
+            def request(self, method, path, params=None, **kw):
+                self.calls.append((dict(params or {}), kw.get("timeout")))
+                return {"id": "job-1", "status": "queued"}, {}
+
+        client = Recorder()
+        cli._wait_call(client, "job-1", "done", chunk=cli.WAIT_CHUNK)
+        params, timeout = client.calls[0]
+        self.assertEqual(params["wait"], cli.WAIT_CHUNK)
+        self.assertGreaterEqual(timeout, cli.WAIT_CHUNK + cli.WAIT_SOCKET_MARGIN)
+        # 普通查询（chunk=0）不带 wait，也不强行拉长超时
+        cli._wait_call(client, "job-1", "done", chunk=0)
+        self.assertEqual(client.calls[1][0], {})
+        self.assertIsNone(client.calls[1][1])
+
+    def test_a_failing_log_fetch_does_not_end_the_wait(self):
+        class FlakyLogs:
+            def request(self, method, path, params=None, **kw):
+                if path.endswith("/logs"):
+                    raise HubError(f"{method} {path} -> RemoteDisconnected")
+                return ({"id": "job-1", "status": "succeeded", "exit_code": 0,
+                         "started": 1.0, "finished": 2.0, "host": "h1",
+                         "slot": "light"},
+                        {"X-Calltable-Wait-Result": "done"})
+
+            def post_json(self, path, body, **kw):
+                return {}
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            code = cli._follow(FlakyLogs(), "job-1", timeout=10, until="done",
+                               chunk=1, stream_logs=True)
+        self.assertEqual(code, 0)
+
+
+class CliWaitRetryTests(unittest.TestCase):
+    """_follow 遇到 hub 瞬时错误：截止前退避重试、照常心跳，截止时仍出错才返回 1。"""
+
+    class FlakyClient:
+        def __init__(self, error: HubError):
+            self.error = error
+            self.waits = 0
+            self.plain = 0
+            self.beats = 0
+
+        def request(self, method, path, params=None, **kw):
+            if "wait" not in (params or {}):  # 探测请求 / 名额满后的普通查询
+                self.plain += 1
+                return {"id": "job-1", "status": "queued", "started": None,
+                        "hold_seconds": 3, "host": "h1", "slot": "light"}, {}
+            self.waits += 1
+            raise self.error
+
+        def post_json(self, path, body, **kw):
+            self.beats += 1
+            return {"ok": True}
+
+    def _follow(self, client, timeout):
+        started = time.time()
+        with mock.patch.object(cli, "WAIT_RETRY_BASE", 0.05), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cli._follow(client, "job-1", timeout=timeout, until="done",
+                               chunk=60, stream_logs=False)
+        return code, time.time() - started
+
+    def test_transient_errors_retry_until_the_deadline_then_exit_1(self):
+        for error in (HubError("GET /api/jobs/job-1 -> RemoteDisconnected"),
+                      HubError("GET /api/jobs/job-1 -> HTTP 502", status=502)):
+            with self.subTest(status=error.status):
+                client = self.FlakyClient(error)
+                code, elapsed = self._follow(client, timeout=2.2)
+                # hub 一直出错到截止时间才返回 1（README/spec 的退出码契约）。
+                self.assertEqual(code, 1)
+                self.assertGreaterEqual(elapsed, 2.0)
+                self.assertGreater(client.waits, 2)
+                # hold=3s → 心跳间隔 1s：重试期间也要继续心跳。
+                self.assertGreaterEqual(client.beats, 2)
+
+    def test_old_hub_503_keeps_heartbeating_and_checks_state(self):
+        client = self.FlakyClient(
+            HubError("GET /api/jobs/job-1 -> HTTP 503", status=503))
+        code, _ = self._follow(client, timeout=2.2)
+        # 名额满不是 hub 错误：截止时按本地超时返回 75。
+        self.assertEqual(code, cli.EXIT_WAIT_TIMEOUT)
+        self.assertGreaterEqual(client.beats, 2)
+        # 503 的轮次改用不带 wait 的查询检查终态（第一次是探测请求）。
+        self.assertGreater(client.plain, 1)
+
+    def test_ct_wait_started_during_a_hub_restart_keeps_waiting(self):
+        class Restarting:
+            def __init__(self):
+                self.calls = 0
+
+            def get_json(self, path, params=None, **kw):
+                raise HubError(f"GET {path} -> ConnectionRefusedError")
+
+            def request(self, method, path, params=None, **kw):
+                if path.endswith("/logs"):
+                    return b"", {}
+                self.calls += 1
+                if self.calls < 3:  # 探测请求和第一次长轮询时 hub 还没起来
+                    raise HubError(f"GET {path} -> ConnectionRefusedError")
+                return ({"id": "job-1", "status": "succeeded", "exit_code": 0,
+                         "started": 1.0, "finished": 2.0, "host": "h1",
+                         "slot": "light"},
+                        {"X-Calltable-Wait-Result": "done"})
+
+            def post_json(self, path, body, **kw):
+                return {}
+
+        client = Restarting()
+        args = mock.Mock(id="job-1", until="done", timeout="10s")
+        with mock.patch.object(cli, "_client", return_value=client), \
+                mock.patch.object(cli, "WAIT_RETRY_BASE", 0.05), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cli.cmd_wait(None, args)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.calls, 3)
+
+
+class FakeClock:
+    """虚拟时钟：sleep 和长轮询只推进读数，测试不用真的等。"""
+
+    def __init__(self, start: float = 1_000_000.0):
+        self.now = start
+
+    def time(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, float(seconds))
+
+
+class CliWaitScheduleTests(unittest.TestCase):
+    """心跳节奏与截止时间：用虚拟时钟跑完整个等待。"""
+
+    class QueuedForever:
+        """任务一直排队；长轮询等满 wait 才回包（推进虚拟时钟）。"""
+
+        def __init__(self, clock: FakeClock, hold: int, fail_first: int = 0,
+                     timeout: int = 3600):
+            self.clock, self.hold, self.timeout = clock, hold, timeout
+            self.fail_first = fail_first
+            self.calls = 0
+            self.beats: list[float] = []
+
+        def get_json(self, path, params=None, **kw):
+            return self.request("GET", path, params=params, **kw)[0]
+
+        def request(self, method, path, params=None, **kw):
+            self.calls += 1
+            if self.calls <= self.fail_first:
+                raise HubError(f"{method} {path} -> ConnectionRefusedError")
+            if path.endswith("/logs"):
+                return b"", {}
+            wait = (params or {}).get("wait")
+            if wait:
+                self.clock.sleep(wait)
+            job = {"id": "job-1", "status": "queued", "started": None,
+                   "hold_seconds": self.hold, "ahead": 0, "host": "h1",
+                   "slot": "light", "timeout": self.timeout}
+            return job, ({"X-Calltable-Wait-Result": "timeout"} if wait else {})
+
+        def post_json(self, path, body, **kw):
+            self.beats.append(self.clock.time())
+            return {"ok": True}
+
+    class Unreachable:
+        """hub 从来连不上（URL 配错、DNS 解析失败等，都是 status=None）。"""
+
+        def __init__(self):
+            self.calls = 0
+
+        def get_json(self, path, params=None, **kw):
+            return self.request("GET", path, params=params, **kw)[0]
+
+        def request(self, method, path, params=None, **kw):
+            self.calls += 1
+            raise HubError(f"{method} {path} -> [Errno 8] nodename nor "
+                           "servname provided, or not known")
+
+        def post_json(self, path, body, **kw):
+            raise HubError(f"POST {path} -> [Errno 8] nodename nor servname")
+
+    def _quiet(self, clock: FakeClock):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(cli, "time", clock))
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+        return stack
+
+    @staticmethod
+    def _gaps(beats: list[float]) -> list[float]:
+        return [b - a for a, b in zip(beats, beats[1:])]
+
+    def test_heartbeats_keep_a_third_of_the_hold_between_them(self):
+        # hold/3 不是整数时，长轮询 int(hold/3) 会比心跳到期早一点结束；
+        # 不能因此隔一轮才心跳（实际间隔 2×hold/3）。
+        clock = FakeClock()
+        client = self.QueuedForever(clock, hold=10)
+        with self._quiet(clock):
+            code = cli._follow(client, "job-1", timeout=60, until="done",
+                               chunk=cli.WAIT_CHUNK, stream_logs=False)
+        self.assertEqual(code, cli.EXIT_WAIT_TIMEOUT)
+        self.assertLessEqual(max(self._gaps(client.beats)), 10 / 3 + 0.01)
+        self.assertGreaterEqual(len(client.beats), 15)
+
+    def test_short_chunks_do_not_heartbeat_every_round(self):
+        # `ct run --wait` 用 5s 的块；默认 hold 180s 时心跳仍约每 60s 一次。
+        clock = FakeClock()
+        client = self.QueuedForever(clock, hold=180)
+        with self._quiet(clock):
+            cli._follow(client, "job-1", timeout=600, until="done",
+                        chunk=cli.RUN_WAIT_CHUNK, stream_logs=False)
+        gaps = self._gaps(client.beats)
+        self.assertLessEqual(max(gaps), 60 + 0.01)
+        self.assertGreaterEqual(min(gaps), 50)
+
+    def test_default_deadline_follows_the_job_timeout_after_a_failed_lookup(self):
+        # ct wait 的首次查询赶上 hub 重启：截止时间不能固定成 3600+300，
+        # 拿到任务后要按任务自己的 timeout + 5 分钟算。
+        clock = FakeClock()
+        client = self.QueuedForever(clock, hold=0, fail_first=1,
+                                    timeout=7200)
+        args = mock.Mock(id="job-1", until="done", timeout=None)
+        started = clock.time()
+        with self._quiet(clock), \
+                mock.patch.object(cli, "_client", return_value=client):
+            code = cli.cmd_wait(None, args)
+        elapsed = clock.time() - started
+        self.assertEqual(code, cli.EXIT_WAIT_TIMEOUT)
+        self.assertGreaterEqual(elapsed, 7200 + 300 - 1)
+        self.assertLess(elapsed, 7200 + 300 + cli.WAIT_CHUNK + 1)
+
+    def test_a_long_outage_does_not_overflow_the_backoff(self):
+        # 连续失败上千次时，2 ** (failures - 1) 会在 min() 之前就溢出成
+        # OverflowError（长停机 + 很短的 sleep 很容易跑过这个点）：
+        # 必须先给指数封顶。
+        clock = FakeClock()
+        client = self.Unreachable()
+        job = {"id": "job-1", "status": "queued", "hold_seconds": 0,
+               "timeout": 86400}
+        with self._quiet(clock):
+            code = cli._follow(client, "job-1", timeout=None, until="done",
+                               chunk=cli.WAIT_CHUNK, stream_logs=False,
+                               job=job)
+        self.assertEqual(code, 1)
+        self.assertGreater(client.calls, 1200)  # 确实跑过了指数溢出点
+
+    def test_a_hub_that_never_answers_ends_the_wait_with_1_in_minutes(self):
+        # 修复前：首次查询失败立即返回 1。不能变成默默阻塞 65 分钟。
+        clock = FakeClock()
+        client = self.Unreachable()
+        args = mock.Mock(id="job-1", until="done", timeout=None)
+        started = clock.time()
+        with self._quiet(clock), \
+                mock.patch.object(cli, "_client", return_value=client):
+            code = cli.cmd_wait(None, args)
+        elapsed = clock.time() - started
+        self.assertEqual(code, 1)
+        self.assertGreater(client.calls, 3)  # 期间确实在重试
+        self.assertLessEqual(elapsed, 10 * 60)
+
+
+class WaitResilienceTests(unittest.TestCase):
+    """真实 hub + 真实 HubClient：断连和 5xx 都不会结束 ct wait。"""
+
+    def _start_hub(self, **overrides) -> Hub:
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.config = make_config(root, hosts={"h1": {"slots": {"light": 1}}},
+                                  **overrides)
+        hub = Hub(self.config)
+        self.addCleanup(hub.store.close)
+        self.addCleanup(hub.close)
+        hub.store.heartbeat("h1", "seed", [])
+        server = HubServer(("127.0.0.1", 0), hub_module.Handler)
+        server.hub = hub
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.hub = hub
+        self.url = f"http://127.0.0.1:{server.server_address[1]}"
+        return hub
+
+    def test_wait_survives_a_dropped_connection_and_5xx(self):
+        hub = self._start_hub(max_wait_seconds=2)
+        job = hub.store.create_job(project="demo", host="h1", slot="light",
+                                   locks=[], cmd=["true"])
+        hub.store.claim("h1", "w1")
+        hub.store.append_log(job["id"], b"hello from the job\n")
+        real = hub_module.Handler._job_detail
+        calls = {"wait": 0}
+        lock = threading.Lock()
+
+        def flaky(handler, job_id):
+            if not (handler.query.get("wait") or [""])[0]:
+                return real(handler, job_id)
+            with lock:
+                calls["wait"] += 1
+                n = calls["wait"]
+            if n == 1:
+                # hub 进程在长轮询中途退出：不回任何响应就断开连接。
+                handler.close_connection = True
+                return None
+            if n == 2:
+                # 重启中的反向代理：5xx；期间任务结束。
+                hub.store.finish(job["id"], status="failed", exit_code=5)
+                return handler._error(502, "bad gateway")
+            return real(handler, job_id)
+
+        client = HubClient(self.url, self.config.token_value, timeout=10)
+        with mock.patch.object(hub_module.Handler, "_job_detail", flaky), \
+                mock.patch.object(cli, "WAIT_RETRY_BASE", 0.05):
+            # 先确认断连确实被包装成 status=None 的 HubError。
+            with self.assertRaises(HubError) as ctx:
+                client.request("GET", f"/api/jobs/{job['id']}",
+                               params={"wait": 1})
+            self.assertIsNone(ctx.exception.status)
+            with lock:
+                calls["wait"] = 0
+            result: dict = {}
+            err = io.StringIO()
+
+            def run():
+                try:
+                    result["code"] = cli._follow(client, job["id"],
+                                                 timeout=10, until="done",
+                                                 chunk=2, stream_logs=True)
+                except BaseException as exc:  # 记录下来，由主线程断言
+                    result["exc"] = exc
+
+            with contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                thread = threading.Thread(target=run, daemon=True)
+                thread.start()
+                thread.join(timeout=20)
+        self.assertFalse(thread.is_alive(), "ct wait hung")
+        self.assertNotIn("exc", result, err.getvalue())
+        self.assertEqual(result.get("code"), 5, err.getvalue())
+        self.assertGreaterEqual(calls["wait"], 3)
 
 
 if __name__ == "__main__":
