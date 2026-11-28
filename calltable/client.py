@@ -97,9 +97,13 @@ class HubClient:
                     on_progress=None):
         """流式上传（I7）：用 http.client 的 send(fileobj) 分块发送，不进内存。"""
         size = os.path.getsize(file_path)
-        parsed = urllib.parse.urlparse(self.base + path)
+        parsed = urllib.parse.urlsplit(self.base + path)
+        if parsed.scheme not in ("http", "https"):
+            raise HubError(f"Unsupported hub URL scheme: {parsed.scheme!r}")
         timeout = max(self.timeout, 600)
         target = parsed.path or "/"
+        if parsed.query:
+            target += "?" + parsed.query
         if self.proxy:
             # 与 _open 一样走 hub 专用代理（Cloud Run 里只有它能到 hub）：
             # http 发绝对 URI 给代理转发；https 先 CONNECT 建隧道。
@@ -114,8 +118,10 @@ class HubClient:
                 conn = http.client.HTTPConnection(proxy.hostname,
                                                   proxy.port or 80,
                                                   timeout=timeout)
-                target = urllib.parse.urlunparse(
-                    (parsed.scheme or "http", parsed.netloc, target, "", "", ""))
+                target = parsed._replace(path=parsed.path or "/", fragment="").geturl()
+        elif parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443,
+                                               timeout=timeout)
         else:
             conn = http.client.HTTPConnection(parsed.hostname,
                                               parsed.port or 80,
