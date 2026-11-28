@@ -80,8 +80,12 @@ green result actually validated. calltable turns those into deterministic facts:
   code, and artifacts collected by glob with sha256 recorded.
 * **What if things crash.** Executors heartbeat an instance id and the jobs they
   hold; the hub reaps jobs whose executor restarted, disappeared from heartbeats,
-  or whose host went silent for 15 minutes. Terminal-state uploads retry with
-  exponential backoff and are replayed from local pending files.
+  or whose host went silent for 15 minutes. A finished job's result is written
+  atomically to a local pending file before it is reported, so an executor crash
+  cannot lose it; undelivered results are replayed before every heartbeat, and a
+  restarted executor holds its first heartbeat (at most 5 minutes) until the
+  previous instance's results are delivered — otherwise that heartbeat would reap
+  those jobs as `worker changed`.
 * **Cancellation.** The whole process tree is killed (systemd scope / process
   group on Linux, Job Object + `taskkill /T /F` on Windows).
 

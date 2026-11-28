@@ -184,10 +184,10 @@ class AttachClient(FakeClient):
         super().__init__()
         self.attach_job = job
 
-    def post_json(self, path, body=None):
+    def post_json(self, path, body=None, **kw):
         if path.endswith("/attach"):
             return self.attach_job
-        return super().post_json(path, body)
+        return super().post_json(path, body, **kw)
 
 
 class ExecutorCancelRaceTests(unittest.TestCase):
