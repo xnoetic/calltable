@@ -1,7 +1,9 @@
 """项目 profile：环境、槽位、锁、规则、产物 glob。
 
 文件位于 ``profiles/<project>@<host>.json``，也支持 ``<project>@*.json``
-（任意主机）与 ``*@<host>.json``（该主机任意项目）。字段见 README。
+（任意主机）、``*@<host>.json``（该主机任意项目）与 ``*@*.json``；只取最具体
+的一个：``project@host > project@* > *@host > *@*``。Windows 文件名不能含
+``*``，通配写在 JSON 的 ``name`` 字段里（文件名随意）。字段见 README。
 
 ``rules`` 按命令类型给默认值：每条规则的 ``match`` 是正则，匹配用
 ``shlex.join`` 拼好的命令；按顺序取第一条命中的规则，一条都不命中时
@@ -197,10 +199,14 @@ def resolve_host(project: str, host: str | None = None,
     * 只有一个 profile 匹配该项目时用它；
     * ``--platform`` 时按主机名里是否含该平台关键字过滤（``runner-a-linux`` 这类）；
     * 其余情况要求显式 ``--host``，不做任何项目专属映射。
+
+    ``project@*`` 适用于任意主机，给不出具体主机名，不参与推断；
+    ``*@host`` / ``*@*`` 不属于某个项目，同样不算。
     """
     if host:
         return host
     candidates = []
+    wildcard = ""
     seen = set()
     for profile in (profiles or {}).values():
         if profile.project != project or profile.unsupported:
@@ -208,8 +214,13 @@ def resolve_host(project: str, host: str | None = None,
         if profile.key in seen:
             continue
         seen.add(profile.key)
+        if "*" in profile.host:
+            wildcard = profile.key
+            continue
         candidates.append(profile.host)
     hosts = list(dict.fromkeys(candidates))
+    # 只剩 project@* 时报错里点名它，免得用户以为 profile 没被读到。
+    hint = f"; {wildcard} matches any host" if wildcard else ""
     if platform:
         platform = platform.lower()
         matched = [name for name in hosts if platform in name.lower()]
@@ -217,14 +228,17 @@ def resolve_host(project: str, host: str | None = None,
             return matched[0]
         if not matched:
             raise ValueError(
-                f"no host for project {project!r} on platform {platform!r}; "
-                f"pass --host (profiles: {', '.join(hosts) or 'none'})")
+                f"no host for project {project!r} on platform {platform!r}"
+                f"{hint}; pass --host (profiles: {', '.join(hosts) or 'none'})")
         raise ValueError(
             f"several hosts for project {project!r} on platform {platform!r}: "
             f"{', '.join(matched)}; pass --host")
     if len(hosts) == 1:
         return hosts[0]
     if not hosts:
+        if wildcard:
+            raise ValueError(f"cannot infer a host for project {project!r}"
+                             f"{hint}; pass --host")
         raise ValueError(f"cannot infer a host for project {project!r}; "
                          "pass --host or add a profile")
     raise ValueError(
@@ -233,6 +247,7 @@ def resolve_host(project: str, host: str | None = None,
 
 def find_profile(profiles: dict[str, Profile], project: str,
                  host: str) -> Profile | None:
+    """按 ``project@host > project@* > *@host > *@*`` 取第一个存在的。"""
     for key in (f"{project}@{host}", f"{project}@*", f"*@{host}", f"*@*"):
         if key in profiles:
             return profiles[key]

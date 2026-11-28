@@ -5,7 +5,8 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from calltable.profiles import Rule, load_profiles, match_rule, resolve_job, resolve_host
+from calltable.profiles import (Profile, Rule, find_profile, load_profiles, match_rule,
+                                resolve_host, resolve_job)
 
 REPO = Path(__file__).resolve().parents[1]
 PROFILES = load_profiles(REPO / "profiles" / "examples")
@@ -165,6 +166,64 @@ class RuleParsingTests(unittest.TestCase):
         self.assertEqual(resolve_host("pytest", profiles=PROFILES), "runner-a")
         with self.assertRaises(ValueError):
             resolve_host("unknown-project", profiles=PROFILES)
+
+
+class WildcardProfileTests(unittest.TestCase):
+    """通配 profile（H11）：``project@*`` / ``*@host`` / ``*@*``。"""
+
+    def _profiles(self, *names: str) -> dict[str, Profile]:
+        # 与 load_profiles 读到的形状一致；`*` 不能出现在 Windows 文件名里，
+        # 这里直接构造（磁盘上的写法见 README：通配写在 name 字段里）。
+        profiles: dict[str, Profile] = {}
+        for name in names:
+            profile = Profile.from_dict({"name": name}, name)
+            profiles[profile.key] = profile
+        return profiles
+
+    def test_wildcard_name_field_sets_project_and_host(self):
+        profile = Profile.from_dict({"name": "*@runner-a"}, "any@runner-a")
+        self.assertEqual((profile.project, profile.host), ("*", "runner-a"))
+        profile = Profile.from_dict({"name": "*@*"}, "any@any")
+        self.assertEqual((profile.project, profile.host), ("*", "*"))
+
+    def test_lookup_priority(self):
+        profiles = self._profiles("p@h1", "p@*", "*@h2", "*@*")
+        self.assertEqual(find_profile(profiles, "p", "h1").name, "p@h1")
+        self.assertEqual(find_profile(profiles, "p", "h2").name, "p@*")
+        self.assertEqual(find_profile(profiles, "q", "h2").name, "*@h2")
+        self.assertEqual(find_profile(profiles, "q", "h9").name, "*@*")
+
+    def test_project_wildcard_alone_does_not_infer_a_literal_star(self):
+        profiles = self._profiles("p@*")
+        with self.assertRaises(ValueError) as ctx:
+            resolve_host("p", profiles=profiles)
+        message = str(ctx.exception)
+        self.assertIn("pass --host", message)
+        self.assertIn("p@*", message)
+        self.assertEqual(resolve_host("p", host="h1", profiles=profiles), "h1")
+
+    def test_project_wildcard_next_to_a_host_profile_infers_that_host(self):
+        profiles = self._profiles("p@h1", "p@*")
+        self.assertEqual(resolve_host("p", profiles=profiles), "h1")
+
+    def test_host_wildcards_are_not_candidates_for_inference(self):
+        # *@host 不属于任何具体项目，推断时不算；只有它时仍要求 --host。
+        profiles = self._profiles("*@h1", "*@*")
+        with self.assertRaises(ValueError) as ctx:
+            resolve_host("p", profiles=profiles)
+        self.assertIn("pass --host", str(ctx.exception))
+        self.assertNotIn("'*'", str(ctx.exception))
+
+    def test_platform_match_ignores_wildcard_hosts(self):
+        profiles = self._profiles("p@runner-a-linux", "p@*")
+        self.assertEqual(resolve_host("p", platform="linux", profiles=profiles),
+                         "runner-a-linux")
+        only_wildcard = self._profiles("p@*")
+        with self.assertRaises(ValueError) as ctx:
+            resolve_host("p", platform="linux", profiles=only_wildcard)
+        message = str(ctx.exception)
+        self.assertIn("pass --host", message)
+        self.assertIn("p@*", message)
 
 
 if __name__ == "__main__":

@@ -358,7 +358,8 @@ class Hub:
         profile = find_profile(self.profiles, project, targets[0])
         if profile is not None and profile.unsupported:
             raise ValueError(f"profile {profile.key} is unsupported: {profile.note}")
-        if profile is not None and profile.project != project:
+        # *@host / *@* 是给任意项目的通配 profile，归属校验只放行它们。
+        if profile is not None and profile.project not in (project, "*"):
             raise ValueError("profile does not belong to this project")
         timeout_value = body.get("timeout")
         # 老客户端（没有 rules 逻辑）会把 profile 默认值当成「显式值」发上来，
@@ -706,6 +707,10 @@ class Hub:
         profile = find_profile(self.profiles, job["project"], job["host"])
         if profile is None and job.get("profile"):
             profile = self.profiles.get(job["profile"])
+            # *@<另一台主机> 只管那台主机（env_files 往往只在那里存在），
+            # 不能跟着组任务套到实际执行的主机上。
+            if profile is not None and profile.project == "*":
+                profile = None
         return profile
 
 

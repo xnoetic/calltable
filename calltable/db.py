@@ -772,7 +772,11 @@ class Store:
 
     # ------------------------------------------------------------ 预计时间
     def _estimate_key(self, job: dict) -> tuple[str, str, str]:
-        """(profile, project, slot)：同一 profile 优先，否则按项目。"""
+        """(profile, project, slot)：有 profile 时按 profile+项目，否则按项目。
+
+        ``*@host`` / ``*@*`` 会被多个项目共用，所以 profile 分支也要带上项目，
+        免得不同项目的耗时混进同一个中位数。
+        """
         return (str(job.get("profile") or ""), str(job.get("project") or ""),
                 str(job.get("slot") or ""))
 
@@ -791,9 +795,9 @@ class Store:
             if profile:
                 rows = self.conn.execute(
                     "SELECT started, finished FROM jobs WHERE status='succeeded' "
-                    "AND slot=? AND profile=? AND started IS NOT NULL "
+                    "AND slot=? AND profile=? AND project=? AND started IS NOT NULL "
                     "AND finished IS NOT NULL ORDER BY finished DESC, rowid DESC LIMIT ?",
-                    (slot, profile, self.estimate_window)).fetchall()
+                    (slot, profile, project, self.estimate_window)).fetchall()
             else:
                 rows = self.conn.execute(
                     "SELECT started, finished FROM jobs WHERE status='succeeded' "
