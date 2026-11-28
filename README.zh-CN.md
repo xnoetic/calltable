@@ -380,6 +380,8 @@ ct cloudrun status | bootstrap | image --project P | jobs --project P   (--apply
 
 `ct wait` 和 `ct run --wait` 用的是 hub 的长轮询（`GET /api/jobs/<id>?wait=<sec>&until=started|done`，服务端上限 60 秒），不是固定间隔的 `sleep` 循环。退出码：任务结束时返回任务自己的退出码；`--until started` 返回 `0`；`130` 表示已取消，`124` 表示任务超时，`75` 表示本地 `--timeout` 到期（任务可能还在跑），`1` 表示 hub 出错，`2` 表示用法错误或任务不存在。0.2 的 hub 会忽略 `wait`；客户端能检测到，并退回文档里约定的 2 秒轮询。
 
+没给 `--timeout` 时，`ct wait` 等到任务自己的 timeout 再加 5 分钟。hub 短暂故障不再结束等待：连接被断、socket 超时、`5xx` 或 hub 重启都按退避重试（0.5 秒起翻倍，封顶 15 秒）直到等待截止，期间照常发排队心跳（约每 `hold_seconds / 3`）。因此 `1` 表示：hub 给出了不可重试的回答（如 `401`）、截止时 hub 仍在出错，或者 5 分钟内一次都没答上来（URL 写错、DNS/TLS 不通）。客户端在读到过任务之前不发长轮询，所以 hub 重启期间开始的等待也能按时心跳。每次长轮询的 socket 超时是轮询时长加 15 秒，不会比 hub 抢跑。
+
 ### 叫号到手机：webhook (0.3)
 
 `--notify`（可重复）和 hub 级的 `webhook_urls` 会把 `job.started` 和 `job.finished` 投递到 HTTP 端点，按 [Standard Webhooks](https://www.standardwebhooks.com/) 签名（`webhook-id`、`webhook-timestamp`、`webhook-signature: v1,<base64 HMAC-SHA256>`）。密钥是 hub 的 `webhook_secret`（`whsec_...` 或原始文本）。投递在后台线程里进行，持久化在 SQLite 中，hub 重启也不会丢，失败按指数退避重试（默认 6 次，基数 2 秒，上限 300 秒）。`ct show <id>` 列出每个 URL 的 `pending`/`delivered`/`failed` 状态。示例：`integrations/verify_webhook.py`（最小的验签程序）和 `integrations/forward_to_im.py`（转发到 Slack/飞书）。
@@ -390,7 +392,7 @@ ct cloudrun status | bootstrap | image --project P | jobs --project P   (--apply
 
 ### 排队心跳 (0.3)
 
-`ct run --hold-while-alive` 要求号在排队期间持续收到心跳。`ct wait` 会自动发；agent 会话被丢下不管，心跳就停了，hub 会取消这个排队中的号（退出码 `-2`，原因写在 `error` 里），而不是让它像幽灵一样一直占着队。默认关闭；运行中的任务不会因为这个机制被回收。
+`ct run --hold-while-alive` 要求号在排队期间持续收到心跳。`ct wait` 会自动发；agent 会话被丢下不管，心跳就停了，hub 会取消这个排队中的号（退出码 `-2`，原因写在 `error` 里），而不是让它像幽灵一样一直占着队。hub 短暂不可用时客户端仍在重试，也就仍在发心跳，短暂的停机不会丢掉这个号。默认关闭；运行中的任务不会因为这个机制被回收。
 
 ## 给 AI agent 用
 

@@ -577,6 +577,18 @@ expired (the job may still be running), `1` hub error, `2` bad usage/unknown
 job. A 0.2 hub ignores `wait`; the client detects that and falls back to a
 documented 2 s poll.
 
+Without `--timeout`, `ct wait` waits until the job's own timeout plus 5
+minutes. Transient hub trouble does not end the wait: a dropped connection,
+socket timeout, `5xx` or a hub restart is retried with backoff (0.5 s doubling,
+capped at 15 s) until the wait deadline, and queue-hold heartbeats keep going
+meanwhile (about every `hold_seconds / 3`). `1` therefore means a
+non-retryable hub answer (e.g. `401`), a hub that was still failing when the
+deadline passed, or a hub that never answered once within 5 minutes (wrong
+URL, DNS or TLS failure). Until the client has read the job once it does not
+long-poll, so a wait started during a hub restart still heartbeats in time.
+The socket timeout of each long poll is the poll length plus 15 s, so it never
+expires before the hub answers.
+
 ### Calling your phone: webhooks (0.3)
 
 `--notify` (repeatable) and hub-level `webhook_urls` deliver `job.started` and
@@ -606,8 +618,9 @@ spec §8.
 `ct run --hold-while-alive` needs a heartbeat while the ticket is queued. `ct
 wait` sends them automatically; an abandoned agent session stops sending them
 and the hub cancels the queued ticket (exit code `-2`, reason in `error`)
-instead of leaving a ghost in line. Off by default; running jobs are never
-reaped by the hold.
+instead of leaving a ghost in line. Heartbeats continue while the client is
+retrying a hub that is down, so a short outage does not cost the ticket. Off by
+default; running jobs are never reaped by the hold.
 
 ## For AI agents
 

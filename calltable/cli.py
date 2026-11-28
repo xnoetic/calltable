@@ -30,6 +30,15 @@ EXIT_WAIT_TIMEOUT = 75
 WAIT_CHUNK = 60
 #: `ct run --wait` 要让日志尽快刷出来，用更小的块。
 RUN_WAIT_CHUNK = 5
+#: 长轮询请求的 socket 超时 = 本次 wait + 余量。服务端要等满 wait 才回包，
+#: socket 超时若不比它长，总是客户端先超时（WAIT_CHUNK 与默认 timeout 都是 60s）。
+WAIT_SOCKET_MARGIN = 15
+#: hub 瞬时错误（断连、超时、5xx、重启中）的退避：从 base 起翻倍，封顶 max。
+WAIT_RETRY_BASE = 0.5
+WAIT_RETRY_MAX = 15.0
+#: 一次都没联系上 hub（URL 配错、DNS/TLS 失败、长时间停机）时最多重试这么久；
+#: 联系上过之后按等待截止时间重试。
+WAIT_UNREACHED_MAX = 300
 
 #: 超过这个大小的 bundle 会在慢链路上传很久，先提示去 seed。
 SEED_WARN_BYTES = 20 * 1024 * 1024
@@ -424,7 +433,8 @@ def cmd_run(config: Config, args) -> int:
         return 0
 
     return _follow(client, job["id"], timeout=timeout + 120,
-                   until="done", chunk=RUN_WAIT_CHUNK, stream_logs=True)
+                   until="done", chunk=RUN_WAIT_CHUNK, stream_logs=True,
+                   job=job)
 
 
 def _print_sources(args, decl, host, host_source, profile, resolution,
@@ -550,55 +560,90 @@ def _cli_prefix(args) -> str:
     return prefix
 
 
-def _follow(client: HubClient, job_id: str, timeout: float,
+def _follow(client: HubClient, job_id: str, timeout: float | None,
             until: str = "done", chunk: float = WAIT_CHUNK,
-            stream_logs: bool = True) -> int:
-    """用长轮询等到条件满足；旧 hub 忽略 wait 时降级为 2s 轮询。"""
-    deadline = time.time() + timeout
+            stream_logs: bool = True, job: dict | None = None) -> int:
+    """用长轮询等到条件满足；旧 hub 忽略 wait 时降级为 2s 轮询。
+
+    hub 的瞬时错误（断连、超时、5xx、重启中）在截止时间内退避重试；每一轮
+    （含 503 与重试期间）都按 hold/3 的间隔发排队心跳。截止时 hub 仍在出错
+    返回 1，否则按本地超时返回 75；从没联系上 hub 时最多重试
+    WAIT_UNREACHED_MAX 秒。``timeout`` 为 None 时按任务自己的 timeout + 5 分钟。
+    ``job`` 是调用方已经拿到的任务；没有时先发一次普通查询拿 hold_seconds。
+    """
+    started = time.time()
+    deadline = started + (timeout if timeout is not None
+                          else _default_wait_timeout(job))
     offset = 0
     last_progress = None
-    # 先探一次任务，拿到 hold_seconds：长轮询块不能长于 hold/3，否则
-    # 客户端在阻塞期间无法心跳，会被 hub 当成弃号取消。
-    hold = 0
-    job0 = None
-    try:
-        job0, _ = client.request("GET", f"/api/jobs/{job_id}")
-        if job0:
-            hold = int(job0.get("hold_seconds") or 0)
-    except HubError:
-        pass
-    if hold:
-        chunk = min(chunk, max(1.0, hold / 3.0))
-        if (job0 or {}).get("status") == "queued":
-            try:
-                client.post_json(f"/api/jobs/{job_id}/heartbeat", {})
-            except HubError:
-                pass
+    # known：至少拿到过一次任务。还不知道 hold_seconds 时不能发整块长轮询：
+    # 长轮询块不能长于 hold/3，否则阻塞期间无法心跳，会被 hub 当成弃号取消。
+    known = bool(job)
+    hold = int((job or {}).get("hold_seconds") or 0)
+    status = (job or {}).get("status")
+    next_beat = 0.0
+    failures = 0
+    last_error: HubError | None = None
     while True:
-        remaining = deadline - time.time()
+        now_ts = time.time()
+        remaining = deadline - now_ts
+        if last_error is not None and (
+                remaining <= 0
+                or (not known and now_ts - started >= WAIT_UNREACHED_MAX)):
+            # hub 一直出错到截止时间，或者从来没连上（URL 配错、DNS/TLS 失败）。
+            print(f"\n[hub] {last_error}", file=sys.stderr)
+            return 1
         if remaining <= 0:
             print("\n[calltable] local wait timed out; job may still be running",
                   file=sys.stderr)
             return EXIT_WAIT_TIMEOUT
+        beat_every = max(1.0, hold / 3.0) if hold else 0.0
+        if not known:
+            step = 0.0  # 先用普通查询拿到 hold_seconds / status
+        else:
+            step = min(chunk, beat_every) if hold else chunk
+        # 下一次轮询结束前心跳就会到期时先发：长轮询按整秒截断，常比到期时刻
+        # 早一点结束，只看「已到期」会隔一轮才发，间隔变成 2×hold/3。
+        if hold and status in (None, "queued") and now_ts + step >= next_beat:
+            next_beat = now_ts + beat_every
+            try:
+                client.post_json(f"/api/jobs/{job_id}/heartbeat", {})
+            except HubError:
+                pass  # hub 暂时不可达：到点再发
         try:
-            job, headers = _wait_call(client, job_id, until,
-                                      min(chunk, remaining))
+            job, headers = _poll_job(client, job_id, until, min(step, remaining))
         except HubError as exc:
-            if exc.status == 503:  # 并发等待上限：稍后重试，不是错误
-                time.sleep(min(1.0, max(0.05, remaining)))
-                continue
-            print(f"\n[hub] {exc}", file=sys.stderr)
-            return 1
+            if exc.status is not None and exc.status < 500:
+                print(f"\n[hub] {exc}", file=sys.stderr)
+                return 1
+            # 断连、超时、5xx、hub 重启中：不退出，截止前退避重试。
+            failures += 1
+            last_error = exc
+            if failures == 1:
+                print(f"[hub] {exc}; retrying until the wait deadline",
+                      file=sys.stderr, flush=True)
+            # 指数先封顶：离线很久时 2 ** (failures - 1) 会在 min() 之前溢出。
+            delay = min(WAIT_RETRY_BASE * 2 ** min(failures - 1, 16),
+                        WAIT_RETRY_MAX)
+            if hold:
+                delay = min(delay, beat_every)
+            time.sleep(max(0.0, min(delay, deadline - time.time())))
+            continue
+        failures = 0
+        last_error = None
         if job is None:
             print(f"[hub] no such job: {job_id}", file=sys.stderr)
             return 2
+        if not known and timeout is None:
+            # 首次查询失败时的截止时间是按默认值估的：拿到任务后按它自己的
+            # timeout 重算。
+            deadline = started + _default_wait_timeout(job)
+        probed = not known
+        known = True
+        status = job.get("status")
+        hold = int(job.get("hold_seconds") or 0)
         result = headers.get("X-Calltable-Wait-Result")
-        if job.get("status") == "queued":
-            if job.get("hold_seconds"):
-                try:
-                    client.post_json(f"/api/jobs/{job_id}/heartbeat", {})
-                except HubError:
-                    pass
+        if status == "queued":
             progress = (job.get("ahead"), int(job.get("queued_seconds") or 0) // 60)
             if progress != last_progress:
                 last_progress = progress
@@ -614,26 +659,56 @@ def _follow(client: HubClient, job_id: str, timeout: float,
             if until == "started" and job.get("status") not in TERMINAL_STATUSES:
                 return 0
             return _exit_code(job)
+        if probed:
+            continue  # 普通查询只为拿 hold：马上开始长轮询
         if result is None:
-            # 0.2 hub 没有 X-Calltable-Wait-Result，说明 wait 被忽略：
-            # 按文档降级成 2s 轮询，避免空转。
-            time.sleep(min(2.0, max(0.2, remaining)))
+            # 0.2 hub 没有 X-Calltable-Wait-Result，说明 wait 被忽略（或旧 hub
+            # 名额满回 503 后改发的普通查询）：按文档降级成 2s 轮询，避免空转。
+            pause = 2.0
+            if hold:  # 停顿也不能长过心跳间隔
+                pause = min(pause, max(1.0, hold / 3.0))
+            time.sleep(min(pause, max(0.2, remaining)))
+
+
+def _default_wait_timeout(job: dict | None) -> float:
+    """没给 --timeout：等到任务自己的 timeout 再加 5 分钟（未知时按 1 小时）。"""
+    return float((job or {}).get("timeout") or 3600) + 300
+
+
+def _poll_job(client: HubClient, job_id: str, until: str,
+              chunk: float) -> tuple[dict | None, dict]:
+    """一轮查询。旧 hub 名额满回 503 时，改发一次不带 wait 的查询拿当前状态。"""
+    try:
+        return _wait_call(client, job_id, until, chunk)
+    except HubError as exc:
+        if exc.status != 503:
+            raise
+    return _wait_call(client, job_id, until, 0)
 
 
 def _wait_call(client: HubClient, job_id: str, until: str,
                chunk: float) -> tuple[dict | None, dict]:
-    params: dict = {"until": until}
+    """一次长轮询；chunk 为 0 时是普通查询（不带 wait/until）。"""
+    params: dict | None = None
+    socket_timeout = None
     if chunk and chunk > 0:
-        params["wait"] = max(1, int(chunk))
+        params = {"until": until, "wait": max(1, int(chunk))}
+        # socket 超时必须比本次长轮询长并留余量：服务端等满 wait 才回包。
+        socket_timeout = max(float(getattr(client, "timeout", 0) or 0),
+                             params["wait"] + WAIT_SOCKET_MARGIN)
     payload, headers = client.request("GET", f"/api/jobs/{job_id}",
-                                      params=params)
+                                      params=params, timeout=socket_timeout)
     return payload, headers
 
 
 def _fetch_logs(client: HubClient, job_id: str, offset: int) -> int:
-    payload, headers = client.request(
-        "GET", f"/api/jobs/{job_id}/logs", params={"offset": offset},
-        raw=True)
+    """增量拉日志；hub 暂时不可达时保留 offset，下一轮再补（不影响退出码）。"""
+    try:
+        payload, headers = client.request(
+            "GET", f"/api/jobs/{job_id}/logs", params={"offset": offset},
+            raw=True)
+    except HubError:
+        return offset
     if payload:
         sys.stdout.write(payload.decode("utf-8", "replace"))
         sys.stdout.flush()
@@ -797,22 +872,24 @@ def cmd_seed(config: Config, args) -> int:
 def cmd_wait(config: Config, args) -> int:
     """等一个任务：长轮询到 started/done，并以任务的退出码退出。"""
     client = _client(config, args)
+    job = None
     try:
         job = client.get_json(f"/api/jobs/{args.id}")
     except HubError as exc:
-        print(f"[hub] {exc}", file=sys.stderr)
-        return 2 if exc.status == 404 else 1
+        if exc.status is not None and exc.status < 500:
+            print(f"[hub] {exc}", file=sys.stderr)
+            return 2 if exc.status == 404 else 1
+        # hub 重启中 / 断连：不急着退出，交给 _follow 在截止前重试。
     until = getattr(args, "until", "done") or "done"
+    timeout = None  # 没给 --timeout：_follow 按任务自己的 timeout + 5 分钟
     if getattr(args, "timeout", None):
         try:
             timeout = float(parse_duration(args.timeout))
         except ValueError as exc:
             print(f"error: --timeout: {exc}", file=sys.stderr)
             return 2
-    else:
-        timeout = float(job.get("timeout") or 3600) + 300
     return _follow(client, args.id, timeout=timeout, until=until,
-                   chunk=WAIT_CHUNK, stream_logs=(until == "done"))
+                   chunk=WAIT_CHUNK, stream_logs=(until == "done"), job=job)
 
 
 def cmd_doctor(config: Config | None, args) -> int:
@@ -1090,7 +1167,9 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=("exit codes: the job's own code when done (0 = success), 0 for "
                 "--until started, 130 = cancelled, 124 = job timeout, "
                 "75 = local --timeout expired while the job may still run, "
-                "1 = hub/API error, 2 = unknown job or bad usage. "
+                "1 = hub/API error (transient errors such as a hub restart are "
+                "retried until --timeout; a hub that never answers gives up "
+                "after 5 minutes), 2 = unknown job or bad usage. "
                 "Uses the hub's long poll (no sleep loop); against a 0.2 hub it "
                 "falls back to a 2s poll."),
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1101,7 +1180,8 @@ def build_parser() -> argparse.ArgumentParser:
                            "terminal state (default: done)")
     wait.add_argument("--timeout", metavar="DURATION",
                       help="give up after this long (e.g. 30m); exits 75 "
-                           "while the job may still be running")
+                           "while the job may still be running (default: the "
+                           "job's timeout + 5m)")
     wait.set_defaults(func=cmd_wait)
 
     doctor = csub.add_parser("doctor", help="check this machine can use calltable")
@@ -1228,4 +1308,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.command_name == "run" and not args.command:
         print("missing command; usage: ct run ... -- <command...>", file=sys.stderr)
         return 2
-    return int(args.func(config, args) or 0)
+    try:
+        return int(args.func(config, args) or 0)
+    except HubError as exc:
+        # 兜底：命令里没单独处理的 hub 错误（含断连、超时）给一行说明并以 1
+        # 退出，不打 traceback。
+        print(f"[hub] {exc}", file=sys.stderr)
+        return 1

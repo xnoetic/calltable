@@ -84,6 +84,13 @@ class HubClient:
                            status=exc.code, payload=payload) from exc
         except urllib.error.URLError as exc:
             raise HubError(f"{method} {path} -> {exc.reason}") from exc
+        except (OSError, http.client.HTTPException) as exc:
+            # 读响应阶段的超时、断连（RemoteDisconnected / ConnectionReset）
+            # 不会被 urllib 包成 URLError：统一成 status=None 的 HubError，
+            # 调用方按瞬时错误处理，而不是带着 traceback 退出。
+            detail = str(exc) or "connection lost"
+            raise HubError(f"{method} {path} -> {type(exc).__name__}: "
+                           f"{detail}") from exc
 
     def get_json(self, path: str, params: dict | None = None, **kw):
         return self.request("GET", path, params=params, **kw)[0]

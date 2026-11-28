@@ -271,6 +271,22 @@ Rules for clients:
 4. SSE is optional for clients; agents should prefer `ct wait` because it is one
    blocking process, not a shell loop. SSE exists for dashboards and
    integrations.
+5. The socket timeout of a long poll is the requested `wait` plus a margin
+   (15 s, never below the client's default timeout), so the client never
+   gives up before the hub answers.
+6. Transient errors (connection refused/reset, the hub closing the connection
+   without a response, socket timeouts, `5xx`) are retried with exponential
+   backoff (0.5 s doubling, capped at 15 s and at `hold_seconds / 3` when a
+   queue hold is set) until the wait deadline. Every round, including retries
+   and slot-full answers, sends the queue-hold heartbeat when it would fall due
+   before that round ends, so heartbeats are at most `hold_seconds / 3` apart.
+   `4xx` answers are not retried and end the wait with exit code `1`.
+7. Until the client has read the job once (`hold_seconds`, `status`) it sends a
+   plain `GET` instead of a long poll, so a wait started while the hub is down
+   cannot block a whole chunk without heartbeats. If the hub never answers
+   once within 5 minutes (wrong URL, DNS/TLS failure, long outage) the wait
+   ends with exit code `1`. Without `--timeout` the deadline is the job's own
+   `timeout` plus 5 minutes, computed from the first successful read.
 
 Exit codes of `ct wait`:
 
@@ -281,7 +297,7 @@ Exit codes of `ct wait`:
 | job cancelled (before or after start) | `130` |
 | job timed out | `124` |
 | local `--timeout` expired first | `75` |
-| hub/API error | `1` |
+| hub/API error: a non-retryable answer, transient errors still failing at the deadline, or no answer at all within 5 minutes | `1` |
 | bad usage / unknown job | `2` |
 
 ## 6. Events and webhook payloads
@@ -425,10 +441,10 @@ makes ticket taking safe to retry.
 `--hold-timeout`). While the job is queued the hub cancels it when
 `now - COALESCE(last_hold, created) > hold_seconds`, recording
 `error = "queue hold expired: ..."`, exit code `-2`, and emitting
-`job.finished`. `ct wait` heartbeats automatically (at most every 60 s, which is
-below the default hold); a detached agent that never runs `ct wait` therefore
-does not block the queue forever. The feature is off by default and does not
-affect running jobs.
+`job.finished`. `ct wait` heartbeats automatically (about every
+`hold_seconds / 3`, also while it is retrying a failing hub); a detached agent
+that never runs `ct wait` therefore does not block the queue forever. The
+feature is off by default and does not affect running jobs.
 
 ### Provider hosts: `POST /api/exec/jobs/<id>/attach` (Cloud Run)
 
