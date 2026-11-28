@@ -239,6 +239,25 @@ ALREADY_ATTACHED = "attached"
 #: 已请求取消……）：调用方按原来的方式处理。
 NOT_REQUEUED = "not_requeued"
 
+#: :meth:`Store.finish_from_executor` 的判定结果，HTTP 层原样回给执行器。
+#: 写进去了。
+FINISH_RECORDED = "recorded"
+#: 写进去了，但按取消优先记成了 ``cancelled``。
+FINISH_CANCELLED = "cancel_precedence"
+#: 任务已是同一个终态：什么都没改（重试、pending 重放走这条）。
+FINISH_DUPLICATE = "duplicate"
+#: 任务已是别的终态：晚到的旧结果，拒绝覆盖。
+FINISH_CONFLICT = "conflict"
+#: 任务在另一台主机上（被放回队列、换了执行环境）：拒绝。
+FINISH_OTHER_OWNER = "other_owner"
+#: 任务现在不在 running（已回到队列）：拒绝。
+FINISH_NOT_RUNNING = "not_running"
+#: 任务不存在（正好被 janitor 清掉）：HTTP 层按 404 回。
+FINISH_UNKNOWN = "unknown"
+#: 请求本身不可能成功（body 不是对象、status 不是终态、exit_code 不是整数）：
+#: HTTP 层直接判的，不进 :meth:`Store.finish_from_executor`。
+FINISH_BAD_REQUEST = "bad_request"
+
 RUNNING = "running"
 QUEUED = "queued"
 TERMINAL = ("succeeded", "failed", "cancelled", "timeout", "error")
@@ -1231,8 +1250,12 @@ class Store:
     def finish(self, job_id: str, *, status: str, exit_code: int | None,
                error: str = "", cleanup_at: float | None = None,
                failure_cleanup_at: float | None = None) -> dict | None:
-        """写终态。``failure_cleanup_at``：最终状态不是 ``succeeded``（例如取消
-        优先改写成了 ``cancelled``）时改用这个清理时间。"""
+        """无条件写终态。``failure_cleanup_at``：最终状态不是 ``succeeded``
+        （例如取消优先改写成了 ``cancelled``）时改用这个清理时间。
+
+        这是内部原语（hub 自己的对账、测试）：执行器通过 HTTP 上报终态的入口是
+        :meth:`finish_from_executor`，那里先判定归属与幂等，不覆盖已交付的结果。
+        """
         with self.lock:
             self._finish_locked(job_id, status, exit_code, error, cleanup_at,
                                 failure_cleanup_at)
@@ -1254,6 +1277,81 @@ class Store:
                 return None
             self._finish_locked(job_id, status, exit_code, error, cleanup_at)
         return self.job(job_id)
+
+    def finish_from_executor(self, job_id: str, *, status: str,
+                             exit_code: int | None, error: str = "",
+                             host: str = "", worker: str = "",
+                             cleanup_at: float | None = None,
+                             failure_cleanup_at: float | None = None
+                             ) -> tuple[str, dict | None]:
+        """执行器上报终态：先判定归属与幂等，再决定写不写。
+
+        返回 ``(outcome, job)``，outcome 是 :data:`FINISH_RECORDED` 等常量。
+        判定与写入在同一把锁里（与 :meth:`finish_if_status` 同理）：晚到的
+        结果不能覆盖已经交付给 agent / webhook 的终态，也不能把被重新排队的
+        组任务改写完成。拒收一律不写：``status`` / ``exit_code`` /
+        ``error`` / ``finished`` / 清理时间都保持原样。
+
+        * 已是终态：一个字都不改。与本条上报（先按取消优先折算）结果相同是
+          :data:`FINISH_DUPLICATE`，不同是 :data:`FINISH_CONFLICT`。只比
+          status/exit_code：执行器可能给同一条终态补说明，那不是冲突。
+        * 不在 ``running``（provider 用 :meth:`requeue_unattached` 放回队列）：
+          :data:`FINISH_NOT_RUNNING`。
+        * ``host`` 给了且不等于任务现在的主机；或 ``worker`` 给了且不等于
+          记录的 claim worker（预留占位 ``pending:`` 不算，那时还没 attach）：
+          :data:`FINISH_OTHER_OWNER`。两个身份都是可选的。
+        * 其余照 :meth:`finish` 写终态（含取消优先），写成功返回
+          :data:`FINISH_RECORDED`，被改写成 ``cancelled`` 返回
+          :data:`FINISH_CANCELLED`。
+
+        身份字段是 0.3 客户端才发的：只有携带**原** claim worker 的客户端才
+        会被拦在归属检查上，老客户端（只发 status / exit_code / error）不做
+        归属判定，行为与 :meth:`finish` 一致——升级 hub 不能把还在跑旧版的
+        机群卡住。但老客户端只能得到幂等保护（不能覆盖已经终结的结果），
+        没有归属保护：重派之后它报的结果照样会落到新执行那一次的记录上。
+        执行器重启后由新实例替旧实例收尾时，要发旧实例的 worker（``.running``
+        里记下的那个），不能拿新实例的 id 冒充。
+        """
+        with self.lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self.conn.execute(
+                    "SELECT status, host, worker, exit_code, cancel_requested "
+                    "FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if row is None:
+                    self.conn.execute("COMMIT")
+                    return FINISH_UNKNOWN, None
+                current = row["status"]
+                if row["cancel_requested"]:
+                    # 库里的终态早就是按取消优先写的，比之前先折算，重放才算
+                    # 同一个结果。
+                    wanted, wanted_exit, _ = cancel_precedence(
+                        status, exit_code, error)
+                else:
+                    wanted, wanted_exit = status, exit_code
+                claimed = row["worker"] or ""
+                if current in TERMINAL:
+                    same = (current == wanted
+                            and row["exit_code"] == wanted_exit)
+                    outcome = FINISH_DUPLICATE if same else FINISH_CONFLICT
+                elif current != RUNNING:
+                    outcome = FINISH_NOT_RUNNING
+                elif host and row["host"] != host:
+                    outcome = FINISH_OTHER_OWNER
+                elif (worker and claimed and not claimed.startswith(
+                        PENDING_WORKER_PREFIX) and claimed != worker):
+                    outcome = FINISH_OTHER_OWNER
+                else:
+                    self._finish_locked(job_id, status, exit_code, error,
+                                        cleanup_at, failure_cleanup_at)
+                    outcome = (FINISH_CANCELLED
+                               if (wanted, wanted_exit) != (status, exit_code)
+                               else FINISH_RECORDED)
+                self.conn.execute("COMMIT")
+            except Exception:
+                self.conn.execute("ROLLBACK")
+                raise
+        return outcome, self.job(job_id)
 
     def _finish_locked(self, job_id: str, status: str, exit_code: int | None,
                        error: str = "", cleanup_at: float | None = None,

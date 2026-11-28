@@ -27,7 +27,9 @@ from pathlib import Path
 from . import RULES_CLIENT_VERSION, __version__, gitops
 from .config import Config
 from .dashboard import render_page
-from .db import QUEUED, TERMINAL, IdempotencyConflict, Store
+from .db import (FINISH_BAD_REQUEST, FINISH_CANCELLED, FINISH_NOT_RUNNING,
+                 FINISH_OTHER_OWNER, FINISH_RECORDED, FINISH_UNKNOWN, QUEUED,
+                 TERMINAL, IdempotencyConflict, Store)
 from .profiles import (Profile, find_profile, load_profiles, match_rule,
                        resolve_job)
 from .util import (MAX_ARTIFACT_PATTERNS, artifact_pattern_problem, iso,
@@ -1135,25 +1137,7 @@ class Handler(BaseHTTPRequestHandler):
 
             match = re.fullmatch(r"/api/exec/jobs/([^/]+)/finish", path)
             if match:
-                body = self._body_json()
-                status = body.get("status") or "error"
-                if status not in TERMINAL:
-                    return self._error(400, f"bad terminal status: {status}")
-                job = self.hub.store.job(match.group(1))
-                if not job:
-                    return self._error(404, "no such job")
-                # 已请求取消的任务一律记 cancelled（见 Store._finish_locked），
-                # 保留期按最终状态算：取消可能在上面读快照之后才到，所以把
-                # 失败保留期一并交给 store，在写终态的同一把锁里选。
-                retention = (self.hub.config.retention_success
-                             if status == "succeeded"
-                             else self.hub.config.retention_failure)
-                finished = self.hub.store.finish(
-                    job["id"], status=status, exit_code=body.get("exit_code"),
-                    error=str(body.get("error") or ""),
-                    cleanup_at=now() + retention,
-                    failure_cleanup_at=now() + self.hub.config.retention_failure)
-                return self._json(200, finished)
+                return self._finish_job(match.group(1))
 
             match = re.fullmatch(r"/api/jobs/([^/]+)/logs", path)
             if match:
@@ -1236,6 +1220,79 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(400, str(exc))
         except Exception as exc:  # pragma: no cover - 兜底
             return self._error(500, f"{type(exc).__name__}: {exc}")
+
+    # ---- 终态上报 ---------------------------------------------------
+    def _finish_job(self, job_id: str):
+        """``POST /api/exec/jobs/<id>/finish``：写终态，或说清楚为何没写。
+
+        判定见 :meth:`Store.finish_from_executor`。状态码就是执行器需要的信号
+        （见 spec “Who may write a terminal state”）：
+
+        * ``200``：记下了（``recorded`` / ``cancel_precedence``），或者任务本来
+          就是同一个终态（``duplicate``）；已经是不**同**的终态（``conflict``）
+          也是 200，body 里是库里原来的记录。body 永远带
+          ``finish_accepted`` 与 ``finish_reason``。
+        * ``409``：任务不归这个执行器（``other_owner``）或已经回到队列
+          （``not_running``）。
+        * ``400``：请求本身不可能成功（body 不是对象、status 不是终态、
+          exit_code 不是整数）。
+        * ``404``：任务不存在（正好被 janitor 清掉）。
+
+        400 / 404 / 409 都带 ``finish_rejected: true`` 和 ``finish_reason``，
+        执行器只凭这个标记清掉本地 pending 文件；普通路由的 404 没有这个
+        标记，不能被当成“这条结果没用了”。拒收不写任务。
+        """
+        try:
+            body = self._body_json()
+        except ValueError as exc:
+            return self._finish_rejection(400, FINISH_BAD_REQUEST, str(exc))
+        if not isinstance(body, dict):
+            return self._finish_rejection(
+                400, FINISH_BAD_REQUEST, "finish body must be a JSON object")
+        status = body.get("status") or "error"
+        if not isinstance(status, str) or status not in TERMINAL:
+            return self._finish_rejection(
+                400, FINISH_BAD_REQUEST, f"bad terminal status: {status!r}")
+        exit_code = body.get("exit_code")
+        # True/False 是 int 的子类：不拦住会把布尔存成退出码。
+        if isinstance(exit_code, bool) or not (exit_code is None
+                                               or isinstance(exit_code, int)):
+            return self._finish_rejection(
+                400, FINISH_BAD_REQUEST,
+                f"exit_code must be an integer or null: {exit_code!r}")
+        if not self.hub.store.job(job_id):
+            return self._finish_rejection(404, FINISH_UNKNOWN, "no such job")
+        # 已请求取消的任务一律记 cancelled（见 Store._finish_locked），保留期按
+        # 最终状态算：取消可能在上面读快照之后才到，所以把失败保留期一并交给
+        # store，在写终态的同一把锁里选。
+        retention = (self.hub.config.retention_success if status == "succeeded"
+                     else self.hub.config.retention_failure)
+        outcome, finished = self.hub.store.finish_from_executor(
+            job_id, status=status, exit_code=exit_code,
+            error=str(body.get("error") or ""),
+            host=str(body.get("host") or "").strip(),
+            worker=str(body.get("worker") or "").strip(),
+            cleanup_at=now() + retention,
+            failure_cleanup_at=now() + self.hub.config.retention_failure)
+        if outcome == FINISH_UNKNOWN or finished is None:
+            return self._finish_rejection(404, FINISH_UNKNOWN, "no such job")
+        if outcome in (FINISH_NOT_RUNNING, FINISH_OTHER_OWNER):
+            reason = ("job is queued again; the result is not recorded"
+                      if outcome == FINISH_NOT_RUNNING
+                      else "job is not held by this executor; "
+                           "the result is not recorded")
+            return self._finish_rejection(409, outcome, reason)
+        payload = dict(finished)
+        payload["finish_accepted"] = outcome in (FINISH_RECORDED,
+                                                 FINISH_CANCELLED)
+        payload["finish_reason"] = outcome
+        return self._json(200, payload)
+
+    def _finish_rejection(self, status: int, reason: str, message: str):
+        """明确拒收：只有这里带 ``finish_rejected``（执行器据此清 pending）。"""
+        return self._json(status, {"error": message,
+                                   "finish_rejected": True,
+                                   "finish_reason": reason})
 
     # ---- 上传 -------------------------------------------------------
     def _acquire_upload(self) -> bool:

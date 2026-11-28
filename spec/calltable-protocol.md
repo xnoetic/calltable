@@ -91,6 +91,60 @@ job.
 Terminal states are final; a repeated finish report (executor replay) does not
 change the state and does not emit a second `job.finished` event.
 
+### 2.1 Who may write a terminal state
+
+`POST /api/exec/jobs/<id>/finish` never overwrites a delivered result: the
+verdict and the write happen under one lock (`Store.finish_from_executor`). The
+body is `status` (required, one of the terminal states), `exit_code` (integer or
+`null`), `error` (string), and optionally the reporter identity `host` and
+`worker`.
+
+Every answer is machine-readable. `200` returns the job as it is now recorded,
+plus `finish_accepted` and `finish_reason`:
+
+```json
+{"id": "job-...", "status": "error", "exit_code": -1, "error": "...",
+ "finish_accepted": false, "finish_reason": "conflict"}
+```
+
+* `recorded` — written as reported (`finish_accepted: true`).
+* `cancel_precedence` — written, but as `cancelled` because the job carries
+  `cancel_requested` (see above; `finish_accepted: true`).
+* `duplicate` — the job is already terminal with the same `status` and
+  `exit_code` (compared after cancel precedence), e.g. a retry or a replayed
+  pending file. Nothing changes: not `status`, not `finished`, not the retention
+  deadline, not `error`.
+* `conflict` — the job is already terminal with a different result: a late
+  report from an execution nobody waits for any more. Nothing changes; the body
+  still returns the recorded state, so the reporter can see what won.
+
+Everything the hub refuses is a `4xx` carrying `finish_rejected: true` and the
+same `finish_reason` vocabulary:
+
+| status | `finish_reason` | when |
+| --- | --- | --- |
+| `409` | `other_owner` | the job runs on another `host`, or the reported `worker` is not the one that claimed it |
+| `409` | `not_running` | the job is queued again (a provider host that never attached it was requeued, `requeue_unattached`) |
+| `400` | `bad_request` | body is not a JSON object, `status` is not a terminal state, or `exit_code` is not an integer/`null` (booleans are refused) |
+| `404` | `unknown` | no such job (unknown id, or purged between the check and the write) |
+
+A rejection never writes: `status`, `exit_code`, `error` (including the reason
+recorded at run time), `finished` and the cleanup deadline stay as they are. The
+`finish_rejected` marker exists only on this route, so a plain `404` elsewhere is
+never mistaken for "this result can be dropped". An executor clears its local
+pending result only on `200` or on one of these marked refusals — anything else
+(network error, `5xx`, unmarked `4xx`) keeps it for the next replay.
+
+Ownership is checked only for clients that send identity: `host` must equal the
+job's current `host`, and `worker` must equal the worker recorded when the job
+was claimed (a provider's `pending:` placeholder is exempt, since the job is not
+attached yet). A body with neither field is handled exactly as in 0.2 — no
+ownership check — so upgrading the hub never strands a fleet of old executors.
+That compatibility is not protection: a body without identity can still land
+its result on a re-run of the same job and is only protected by the terminal
+rules above. A restarted executor that reports for the job a previous instance
+left behind must send that instance's `worker`, never its own new id.
+
 Jobs also carry `needs_reconcile` and `purged` bookkeeping flags inherited from
 0.2; they are not part of the protocol between clients and hub beyond being
 present in the JSON.
