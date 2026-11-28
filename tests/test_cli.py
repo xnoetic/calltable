@@ -75,6 +75,19 @@ class ConfigSearchTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CALLTABLE_PROFILES_DIR": str(custom)}):
             self.assertEqual(cfg.profiles_dir, custom)
 
+    def test_explicit_relative_paths_follow_config_not_cwd(self):
+        directory = self.root / "service"
+        profiles = directory / "custom-profiles"
+        profiles.mkdir(parents=True)
+        path = directory / "config.json"
+        path.write_text(json.dumps({"token": "t", "runs_root": "runs",
+                                    "mirror_root": "mirrors",
+                                    "profiles_dir": "custom-profiles"}), encoding="utf-8")
+        config = load_config(str(path))
+        self.assertEqual(config.runs_root, directory.resolve() / "runs")
+        self.assertEqual(config.mirror_root, directory.resolve() / "mirrors")
+        self.assertEqual(config.profiles_dir, profiles.resolve())
+
     def test_default_hub_and_owner_tailnet(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CALLTABLE_CONFIG", None)

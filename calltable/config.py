@@ -359,6 +359,10 @@ class Config:
         value = int(self.raw.get("cpu_rate_percent", 70))
         return max(1, min(100, value))
 
+    def _config_path(self, value: str) -> Path:
+        path = Path(value).expanduser()
+        return path if path.is_absolute() else (self.path.parent / path).resolve()
+
     @property
     def profiles_dir(self) -> Path:
         """profile 目录：配置 → CALLTABLE_PROFILES_DIR → 配置旁边 → 安装源 → cwd。
@@ -369,7 +373,7 @@ class Config:
         configured = self.raw.get("profiles_dir")
         candidates = []
         if configured:
-            candidates.append(Path(configured))
+            candidates.append(self._config_path(configured))
         env = os.environ.get("CALLTABLE_PROFILES_DIR")
         if env:
             candidates.append(Path(env))
@@ -391,11 +395,13 @@ class Config:
 
     @property
     def runs_root(self) -> Path:
-        return Path(self.raw.get("runs_root") or (self.data_dir / "runs"))
+        value = self.raw.get("runs_root")
+        return self._config_path(value) if value else self.data_dir / "runs"
 
     @property
     def mirror_root(self) -> Path:
-        return Path(self.raw.get("mirror_root") or (self.data_dir / "mirrors"))
+        value = self.raw.get("mirror_root")
+        return self._config_path(value) if value else self.data_dir / "mirrors"
 
     @property
     def max_jobs(self) -> int:
