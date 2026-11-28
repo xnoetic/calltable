@@ -18,6 +18,7 @@ from unittest import mock
 
 from calltable import executor as executor_module
 from calltable.client import HubError
+from calltable.db import Store
 from calltable.executor import Aborted, Executor, LogPump
 from tests.helpers import make_config
 
@@ -33,7 +34,7 @@ class FakeClient:
         self.cancel_jobs: set[str] = set()
         self.on_download = None
 
-    def post_json(self, path, body=None):
+    def post_json(self, path, body=None, **_kw):
         if path.endswith("/finish") and self.finish_failures > 0:
             self.finish_failures -= 1
             raise HubError("finish rejected")
@@ -882,6 +883,431 @@ class ArtifactRegexTests(unittest.TestCase):
                 started = time.monotonic()
                 self.assertIsNone(regex.fullmatch(name))
                 self.assertLess(time.monotonic() - started, 1.0)
+
+
+
+
+class RecordingClient(FakeClient):
+    """在 FakeClient 上加三件事：记录每一次 finish 尝试（含失败的那几次）、
+    能返回带状态码/payload 的错误、以及 Cloud Run 一次性执行器的 attach 路由。"""
+
+    def __init__(self):
+        super().__init__()
+        self.attempts: list[tuple[str, dict]] = []
+        self.attachments: list[tuple[str, dict]] = []
+        self.attach_job = None
+        self.on_finish = None
+        self.finish_error = None
+        self.timeouts: list[float | None] = []
+
+    def post_json(self, path, body=None, **kw):
+        if "/attach" in path:
+            self.attachments.append((path, body))
+            return self.attach_job
+        if path.endswith("/finish"):
+            self.attempts.append((path, body))
+            self.timeouts.append(kw.get("timeout"))
+            if self.on_finish is not None:
+                self.on_finish(path, body)
+            if self.finish_failures > 0:
+                self.finish_failures -= 1
+                raise self.finish_error or HubError("finish rejected")
+        return super().post_json(path, body)
+
+
+class PendingDurabilityTests(unittest.TestCase):
+    """终态先原子落盘、短暂错误保留、重放有界且不重复发送（B1 的加固）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.tmp.name)
+        self.config = make_config(self.root)
+        self.client = RecordingClient()
+        self.exec = Executor(self.config, client=self.client)
+
+    def tearDown(self):
+        self.exec.stop()
+        self.tmp.cleanup()
+
+    def pending(self, job_id="job-1"):
+        return self.exec.pending_dir / f"{job_id}.json"
+
+    # -------------------------------------------------- 先落盘，再上报
+    def test_result_is_on_disk_before_the_first_report(self):
+        seen = {}
+
+        def on_finish(path, body):
+            seen["exists"] = self.pending().exists()
+            seen["body"] = (json.loads(self.pending().read_text(encoding="utf-8"))
+                            if seen["exists"] else None)
+
+        self.client.on_finish = on_finish
+        outcome = {"status": "failed", "exit_code": 7, "error": "boom"}
+        self.assertTrue(self.exec._finish("job-1", outcome))
+        self.assertTrue(seen["exists"], "上报之前终态必须已经在盘上")
+        self.assertEqual(seen["body"], outcome)
+        self.assertFalse(self.pending().exists(), "送达之后要删掉")
+
+    def test_pending_write_leaves_no_partial_file(self):
+        self.assertTrue(self.exec._persist_pending(
+            "job-1", {"status": "succeeded", "exit_code": 0}))
+        self.assertEqual(sorted(p.name for p in self.exec.pending_dir.iterdir()),
+                         ["job-1.json"])
+        self.assertEqual(json.loads(self.pending().read_text(
+            encoding="utf-8"))["exit_code"], 0)
+
+    def test_result_that_cannot_be_persisted_is_replayed_from_memory(self):
+        self.client.finish_failures = 99
+        with mock.patch.object(executor_module.os, "replace",
+                               side_effect=OSError("read-only file system")), \
+                mock.patch.object(executor_module, "FINISH_BUDGET", 0), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertFalse(self.exec._finish(
+                "job-1", {"status": "failed", "exit_code": 3}))
+        self.assertIn("kept in memory only", stderr.getvalue())
+        self.assertFalse(self.pending().exists())
+
+        self.client.finish_failures = 0
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(), 1)
+        self.assertEqual(self.client.posts[-1],
+                         ("/api/exec/jobs/job-1/finish",
+                          {"status": "failed", "exit_code": 3}))
+
+    def test_complete_temporary_result_is_recovered_on_startup(self):
+        partial = self.exec.pending_dir / ".job-a.json.tmp"
+        partial.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.exec._recover_partial_pending_once()
+            self.assertEqual(self.exec.replay_pending(), 1)
+        self.assertFalse(partial.exists())
+        self.assertEqual(self.client.attempts[-1][0],
+                         "/api/exec/jobs/job-a/finish")
+
+    def test_unusable_temporary_result_is_moved_aside(self):
+        partial = self.exec.pending_dir / ".job-a.json.tmp"
+        partial.write_text("{not json", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.exec._recover_partial_pending_once()
+            self.assertEqual(self.exec.replay_pending(), 0)
+        self.assertTrue((self.exec.pending_dir / ".job-a.json.tmp.bad").exists())
+
+    # -------------------------------------------------- 短暂错误保留
+    def test_transient_failure_keeps_the_result_for_the_next_heartbeat(self):
+        self.client.finish_failures = 99
+        with mock.patch.object(executor_module, "FINISH_BUDGET", 0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(self.exec._finish(
+                "job-1", {"status": "succeeded", "exit_code": 0}))
+        self.assertTrue(self.pending().exists(), "没送达的结果必须留着")
+
+        self.client.finish_failures = 0
+        self.assertTrue(self.exec.heartbeat())
+        self.assertEqual([p for p, _ in self.client.posts][-2:],
+                         ["/api/exec/jobs/job-1/finish", "/api/hosts/heartbeat"])
+        self.assertFalse(self.pending().exists())
+
+    def test_replay_keeps_the_result_when_the_hub_is_unreachable(self):
+        job_a, job_b = self.pending("job-a"), self.pending("job-b")
+        for path in (job_a, job_b):
+            path.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                            encoding="utf-8")
+        self.client.finish_failures = 99
+        self.client.finish_error = HubError("connect failed", status=None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(), 0)
+        # 第一份连不上就收手：这一轮剩下的不做，心跳不能被拖住。
+        self.assertEqual(len(self.client.attempts), 1)
+        self.assertTrue(job_a.exists() and job_b.exists())
+
+    def test_replay_honours_its_time_budget(self):
+        pending = self.pending("job-a")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(budget=0), 0)
+        self.assertEqual(self.client.attempts, [])
+        self.assertTrue(pending.exists())
+
+    def test_answered_refusal_backs_off_instead_of_spinning(self):
+        pending = self.pending("job-a")
+        pending.write_text(json.dumps({"status": "failed", "exit_code": 1}),
+                           encoding="utf-8")
+        self.client.finish_error = HubError("bad exit_code", status=400)
+        self.client.finish_failures = 99
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(), 0)
+            self.assertEqual(len(self.client.attempts), 1)
+            self.assertEqual(self.exec.replay_pending(), 0)
+        self.assertEqual(len(self.client.attempts), 1, "退避期间不该再打 hub")
+        self.assertTrue(pending.exists())
+
+    def test_hub_refusal_marker_drops_the_result(self):
+        pending = self.pending("job-a")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        self.client.finish_error = HubError("no such job", status=404,
+                                           payload={"finish_rejected": True})
+        self.client.finish_failures = 1
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(), 0)
+        self.assertFalse(pending.exists(), "明确拒收的结果不能一直留着")
+
+    def test_unrouted_refusal_without_the_marker_is_kept(self):
+        pending = self.pending("job-a")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        self.client.finish_error = HubError("no such job", status=404)
+        self.client.finish_failures = 1
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(), 0)
+        self.assertTrue(pending.exists(), "代理/路由没对上的 404 要照旧重放")
+
+    # -------------------------------------------------- 不重复发送
+    def test_a_result_being_delivered_is_not_sent_twice(self):
+        pending = self.pending("job-a")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        with self.exec._lock:
+            self.exec._delivering.add("job-a")
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(self.exec.replay_pending(), 0)
+        finally:
+            with self.exec._lock:
+                self.exec._delivering.discard("job-a")
+        self.assertEqual(self.client.attempts, [])
+        self.assertTrue(pending.exists())
+
+    def test_settled_result_is_not_reported_again(self):
+        outcome = {"status": "succeeded", "exit_code": 0}
+        self.exec._persist_pending("job-a", outcome)
+        self.assertEqual(self.exec._deliver("job-a", outcome), "reported")
+        self.assertFalse(self.pending("job-a").exists())
+        self.assertEqual(self.exec._deliver("job-a", outcome), "settled")
+        self.assertEqual(len(self.client.attempts), 1)
+
+    def test_finish_waits_for_a_concurrent_replay_instead_of_resending(self):
+        outcome = {"status": "succeeded", "exit_code": 0}
+
+        def fake_deliver(job_id, payload):
+            self.exec._settle(job_id)      # 心跳前的重放刚把它送走
+            return None
+
+        with mock.patch.object(self.exec, "_deliver", side_effect=fake_deliver), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.exec._finish("job-1", outcome))
+        self.assertEqual(self.client.attempts, [], "不能重发已经被送走的结果")
+
+    # -------------------------------------------------- 与启动回收、一次性执行器
+    def test_orphan_with_a_pending_result_is_left_to_the_replay(self):
+        run_dir = self.exec.runs_root / "job-orphan"
+        run_dir.mkdir(parents=True)
+        (run_dir / ".running").write_text("previous-worker", encoding="utf-8")
+        (run_dir / ".pid").write_text("999999", encoding="utf-8")
+        self.exec._persist_pending("job-orphan",
+                                   {"status": "succeeded", "exit_code": 0})
+        with mock.patch.object(self.exec, "_pid_matches", return_value=True), \
+                mock.patch.object(self.exec, "_kill_tree") as kill, \
+                mock.patch.object(self.exec, "_schedule_cleanup") as cleanup:
+            self.exec._reclaim_orphans()
+        kill.assert_called_once_with(999999, "job-orphan")
+        self.assertEqual(self.client.attempts, [],
+                         "不能用一个 error 盖掉上一个实例留下的真实结果")
+        cleanup.assert_called_once_with(run_dir, "succeeded")
+        self.assertFalse((run_dir / ".running").exists())
+
+    def test_once_mode_delivers_a_left_over_result_before_exiting(self):
+        job = {"id": "job-9", "project": "demo", "sha": "a" * 40,
+               "timeout": 60, "profile_data": {}, "cmd": ["true"]}
+        once = Executor(self.config, client=self.client, job_id="job-9")
+        self.client.attach_job = job
+        try:
+            with mock.patch.object(once, "_run_job") as run_job, \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                run_job.side_effect = lambda payload: once._persist_pending(
+                    payload["id"], {"status": "succeeded", "exit_code": 0})
+                once._run_once()
+        finally:
+            once.stop()
+        self.assertIn("/api/exec/jobs/job-9/finish",
+                      [path for path, _ in self.client.posts])
+        self.assertFalse(self.pending("job-9").exists())
+
+    # -------------------------------------------------- 启动恢复不能和活跃写入打架
+    def test_replay_never_touches_a_temp_file_being_written_now(self):
+        self.exec._recover_partial_pending_once()   # 启动时做过一次
+        partial = self.exec.pending_dir / ".job-live.json.tmp"
+        partial.write_text('{"status": "succeeded"', encoding="utf-8")  # 正在写
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.exec.replay_pending()
+        self.assertTrue(partial.exists(), "活跃写入的临时文件不能被重放动")
+        self.assertFalse(
+            (self.exec.pending_dir / ".job-live.json.tmp.bad").exists())
+
+    def test_recovery_happens_only_once(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.exec._recover_partial_pending_once()
+        partial = self.exec.pending_dir / ".job-late.json.tmp"
+        partial.write_text(json.dumps({"status": "succeeded"}),
+                           encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.exec._recover_partial_pending_once()
+        self.assertTrue(partial.exists(), "第二次调用不能再碰临时文件")
+
+    # -------------------------------------------------- 重放不饿死后面的结果
+    def test_backed_off_results_do_not_hide_the_rest_forever(self):
+        max_files = executor_module.REPLAY_MAX_FILES
+        for index in range(max_files):
+            job_id = f"job-{index:03d}"
+            (self.exec.pending_dir / f"{job_id}.json").write_text(
+                json.dumps({"status": "failed", "exit_code": 1}),
+                encoding="utf-8")
+            self.exec._back_off(job_id)       # 这些全在退避里
+        fresh = self.pending("job-zzz")
+        fresh.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                         encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(budget=5), 1)
+        self.assertFalse(fresh.exists(), "退避中的前 50 项不能挡住后面的结果")
+
+    def test_replay_cursor_walks_past_the_first_batch(self):
+        total = executor_module.REPLAY_MAX_WALK + 5
+        for index in range(total):
+            (self.exec.pending_dir / f"job-{index:04d}.json").write_text(
+                json.dumps({"status": "succeeded", "exit_code": 0}),
+                encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            for _ in range(20):
+                if not self.exec._has_unsent_results():
+                    break
+                self.exec.replay_pending(budget=5)
+        self.assertFalse(list(self.exec.pending_dir.glob("*.json")),
+                         "游标轮转之后所有结果都要送到")
+        attempted = {path.rsplit("/", 2)[-2] for path, _ in self.client.attempts}
+        self.assertIn(f"job-{total - 1:04d}", attempted)
+
+    # -------------------------------------------------- 单次请求也受预算约束
+    def test_replay_passes_the_remaining_budget_as_the_request_timeout(self):
+        pending = self.pending("job-a")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.exec.replay_pending(budget=30), 1)
+        self.assertEqual(len(self.client.timeouts), 1)
+        timeout = self.client.timeouts[0]
+        self.assertIsNotNone(timeout, "重放必须给单次请求带上预算内的超时")
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, 30)
+
+    def test_finish_keeps_the_client_default_timeout(self):
+        self.assertTrue(self.exec._finish(
+            "job-1", {"status": "succeeded", "exit_code": 0}))
+        self.assertEqual(self.client.timeouts, [None])
+
+    # -------------------------------------------------- _unreported 不能残留
+    def test_settle_during_persist_does_not_leave_a_stale_running_entry(self):
+        outcome = {"status": "succeeded", "exit_code": 0}
+        real_persist = self.exec._persist_pending
+
+        def persist_then_settle(job_id, payload):
+            ok = real_persist(job_id, payload)
+            # 心跳线程正好在这个窗口里把这份结果送走了
+            self.exec._settle(job_id)
+            return ok
+
+        with mock.patch.object(self.exec, "_persist_pending",
+                               side_effect=persist_then_settle), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(self.exec._finish("job-1", outcome))
+        self.assertNotIn("job-1", self.exec._unreported,
+                         "送达后不能再被登记回 running")
+        self.assertEqual(self.client.attempts, [], "已被送走的结果不能重发")
+
+    # -------------------------------------------------- 启动时旧结果不被首次心跳回收
+    def test_first_heartbeat_is_held_until_the_inherited_result_is_delivered(self):
+        pending = self.pending("job-old")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        self.client.finish_failures = 1        # 第一轮送不出去，第二轮才成功
+        with mock.patch.object(executor_module, "INHERITED_HOLD_PAUSE", 0.01), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.exec._snapshot_inherited_results()
+            self.assertTrue(self.exec._await_inherited_results(grace=5))
+        self.assertFalse(pending.exists())
+        self.assertEqual([path for path, _ in self.client.posts],
+                         ["/api/exec/jobs/job-old/finish"],
+                         "结果送到之前不能发第一次心跳")
+        self.assertEqual(len(self.client.attempts), 2)
+
+    def test_first_heartbeat_hold_is_bounded(self):
+        pending = self.pending("job-old")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        self.client.finish_failures = 999
+        self.client.finish_error = HubError("connect failed", status=None)
+        with mock.patch.object(executor_module, "INHERITED_HOLD_PAUSE", 0.01), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.exec._snapshot_inherited_results()
+            started = time.monotonic()
+            self.assertFalse(self.exec._await_inherited_results(grace=0.05))
+        self.assertLess(time.monotonic() - started, 2.0, "到点必须放行心跳")
+        self.assertTrue(pending.exists())
+        self.assertIn("heartbeating anyway", stderr.getvalue())
+
+    def test_no_hold_without_inherited_results(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.exec._snapshot_inherited_results()
+            self.assertTrue(self.exec._await_inherited_results(grace=60))
+
+    def test_once_executor_does_not_delay_its_first_heartbeat(self):
+        pending = self.pending("job-old")
+        pending.write_text(json.dumps({"status": "succeeded", "exit_code": 0}),
+                           encoding="utf-8")
+        once = Executor(self.config, client=self.client, job_id="job-9")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                once._snapshot_inherited_results()
+                started = time.monotonic()
+                self.assertFalse(once._await_inherited_results(grace=60))
+            self.assertLess(time.monotonic() - started, 0.5,
+                            "一次性执行器（Cloud Run）不能拖着不 attach")
+        finally:
+            once.stop()
+        self.assertTrue(pending.exists())
+
+    # -------------------------------------------------- 归档的 hub 回收顺序
+    def test_hub_reaps_a_worker_change_before_looking_at_running(self):
+        """把 hub 的回收顺序钉住：worker 变了就先结算，``running`` 免不了灾。
+
+        这条用例解释为什么继承的结果只能靠"推迟第一次心跳"保护：只要心跳先
+        到，job 就会按 worker changed 回收，结果是 late finish。
+        """
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        store = Store(Path(tmp.name) / "hub.sqlite3")
+        try:
+            store.seed_host("h1", {"light": 1}, [])
+            # seed_host 故意不刷新 last_seen：先发一次心跳让主机在线。claim 只会
+            # 把任务交给 90 秒内见过、未 drain、未被冷却、slot 还有空位的主机。
+            store.heartbeat("h1", "h1-old", [])
+            job = store.create_job(project="demo", host="h1", slot="light",
+                                   locks=[], cmd=["true"])
+            claimed = store.claim("h1", "h1-old")
+            self.assertIsNotNone(claimed, "夹具应让主机在线且 slot=light 有空位")
+            self.assertEqual(claimed["id"], job["id"])
+            # 新 worker 把这条任务报进 running，它还是会被回收。
+            reaped = store.heartbeat("h1", "h1-new", [job["id"]])
+            self.assertEqual([r["id"] for r in reaped], [job["id"]])
+            after = store.job(job["id"])
+            self.assertEqual(after["status"], "error")
+            self.assertIn("worker changed", after["error"])
+        finally:
+            store.close()
+            tmp.cleanup()
 
 
 if __name__ == "__main__":

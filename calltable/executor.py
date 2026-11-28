@@ -11,8 +11,13 @@
 准备阶段（下载/fetch/worktree）也受同一个超时截止时间约束，并在每步前后检查
 取消标记（I8）。取消时先礼貌终止再强杀整棵进程树。
 
-终态上报失败会指数退避重试（最长 10 分钟），仍然失败就写进
-``<data_dir>/pending/<job_id>.json``，下次启动时重放（B1）。
+终态在**上报之前**就原子写进 ``<data_dir>/pending/<job_id>.json``（临时文件 +
+fsync + rename）：上报失败、任务线程被杀、执行器重启都不会丢结果（B1）。之后
+指数退避重试（最长 10 分钟），仍然失败就留在 pending 里，由每一次心跳前的
+有界重放接着送；写不进盘时结果退到内存副本，照样重放，退出才丢。同一个任务
+同时只有一个线程在送这份结果，重放和任务线程不会把同一份发两遍。重启后的执行器
+会先有界地（:data:`INHERITED_RESULT_GRACE`，默认 5 分钟）把上一个实例留下的结果
+送出去，再发第一次心跳——hub 对 worker 变化是无条件回收的，心跳一发就晚了。
 """
 
 from __future__ import annotations
@@ -50,6 +55,28 @@ ARTIFACT_SKIP_DIRS = {
 }
 FINISH_BUDGET = 600.0
 FINISH_MAX_DELAY = 30.0
+#: 心跳前那一轮重放的上限：整轮最多这么久、最多试这么多份、最多看这么多候选。
+#: 重放绝不能把心跳拖住，剩下的留给下一次心跳（默认 poll_interval 3 秒，通常
+#: 一秒内就送完）。候选每轮从上一轮停下的位置开始轮转，所以积压的结果不会被
+#: 前面那些正在退避的结果永远挡住。
+REPLAY_BUDGET = 10.0
+REPLAY_MAX_FILES = 50
+REPLAY_MAX_WALK = 200
+#: 一次性执行器（Cloud Run）退出前那一轮：容器马上要回收，给足时间。
+REPLAY_FINAL_BUDGET = 120.0
+#: 启动时继承的、还没送出去的终态：有界推迟第一次心跳（和领任务）最多这么久，
+#: 好让这些结果先送达。hub 的 ``Store.heartbeat`` 对 worker 变化是无条件回收的
+#: （db.py:407 先判 ``job["worker"] != worker``，之后才看 ``running``），所以只把
+#: 任务报进 ``running`` 救不了它们。窗口必须小于 ``HOST_STALE_SECONDS``（900s）。
+INHERITED_RESULT_GRACE = 300.0
+#: 推迟期间两次重放之间等多久。
+INHERITED_HOLD_PAUSE = 2.0
+#: hub 明确答复、重试也不会变的失败（4xx，除 408/429）按任务退避：
+#: 30s 起、翻倍、最长 10 分钟，免得每 3 秒打一次 hub。
+REPLAY_BACKOFF = 30.0
+REPLAY_BACKOFF_MAX = 600.0
+#: 还没 rename 的 pending 临时文件后缀：``.<job id>.json.tmp``。
+PENDING_TMP_SUFFIX = ".tmp"
 #: 磁盘/runs 大小的全量扫描至少隔这么久（walk 巨型 node_modules 很贵）。
 DISK_SCAN_INTERVAL = 60.0
 #: 调整任务进程 OOM 权重的 procfs 入口（只在 Linux 上存在）。
@@ -65,6 +92,43 @@ GIT_RELAY_FETCH_TIMEOUT = 300.0
 GIT_RELAY_MIN_TIMEOUT = 1.0
 #: hub 推送的临时 ref 前缀（``refs/calltable/jobs/<job id>``）。
 _GIT_RELAY_REFS_RE = re.compile(r"^refs/calltable/jobs/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _fsync_dir(path: Path) -> None:
+    """rename 之后把目录项也刷到盘上（POSIX）；Windows 上打不开目录，跳过。"""
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _hub_unavailable(exc: HubError) -> bool:
+    """hub 这会儿收不了（连不上、超时、5xx、408、429）：这一轮重放立刻收手。
+
+    这种情况下继续送下一份只是排队等超时，心跳会被拖住；等 hub 回来时，
+    下一轮重放会把它们一起送出去。
+    """
+    return exc.status is None or exc.status >= 500 or exc.status in (408, 429)
+
+
+def _finish_rejected(exc: HubError) -> bool:
+    """hub 明确拒收这份终态（只在响应里带 ``finish_rejected`` 时才算）。
+
+    代理或路由没对上的 404、401/403（修好 token 还能重放）、5xx 都不算，照旧
+    留给重放；带标记的 4xx 重试也不会有别的结果，本地结果直接丢掉。没有这个
+    标记的 hub（0.2、0.3）行为不变：一直留着重放。
+    """
+    payload = exc.payload if isinstance(exc.payload, dict) else None
+    return (exc.status is not None and 400 <= exc.status < 500
+            and bool(payload) and payload.get("finish_rejected") is True)
 
 
 def _artifact_regex(pattern: str) -> re.Pattern[str]:
@@ -163,6 +227,20 @@ class Executor:
         #: 已经跑完但终态还没送达 hub 的任务：仍要在心跳里报告，否则 hub 会把它
         #: 当成「丢失」回收，把成功改成 error（hub 重启窗口里真实发生过）。
         self._unreported: set[str] = set()
+        #: 写不进 pending 目录（磁盘满、只读、序列化失败）的终态：只在内存里，
+        #: 照样重放，执行器退出就丢（写失败时会打日志说明）。
+        self._unpersisted: dict[str, dict] = {}
+        #: 正在上报的 job id：任务线程和心跳前的重放不能同时送同一份结果。
+        self._delivering: set[str] = set()
+        #: hub 明确答复过的失败：job id → (下次可以重放的时刻, 当前退避秒数)。
+        self._replay_after: dict[str, tuple[float, float]] = {}
+        #: 重放候选的轮转游标：每轮从上一轮停下的位置开始，后面的结果也轮得到。
+        self._replay_cursor = 0
+        #: 半截临时文件的恢复只能在启动时、任何任务线程开始写 pending 之前做一次。
+        self._pending_recovered = False
+        #: 启动时盘上还没送出去的终态（上一个执行器实例留下的）：第一次心跳要等
+        #: 它们送到（最多 INHERITED_RESULT_GRACE 秒）。
+        self._inherited: set[str] = set()
         self._cancel_flags: dict[str, bool] = {}
         self._watcher: threading.Thread | None = None
         self._disk_status: disk.DiskStatus = disk.DiskStatus()
@@ -191,6 +269,10 @@ class Executor:
         return False, f"probe failed: {reason}; falling back to direct mode"
 
     def run(self) -> None:
+        # 先补完上次崩溃留下的半截临时文件，再开始读 pending / 起任务线程。
+        self._recover_partial_pending_once()
+        # 记下上一实例留下的结果：第一次心跳之前要尽量把它们送出去。
+        self._snapshot_inherited_results()
         self._reclaim_orphans()
         print(f"calltable exec host={self.host} worker={self.worker_id} "
               f"hub={self.config.hub_url} runs={self.runs_root} "
@@ -198,7 +280,10 @@ class Executor:
         if not self.use_systemd and self.systemd_reason.startswith("probe failed"):
             print(f"[exec] WARNING: {self.systemd_reason}", file=sys.stderr,
                   flush=True)
-        self.replay_pending()
+        # 继承了上一个实例的结果时，先有界地把它们送出去再发第一次心跳：
+        # hub 对 worker 变化是无条件回收的，心跳一发结果就变成「迟到」。
+        self._replay_pending_quietly()
+        self._await_inherited_results()
         self._start_watcher()
         self._start_housekeeping()
         if self.once:
@@ -258,7 +343,7 @@ class Executor:
                 self.cleanup_disk()
                 self.janitor()
                 # 上次没送达的终态：定期重试，别等下一次重启。
-                if any(self.pending_dir.glob("*.json")):
+                if self._has_unsent_results():
                     self.replay_pending()
             except Exception as exc:  # pragma: no cover
                 print(f"[exec] janitor: {type(exc).__name__}: {exc}",
@@ -267,6 +352,9 @@ class Executor:
 
     # ------------------------------------------------------------ 心跳/领取
     def heartbeat(self) -> bool:
+        # 先送没送达的终态（B1）：hub 一恢复，结果在下一次心跳之前就到了，
+        # 槽位和锁马上释放。有界重放，绝不因为重放把心跳拖住或抛异常。
+        self._replay_pending_quietly()
         with self._lock:
             running = sorted(self._active_jobs | self._unreported)
         system = self._host_system()
@@ -448,18 +536,24 @@ class Executor:
                 pass
             if pid_text.isdigit() and self._pid_matches(int(pid_text), job_id):
                 self._kill_tree(int(pid_text), job_id)
-            try:
-                self.client.post_json(
-                    f"/api/exec/jobs/{job_id}/finish",
-                    {"status": "error", "exit_code": None,
-                     "error": "executor restarted; orphan job terminated"})
-            except HubError:
-                pass
+            pending = self._pending_result(job_id)
+            if pending is None:
+                try:
+                    self.client.post_json(
+                        f"/api/exec/jobs/{job_id}/finish",
+                        {"status": "error", "exit_code": None,
+                         "error": "executor restarted; orphan job terminated"})
+                except HubError:
+                    pass
+                self._schedule_cleanup(entry, "error")
+            else:
+                # 上一个实例已经把终态落盘：真实结果交给心跳前的重放去送，
+                # 别再补一个 error 盖掉它。保留期按那份结果的状态算。
+                self._schedule_cleanup(entry, str(pending.get("status") or "error"))
             try:
                 marker.unlink()
             except OSError:
                 pass
-            self._schedule_cleanup(entry, "error")
 
     def _pid_matches(self, pid: int, job_id: str) -> bool:
         """PID 可能被系统复用；只杀命令行里确实属于该任务的进程。"""
@@ -494,6 +588,8 @@ class Executor:
             pass
 
     def _run_once(self) -> None:
+        # 幂等：``run()`` 已经做过一次，直接调 ``_run_once``（测试、嵌入）时补上。
+        self._recover_partial_pending_once()
         self.heartbeat()
         if not self.job_id:
             self._claim_loop()
@@ -514,8 +610,8 @@ class Executor:
             done.set()
             beater.join(timeout=5)
         # 终态没送达就再试一次（容器马上要回收，pending 文件留不下来）。
-        if any(self.pending_dir.glob("*.json")):
-            self.replay_pending()
+        if self._has_unsent_results():
+            self._replay_pending_quietly(budget=REPLAY_FINAL_BUDGET)
         self.heartbeat()
 
     # ------------------------------------------------------------ 单个任务
@@ -822,59 +918,384 @@ class Executor:
             time.sleep(interval)
 
     # ------------------------------------------------------------ 终态上报
+    def _pending_path(self, job_id: str) -> Path:
+        return self.pending_dir / f"{job_id}.json"
+
+    def _has_unsent_results(self) -> bool:
+        """本地还有没有没送达的终态（盘上的 pending，或写不进盘的内存副本）。"""
+        with self._lock:
+            if self._unpersisted:
+                return True
+        try:
+            return any(self.pending_dir.glob("*.json"))
+        except OSError:
+            return False
+
+    def _result_pending(self, job_id: str) -> bool:
+        """这份终态还在本地（盘上的 pending 文件，或写不进盘时的内存副本）。"""
+        with self._lock:
+            if job_id in self._unpersisted:
+                return True
+        return self._pending_path(job_id).exists()
+
+    def _pending_result(self, job_id: str) -> dict | None:
+        """读一份还没送达的终态；盘上的优先，其次内存副本。"""
+        with self._lock:
+            outcome = self._unpersisted.get(job_id)
+        if isinstance(outcome, dict):
+            return outcome
+        try:
+            outcome = json.loads(self._pending_path(job_id).read_text(
+                encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return outcome if isinstance(outcome, dict) else None
+
+    def _persist_pending(self, job_id: str, outcome: dict) -> bool:
+        """上报之前先把终态原子写进 ``pending/<job_id>.json``。
+
+        先写 ``.<job_id>.json.tmp``、fsync、再 rename，最后刷目录项：崩溃或
+        断电时盘上要么没有这份文件、要么是完整的一份，不会有半截 JSON。
+        写不进去（磁盘满、只读、序列化失败）时结果退到内存副本，照样按心跳
+        重放，只是执行器退出就没了——日志里写明这一点。
+        """
+        target = self._pending_path(job_id)
+        partial = self.pending_dir / f".{job_id}.json{PENDING_TMP_SUFFIX}"
+        try:
+            payload = json.dumps(outcome, ensure_ascii=False)
+            with open(partial, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(partial, target)
+            _fsync_dir(self.pending_dir)
+        except (OSError, TypeError, ValueError) as exc:
+            try:
+                partial.unlink(missing_ok=True)
+            except OSError:
+                pass
+            with self._lock:
+                self._unpersisted[job_id] = outcome
+            print(f"[exec] cannot persist pending finish for {job_id} ({exc}); "
+                  "the result is kept in memory only and lost if the executor "
+                  "exits", file=sys.stderr, flush=True)
+            return False
+        with self._lock:
+            self._unpersisted.pop(job_id, None)
+        return True
+
+    def _settle(self, job_id: str) -> None:
+        """这份终态已了结：删 pending、清内存副本与退避记录，心跳不再报告它。"""
+        try:
+            self._pending_path(job_id).unlink(missing_ok=True)
+        except OSError as exc:
+            print(f"[exec] cannot remove pending finish for {job_id}: {exc}",
+                  file=sys.stderr, flush=True)
+        with self._lock:
+            self._unpersisted.pop(job_id, None)
+            self._replay_after.pop(job_id, None)
+            self._unreported.discard(job_id)
+
+    def _deliver(self, job_id: str, outcome: dict,
+                 timeout: float | None = None) -> str | None:
+        """把一份终态送一次（任务线程和心跳前的重放共用一个入口）。
+
+        返回 ``"reported"``（hub 收下了）、``"settled"``（这份结果已经了结，
+        不必再送）或 ``None``（另一个线程正在送它）。没送到时抛 HubError，
+        结果原样留在 pending 里。同一个任务同时只有一个线程在送，重放和任务
+        线程不会把同一份结果发两遍。``timeout`` 是单次请求的超时：重放用它把
+        一整轮限在预算内，免得一个卡住的请求把心跳拖过重放预算。
+        """
+        with self._lock:
+            if job_id in self._delivering:
+                return None
+            if job_id not in self._unpersisted and not self._pending_path(
+                    job_id).exists():
+                return "settled"
+            self._delivering.add(job_id)
+        try:
+            try:
+                if timeout is None:
+                    self.client.post_json(
+                        f"/api/exec/jobs/{job_id}/finish", outcome)
+                else:
+                    self.client.post_json(
+                        f"/api/exec/jobs/{job_id}/finish", outcome,
+                        timeout=timeout)
+            except HubError as exc:
+                if _finish_rejected(exc):
+                    # hub 明确拒收（M1 的 finish_rejected）：重试没有别的结果。
+                    self._settle(job_id)
+                    return "settled"
+                raise
+            self._settle(job_id)
+            return "reported"
+        finally:
+            with self._lock:
+                self._delivering.discard(job_id)
+
     def _finish(self, job_id: str, outcome: dict) -> bool:
-        """指数退避重试（最长 10 分钟）；彻底失败就落 pending 文件。"""
-        delay = 1.0
-        started = time.time()
+        """终态先原子落盘，再指数退避重试上报（最长 10 分钟）。
+
+        落盘在最前面：任务线程、心跳前的重放、以及重启后的下一个执行器都能
+        接着送，短暂错误（连不上、超时、5xx）不丢结果。
+
+        先登记 ``_unreported`` 再落盘：落盘会先把这份结果暴露给心跳前的重放，
+        那个线程可能会抢先送达并在 :meth:`_settle` 里把它从 ``_unreported``
+        摘掉。顺序反过来的话，这里会在送达之后又把它登记回去，心跳就会永远
+        报一条早就结束的任务。
+        """
         with self._lock:
             self._unreported.add(job_id)
+        persisted = self._persist_pending(job_id, outcome)
+        delay = 1.0
+        started = time.time()
         while True:
             try:
-                self.client.post_json(f"/api/exec/jobs/{job_id}/finish", outcome)
-                with self._lock:
-                    self._unreported.discard(job_id)
-                return True
+                result = self._deliver(job_id, outcome)
             except HubError as exc:
                 elapsed = time.time() - started
                 if elapsed >= FINISH_BUDGET:
-                    self._write_pending(job_id, outcome)
+                    where = ("pending" if persisted else
+                             "memory only (lost if the executor exits)")
                     print(f"[exec] finish for {job_id} failed after "
-                          f"{int(elapsed)}s; queued for replay: {exc}",
-                          file=sys.stderr, flush=True)
+                          f"{int(elapsed)}s; queued for replay from {where}: "
+                          f"{exc}", file=sys.stderr, flush=True)
                     return False
                 print(f"[exec] finish for {job_id} failed ({exc}); "
                       f"retrying in {delay:.0f}s", file=sys.stderr, flush=True)
                 time.sleep(min(delay, FINISH_MAX_DELAY))
                 delay = min(delay * 2, FINISH_MAX_DELAY)
+                continue
+            if result is not None:
+                return True
+            # 另一个线程（心跳前的重放）正在送同一份结果：等它，别再发一遍。
+            if not self._result_pending(job_id):
+                return True
+            if time.time() - started >= FINISH_BUDGET:
+                return False
+            time.sleep(0.2)
 
-    def _write_pending(self, job_id: str, outcome: dict) -> None:
-        target = self.pending_dir / f"{job_id}.json"
+    # ------------------------------------------------------------ 终态重放
+    def _recover_partial_pending_once(self) -> None:
+        """启动时补完崩溃在 fsync 与 rename 之间的临时文件（只做一次）。
+
+        只能在任何任务线程开始写 pending 之前跑：正在写入的 ``.tmp`` 既不完整
+        也不能改名，混进重放会被挪成 ``.bad`` 或被提前 rename 掉。"""
+        with self._lock:
+            if self._pending_recovered:
+                return
+            self._pending_recovered = True
+        self._recover_partial_pending()
+
+    def _recover_partial_pending(self) -> None:
+        """补完崩溃在 fsync 与 rename 之间的那份临时文件，清掉没用的残留。"""
         try:
-            target.write_text(json.dumps(outcome, ensure_ascii=False),
-                              encoding="utf-8")
-        except OSError as exc:
-            print(f"[exec] cannot persist pending finish for {job_id}: {exc}",
-                  file=sys.stderr, flush=True)
-
-    def replay_pending(self) -> int:
-        replayed = 0
-        for path in sorted(self.pending_dir.glob("*.json")):
-            job_id = path.stem
-            try:
-                outcome = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+            partials = sorted(self.pending_dir.glob(
+                f".*.json{PENDING_TMP_SUFFIX}"))
+        except OSError:
+            return
+        for partial in partials:
+            job_id = partial.name[1:-len(".json" + PENDING_TMP_SUFFIX)]
+            if not job_id:
+                self._set_aside(partial, "bad temporary file name")
+                continue
+            target = self._pending_path(job_id)
+            if target.exists():
+                # 正式的 pending 已经在（写新的时旧的还没删）：临时文件没用。
+                try:
+                    partial.unlink(missing_ok=True)
+                except OSError:
+                    pass
                 continue
             try:
-                self.client.post_json(f"/api/exec/jobs/{job_id}/finish", outcome)
-                path.unlink(missing_ok=True)
-                with self._lock:
-                    self._unreported.discard(job_id)
+                json.loads(partial.read_text(encoding="utf-8"))
+                os.replace(partial, target)
+            except (OSError, ValueError) as exc:
+                self._set_aside(partial, f"unusable temporary file: {exc}")
+
+    def _set_aside(self, path: Path, reason: str) -> None:
+        """把读不了的 pending 改名成 ``*.bad``：留着查原因，但不再每轮重试。"""
+        try:
+            path.replace(path.with_name(path.name + ".bad"))
+        except OSError:
+            return
+        print(f"[exec] pending {path.name} moved aside ({reason})",
+              file=sys.stderr, flush=True)
+
+    def _replay_wait(self, job_id: str) -> float:
+        """这份结果还要等多久才能再试（只有 hub 明确答复过的失败才退避）。"""
+        with self._lock:
+            entry = self._replay_after.get(job_id)
+        if not entry:
+            return 0.0
+        return max(0.0, entry[0] - time.monotonic())
+
+    def _back_off(self, job_id: str) -> None:
+        with self._lock:
+            previous = self._replay_after.get(job_id, (0.0, 0.0))[1]
+        delay = min(REPLAY_BACKOFF_MAX,
+                    previous * 2 if previous else REPLAY_BACKOFF)
+        with self._lock:
+            self._replay_after[job_id] = (time.monotonic() + delay, delay)
+
+    def _snapshot_inherited_results(self) -> set[str]:
+        """记下启动时还没送出去的终态：这些是上一个执行器实例留下的任务。
+
+        它们在 hub 上还绑着旧 worker。本实例的第一次心跳会按
+        ``executor worker changed`` 无条件把它们结算成 error（hub 的
+        ``Store.heartbeat`` 先判 worker，之后才看 ``running``），所以只把任务
+        报进 ``running`` 保护不了，必须推迟第一次心跳。
+        """
+        try:
+            paths = sorted(self.pending_dir.glob("*.json"))
+        except OSError:
+            paths = []
+        with self._lock:
+            self._inherited = ({path.stem for path in paths}
+                               | set(self._unpersisted))
+            return set(self._inherited)
+
+    def _undelivered_inherited(self) -> set[str]:
+        """继承的结果里还有哪些没送到（盘上的 pending 或内存副本）。"""
+        with self._lock:
+            inherited = set(self._inherited)
+            memory = set(self._unpersisted)
+        if not inherited:
+            return set()
+        present: set[str] = set()
+        try:
+            for path in self.pending_dir.glob("*.json"):
+                present.add(path.stem)
+        except OSError:
+            pass
+        return inherited & (memory | present)
+
+    def _await_inherited_results(self, grace: float | None = None) -> bool:
+        """有界推迟第一次心跳/领任务，先把上一个实例留下的结果送出去。
+
+        只对启动时继承的结果生效：本实例自己任务的终态不需要推迟心跳（它们
+        还在 ``running`` 里）。窗口默认 :data:`INHERITED_RESULT_GRACE`，到点照常
+        心跳——那时 hub 可能已经把旧任务回收成 error，真实结果只剩一条说明，
+        但主机不能因此一直不心跳、不领任务。一次性执行器（Cloud Run 每次都是
+        全新容器，没有上一个实例）不推迟，避免拖住 attach。
+        返回是否全部送达。
+        """
+        pending = self._undelivered_inherited()
+        if not pending or self.once:
+            return not pending
+        window = float(INHERITED_RESULT_GRACE if grace is None else grace)
+        deadline = time.monotonic() + max(0.0, window)
+        print(f"[exec] holding the first heartbeat until {len(pending)} result(s) "
+              f"left by the previous executor are delivered (at most "
+              f"{window:.0f}s)", flush=True)
+        while not self._stop.is_set():
+            if not self._undelivered_inherited():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self._replay_pending_quietly(budget=min(REPLAY_BUDGET, remaining))
+            if not self._undelivered_inherited():
+                return True
+            self._stop.wait(min(INHERITED_HOLD_PAUSE,
+                                max(0.0, deadline - time.monotonic())))
+        left = self._undelivered_inherited()
+        if left:
+            print(f"[exec] {len(left)} inherited result(s) still undelivered "
+                  f"after {window:.0f}s; heartbeating anyway (the hub may reap "
+                  f"those jobs as worker changed)", file=sys.stderr, flush=True)
+        return not left
+
+    def _replay_pending_quietly(self, budget: float | None = None) -> int:
+        """重放一次，但绝不让重放把心跳、启动或退出弄挂。"""
+        try:
+            return self.replay_pending(budget=budget)
+        except Exception as exc:  # pragma: no cover - 兜底：心跳/退出优先
+            print(f"[exec] pending replay: {type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+            return 0
+
+    def replay_pending(self, budget: float | None = None) -> int:
+        """重放没送达的终态（心跳前、janitor、启动时各调一次）。
+
+        有界：整轮不超过 ``budget`` 秒（默认 :data:`REPLAY_BUDGET`，单次请求也
+        按剩余预算设超时，一个卡住的请求不能把心跳拖过预算）、最多真正试
+        :data:`REPLAY_MAX_FILES` 份、最多看 :data:`REPLAY_MAX_WALK` 个候选。
+        hub 这会儿用不了（连不上、超时、5xx）就立刻收手；hub 明确答复的失败按
+        任务退避，且退避中的结果只是本轮跳过、不占尝试名额。候选从上一轮停下
+        的位置轮转，所以积压的结果不会被前面那些退避中的结果永远挡住。
+        """
+        budget = REPLAY_BUDGET if budget is None else max(0.0, float(budget))
+        deadline = time.monotonic() + budget
+        # 这里**不**碰 ``.tmp``：恢复只在启动时做一次，活跃写入的临时文件
+        # 不能被重放挪走或提前 rename。
+        try:
+            paths = sorted(self.pending_dir.glob("*.json"))
+        except OSError:
+            paths = []
+        with self._lock:
+            memory = dict(self._unpersisted)
+        candidates: list[tuple[str, Path | None]] = [(p.stem, p) for p in paths]
+        candidates += [(job_id, None) for job_id in memory]
+        total = len(candidates)
+        if not total:
+            return 0
+        with self._lock:
+            start = self._replay_cursor % total
+            self._replay_cursor = (start + 1) % total   # 至少前进一格
+        rotated = candidates[start:] + candidates[:start]
+        replayed = 0
+        attempts = 0
+        walked = 0
+        for walked, (job_id, path) in enumerate(rotated[:REPLAY_MAX_WALK], start=1):
+            if attempts >= REPLAY_MAX_FILES:
+                break
+            if time.monotonic() >= deadline:
+                print(f"[exec] pending replay used its {budget:.0f}s budget; "
+                      "the rest is left for the next heartbeat",
+                      file=sys.stderr, flush=True)
+                break
+            if self._replay_wait(job_id) > 0:
+                continue
+            outcome = memory.get(job_id) if path is None else self._read_pending(path)
+            if not isinstance(outcome, dict):
+                continue
+            attempts += 1
+            remaining = deadline - time.monotonic()
+            try:
+                # 单次请求也不能超预算：预算不够时最多再多给 1 秒，而不是用
+                # 客户端的默认 60 秒把心跳拖死。
+                result = self._deliver(job_id, outcome,
+                                       timeout=max(1.0, remaining))
+            except HubError as exc:
+                if _hub_unavailable(exc):
+                    print(f"[exec] pending finish still failing for {job_id}: "
+                          f"{exc}", file=sys.stderr, flush=True)
+                    break
+                self._back_off(job_id)
+                print(f"[exec] pending finish for {job_id} was refused: {exc}; "
+                      "retrying later", file=sys.stderr, flush=True)
+                continue
+            if result == "reported":
                 replayed += 1
                 print(f"[exec] replayed pending finish for {job_id}", flush=True)
-            except HubError as exc:
-                print(f"[exec] pending finish still failing for {job_id}: {exc}",
-                      file=sys.stderr, flush=True)
+        with self._lock:
+            self._replay_cursor = (start + walked) % max(1, total)
         return replayed
+
+    def _read_pending(self, path: Path) -> dict | None:
+        """读一份 pending；读不了的挪成 ``*.bad``（留着查原因，不再每轮重试）。"""
+        try:
+            outcome = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            self._set_aside(path, f"unreadable pending finish: {exc}")
+            return None
+        except OSError as exc:
+            print(f"[exec] cannot read pending finish {path.name}: {exc}",
+                  file=sys.stderr, flush=True)
+            return None
+        return outcome if isinstance(outcome, dict) else None
 
     # ------------------------------------------------------------ 环境与脚本
     def _write_launcher(self, run_dir: Path, job: dict, profile: dict,
